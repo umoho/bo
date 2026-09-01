@@ -236,8 +236,9 @@ impl<I: Source> Source for Gain<I> {
     }
 }
 
-/// Decode a file far enough to learn its length.
-fn probe(uri: &str) -> Result<Duration, String> {
+/// Decode a file far enough to learn its length. Pure decoding — no device
+/// needed, so it works headless (`bo probe <uri>`, tests, CI).
+pub fn probe(uri: &str) -> Result<Duration, String> {
     let file = File::open(uri).map_err(|e| format!("cannot open {uri}: {e}"))?;
     let decoder = Decoder::new(BufReader::new(file))
         .map_err(|e| format!("cannot decode {uri}: {e}"))?;
@@ -246,24 +247,31 @@ fn probe(uri: &str) -> Result<Duration, String> {
         .ok_or_else(|| format!("cannot determine the length of {uri}"))
 }
 
-/// Probe every distinct source in the arrangement, returning one problem
-/// string per source that cannot be opened, decoded, or measured. Duplicate
-/// uris are probed once.
-pub fn check_sources(tracks: &[Track]) -> Vec<String> {
+/// Measure every distinct source in the arrangement: the uri plus its length,
+/// or the reason it could not be measured. Duplicate uris are probed once.
+pub fn probe_sources(tracks: &[Track]) -> Vec<(String, Result<Duration, String>)> {
     let mut seen = std::collections::HashSet::new();
-    let mut problems = Vec::new();
+    let mut results = Vec::new();
     for track in tracks {
         for clip in track.clips() {
             let uri = clip.source.uri.as_str();
             if !seen.insert(uri) {
                 continue;
             }
-            if let Err(e) = probe(uri) {
-                problems.push(e);
-            }
+            results.push((uri.to_string(), probe(uri)));
         }
     }
-    problems
+    results
+}
+
+/// Probe every distinct source in the arrangement, returning one problem
+/// string per source that cannot be opened, decoded, or measured. Duplicate
+/// uris are probed once.
+pub fn check_sources(tracks: &[Track]) -> Vec<String> {
+    probe_sources(tracks)
+        .into_iter()
+        .filter_map(|(_, result)| result.err())
+        .collect()
 }
 
 #[cfg(test)]
@@ -396,6 +404,18 @@ mod tests {
         let decoder = Decoder::new(BufReader::new(File::open(&out).unwrap())).unwrap();
         let (peak, _) = decoder.fold((0.0f32, 0u64), |(peak, n), s| (peak.max(s.abs()), n + 1));
         assert!(peak < 1e-6, "a muted track contributes nothing, peak {peak}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn probe_measures_a_wav_and_reports_missing_files() {
+        let dir = std::env::temp_dir().join(format!("bo-probe-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.wav");
+        write_wav(&a, 0.5, 440.0, 0.5);
+        let d = probe(a.to_str().unwrap()).unwrap();
+        assert!((d.as_secs_f64() - 0.5).abs() < 0.05, "probed {d:?}");
+        assert!(probe("/nonexistent.wav").is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
 }

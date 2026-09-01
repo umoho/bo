@@ -41,6 +41,8 @@
 //! * `save <file>` / `load <file>` — write the arrangement as a script of
 //!   commands, or replace it from one (transport resets with the swap).
 //! * `check` — verify every distinct source is readable.
+//! * `probe [uri]` — measure the length of a source, or of every distinct
+//!   source in the arrangement; a bare uri is probed locally, no daemon.
 //! * `name <track> <name>` — label a track; names are single tokens in
 //!   scripts.
 //! * `ls` — dump the whole arrangement.
@@ -76,7 +78,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use bo::engine::rodio::{check_sources, render_to_file, Rodio};
+use bo::engine::rodio::{check_sources, probe, probe_sources, render_to_file, Rodio};
 use bo::engine::{Backend, BackendError, Player, Silent, State};
 use bo::track::{Clip, Source, Track};
 use clap::error::ErrorKind;
@@ -142,6 +144,12 @@ enum Command {
     },
     /// Verify every source in the arrangement is readable.
     Check,
+    /// Measure the length of a source, or of every distinct source in the
+    /// arrangement. A bare uri runs locally — no daemon is spawned.
+    Probe {
+        /// Source uri to measure; omit to probe the arrangement's sources.
+        uri: Option<String>,
+    },
     /// Label a track; names are single tokens in scripts.
     Name {
         /// Track index.
@@ -323,6 +331,8 @@ Arrangement:
   save <file>              write the arrangement as a script
   load <file>              replace the arrangement from a script
   check                    verify every source is readable
+  probe [uri]              measure a source's length; without a uri, every
+                           source in the arrangement
   name <track> <name>      label a track
 
 Mix:
@@ -359,8 +369,8 @@ EXAMPLES
 
 /// Names of the user-facing subcommands: `bo <name> --help` must keep
 /// clap's own per-command help, while `bo --help` shows the grouped [`HELP`].
-const SUBCOMMAND_NAMES: [&str; 16] = [
-    "put", "take", "ls", "render", "save", "load", "check", "name", "play", "pause",
+const SUBCOMMAND_NAMES: [&str; 17] = [
+    "put", "take", "ls", "render", "save", "load", "check", "probe", "name", "play", "pause",
     "resume", "stop", "seek", "volume", "mute", "unmute",
 ];
 
@@ -574,6 +584,10 @@ fn dispatch(a: &mut Arrangement, command: Command) -> Result<String, (i32, Strin
                 Err((1, out))
             }
         }
+        Command::Probe { uri } => match uri {
+            None => probe_arrangement(a),
+            Some(uri) => probe_uri(&uri),
+        },
         Command::Name { track, name } => {
             let t = a
                 .player
@@ -680,6 +694,47 @@ fn play_command(a: &mut Arrangement) -> Result<String, (i32, String)> {
     Ok(out)
 }
 
+/// `probe <uri>`: measure one source. Used both locally (no daemon) and over
+/// the wire.
+fn probe_uri(uri: &str) -> Result<String, (i32, String)> {
+    match probe(uri) {
+        Ok(d) => Ok(format!(
+            "probe: {uri} {} {:.2} s\n",
+            format_time(d),
+            d.as_secs_f64()
+        )),
+        Err(e) => Err(fail(e)),
+    }
+}
+
+/// `probe` with no uri: measure every distinct source in the arrangement.
+/// Lists each source's length; exit 1 if any source cannot be measured.
+fn probe_arrangement(a: &Arrangement) -> Result<String, (i32, String)> {
+    let results = probe_sources(a.player.tracks());
+    if results.is_empty() {
+        return Ok("probe: no sources in the arrangement\n".to_string());
+    }
+    let noun = if results.len() == 1 { "source" } else { "sources" };
+    let mut out = format!("probe: {} {noun}\n", results.len());
+    let mut problems = 0;
+    for (uri, result) in results {
+        match result {
+            Ok(d) => {
+                let _ = writeln!(out, "  {uri} {} {:.2} s", format_time(d), d.as_secs_f64());
+            }
+            Err(e) => {
+                problems += 1;
+                let _ = writeln!(out, "  {uri}: {e}");
+            }
+        }
+    }
+    if problems > 0 {
+        Err((1, out))
+    } else {
+        Ok(out)
+    }
+}
+
 /// The command line the client puts on the wire, re-serialized from the
 /// already-parsed subcommand.
 fn command_line(command: &Command) -> String {
@@ -702,6 +757,10 @@ fn command_line(command: &Command) -> String {
         Command::Save { file } => format!("save {file}"),
         Command::Load { file } => format!("load {file}"),
         Command::Check => "check".to_string(),
+        Command::Probe { uri } => match uri {
+            Some(uri) => format!("probe {uri}"),
+            None => "probe".to_string(),
+        },
         Command::Name { track, name } => format!("name {track} {name}"),
         Command::Help => unreachable!("help is handled locally, never sent"),
         Command::Daemon => unreachable!("the daemon is spawned, not sent"),
@@ -791,7 +850,23 @@ pub fn run(args: Vec<String>) -> i32 {
             0
         }
         Command::Daemon => daemon_main(&socket),
+        Command::Probe { uri: Some(uri) } => probe_client(&uri),
         command => client_main(&socket, &command),
+    }
+}
+
+/// `probe <uri>` runs in the client: measuring a file needs no daemon or
+/// device, so a bare uri is answered locally and spawns nothing.
+fn probe_client(uri: &str) -> i32 {
+    match probe_uri(uri) {
+        Ok(out) => {
+            print!("{out}");
+            0
+        }
+        Err((code, msg)) => {
+            eprintln!("bo: {msg}");
+            code
+        }
     }
 }
 
@@ -1402,6 +1477,37 @@ mod tests {
         dispatch(&mut a, put).unwrap();
         let out = run_ok(&mut a, &["check"]);
         assert!(out.contains("all sources ok"), "{out}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn probe_measures_sources_locally_and_in_the_arrangement() {
+        let dir = temp_dir();
+        let src = dir.join("a.wav");
+        write_test_wav(&src, 0.2, 0.5);
+        let path = src.to_string_lossy().into_owned();
+
+        let mut a = Arrangement::default();
+        let out = run_ok(&mut a, &["probe", path.as_str()]);
+        assert!(out.contains("probe:") && out.contains("00:00:00.200"), "{out}");
+        assert_eq!(a.player.tracks().len(), 0, "a bare probe touches nothing");
+
+        run_ok(&mut a, &["put", path.as_str()]);
+        let out = run_ok(&mut a, &["probe"]);
+        assert!(out.contains("probe: 1 source"), "{out}");
+        assert!(out.contains("00:00:00.200"), "{out}");
+
+        // A source that cannot be opened is reported, and fails the probe.
+        run_ok(&mut a, &["put", "/nonexistent.wav:00:00:00-00:00:10"]);
+        let (code, msg) = run_err(&mut a, &["probe"]);
+        assert_eq!(code, 1);
+        assert!(msg.contains("2 sources"), "{msg}");
+        assert!(msg.contains("cannot open /nonexistent.wav"), "{msg}");
+
+        let (code, msg) = run_err(&mut a, &["probe", "/missing.wav"]);
+        assert_eq!(code, 1);
+        assert!(msg.contains("cannot open /missing.wav"), "{msg}");
+
         std::fs::remove_dir_all(&dir).ok();
     }
 

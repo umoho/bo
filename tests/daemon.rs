@@ -35,6 +35,35 @@ fn temp_dir() -> PathBuf {
     dir
 }
 
+/// A tiny mono PCM wav with a sine at `amp` amplitude.
+fn write_test_wav(path: &Path, seconds: f32, amp: f32) {
+    let rate = 44_100u32;
+    let n = (rate as f32 * seconds) as usize;
+    let mut data = Vec::with_capacity(n * 2);
+    for i in 0..n {
+        let v = (amp
+            * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / rate as f32).sin()
+            * 32767.0) as i16;
+        data.extend_from_slice(&v.to_le_bytes());
+    }
+    let mut wav = Vec::new();
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + data.len() as u32).to_le_bytes());
+    wav.extend_from_slice(b"WAVE");
+    wav.extend_from_slice(b"fmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&rate.to_le_bytes());
+    wav.extend_from_slice(&(rate * 2).to_le_bytes());
+    wav.extend_from_slice(&2u16.to_le_bytes());
+    wav.extend_from_slice(&16u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    wav.extend_from_slice(&data);
+    std::fs::write(path, wav).unwrap();
+}
+
 fn wait_for_socket_gone(socket: &Path) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while socket.exists() {
@@ -120,5 +149,32 @@ fn stop_ends_the_session() {
         std::thread::sleep(Duration::from_millis(20));
     }
 
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn probe_measures_locally_without_a_daemon_and_over_the_wire() {
+    let dir = temp_dir();
+    let socket = dir.join("d.sock");
+    let sp = socket.to_string_lossy().into_owned();
+    let src = dir.join("a.wav");
+    write_test_wav(&src, 0.2, 0.5);
+    let spec = format!("{}:00:00:00-00:00:00.200", src.to_string_lossy());
+
+    // A bare uri is probed in the client: no daemon is spawned.
+    let out = bo(&sp, &["probe", src.to_str().unwrap()]);
+    assert!(out.contains("probe:") && out.contains("00:00:00.200"), "{out}");
+    assert!(!socket.exists(), "a bare probe must not spawn a daemon");
+
+    // The arrangement's sources are probed over the wire.
+    let out = bo(&sp, &["put", spec.as_str()]);
+    assert!(out.contains("ok: track 0"), "{out}");
+    let out = bo(&sp, &["probe"]);
+    assert!(out.contains("probe: 1 source"), "{out}");
+    assert!(out.contains("00:00:00.200"), "{out}");
+
+    let out = bo(&sp, &["stop"]);
+    assert!(out.contains("stopped"), "{out}");
+    wait_for_socket_gone(&socket);
     std::fs::remove_dir_all(&dir).ok();
 }
