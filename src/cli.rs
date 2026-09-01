@@ -47,7 +47,7 @@ use clap::{Parser, Subcommand};
 
 /// bo — arrange and play a radio program.
 #[derive(Debug, Parser)]
-#[command(name = "bo", version, arg_required_else_help = true)]
+#[command(name = "bo", version, arg_required_else_help = true, max_term_width = 80)]
 struct Cli {
     /// State file holding the arrangement script.
     #[arg(long, global = true, env = "BO_STATE", default_value = "bo.state")]
