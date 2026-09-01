@@ -6,3 +6,4 @@ edition = "2024"
 [dependencies]
 clap = { version = "4", features = ["derive", "env", "wrap_help"] }
 rodio = { version = "0.22.2", features = ["wav_output"] }
+shlex = "2.0.1"

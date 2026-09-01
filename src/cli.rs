@@ -388,6 +388,21 @@ const SUBCOMMAND_NAMES: [&str; 18] = [
     "resume", "stop", "seek", "volume", "mute", "unmute",
 ];
 
+/// Tokenize a wire or script line: whitespace-separated words with
+/// shell-style quoting (`'...'`, `"..."`, backslash escapes). Wraps
+/// `shlex::split`; an unterminated quote is an error, not silence.
+fn tokenize(line: &str) -> Result<Vec<String>, String> {
+    shlex::split(line).ok_or_else(|| "unterminated quote".to_string())
+}
+
+/// Serialize one argument for the wire or a script, quoting it when it
+/// contains whitespace or quote characters. Round-trips through
+/// [`tokenize`].
+fn quote_arg(arg: &str) -> String {
+    // NUL cannot appear in argv; this branch is unreachable in practice.
+    shlex::try_quote(arg).map_or_else(|_| arg.to_string(), |q| q.into_owned())
+}
+
 /// Parse `SS`, `MM:SS` or `HH:MM:SS` (optional `.fff` fraction) into a
 /// duration.
 fn parse_timecode(s: &str) -> Result<Duration, String> {
@@ -802,32 +817,35 @@ fn probe_arrangement(a: &Arrangement) -> Result<String, (i32, String)> {
 
 /// The command line the client puts on the wire, re-serialized from the
 /// already-parsed subcommand.
+/// The command line the client puts on the wire, re-serialized from the
+/// already-parsed subcommand. String arguments are quoted so that paths and
+/// names with whitespace survive [`handle_line`]'s tokenizer.
 fn command_line(command: &Command) -> String {
     match command {
         Command::Put { spec, track } => match track {
-            Some(t) => format!("put {spec} {t}"),
-            None => format!("put {spec}"),
+            Some(t) => format!("put {} {t}", quote_arg(spec)),
+            None => format!("put {}", quote_arg(spec)),
         },
         Command::Play => "play".to_string(),
         Command::Ls => "ls".to_string(),
-        Command::At { at } => format!("at {at}"),
+        Command::At { at } => format!("at {}", quote_arg(at)),
         Command::Pause => "pause".to_string(),
         Command::Resume => "resume".to_string(),
         Command::Stop => "stop".to_string(),
-        Command::Seek { at } => format!("seek {at}"),
+        Command::Seek { at } => format!("seek {}", quote_arg(at)),
         Command::Volume { track, v } => format!("volume {track} {v}"),
         Command::Mute { track } => format!("mute {track}"),
         Command::Unmute { track } => format!("unmute {track}"),
         Command::Take { track, clip } => format!("take {track} {clip}"),
-        Command::Render { file } => format!("render {file}"),
-        Command::Save { file } => format!("save {file}"),
-        Command::Load { file } => format!("load {file}"),
+        Command::Render { file } => format!("render {}", quote_arg(file)),
+        Command::Save { file } => format!("save {}", quote_arg(file)),
+        Command::Load { file } => format!("load {}", quote_arg(file)),
         Command::Check => "check".to_string(),
         Command::Probe { uri } => match uri {
-            Some(uri) => format!("probe {uri}"),
+            Some(uri) => format!("probe {}", quote_arg(uri)),
             None => "probe".to_string(),
         },
-        Command::Name { track, name } => format!("name {track} {name}"),
+        Command::Name { track, name } => format!("name {track} {}", quote_arg(name)),
         Command::Help => unreachable!("help is handled locally, never sent"),
         Command::Daemon => unreachable!("the daemon is spawned, not sent"),
     }
@@ -835,7 +853,7 @@ fn command_line(command: &Command) -> String {
 
 /// The arrangement as a script: the commands that rebuild it. Every line is
 /// a valid command, so `load` runs the file through the same parse and
-/// dispatch. Names must be single tokens to survive the round trip.
+/// dispatch. URIs and names are quoted so whitespace round-trips.
 fn serialize(a: &Arrangement) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "# bo arrangement v1");
@@ -848,14 +866,14 @@ fn serialize(a: &Arrangement) -> String {
             let _ = writeln!(
                 out,
                 "put {}@{}:{}-{} {ti}",
-                c.source.uri,
+                quote_arg(&c.source.uri),
                 format_time(c.at),
                 format_time(c.from),
                 to
             );
         }
         if let Some(name) = t.name() {
-            let _ = writeln!(out, "name {ti} {name}");
+            let _ = writeln!(out, "name {ti} {}", quote_arg(name));
         }
         let _ = writeln!(out, "volume {ti} {}", t.volume());
         if t.muted() {
@@ -876,7 +894,7 @@ fn run_script(a: &mut Arrangement, text: &str, src: &str) -> Result<(), String> 
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let args: Vec<String> = line.split_whitespace().map(str::to_string).collect();
+        let args = tokenize(line).map_err(|e| format!("{src}:{}: {e}", n + 1))?;
         let command = parse_command(&args)
             .map_err(|code| format!("{src}:{}: parse failed (exit {code})", n + 1))?;
         dispatch(a, command).map_err(|(_, msg)| format!("{src}:{}: {msg}", n + 1))?;
@@ -1094,7 +1112,10 @@ fn serve_loop(listener: UnixListener, state: Arc<Mutex<Arrangement>>, exit: Arc<
 /// One command over the wire: parse, dispatch, and frame the reply. The third
 /// value says whether this command ends the daemon's session.
 fn handle_line(state: &Mutex<Arrangement>, line: &str) -> (i32, String, bool) {
-    let args: Vec<String> = line.split_whitespace().map(str::to_string).collect();
+    let args = match tokenize(line) {
+        Ok(args) => args,
+        Err(e) => return (2, format!("bo: {e}\n"), false),
+    };
     let command = match parse_command(&args) {
         Ok(command) => command,
         Err(e) => return (e.exit_code(), format!("{}\n", e.to_string().trim_end()), false),
@@ -1182,6 +1203,34 @@ mod tests {
         while !check() {
             assert!(Instant::now() < deadline, "timeout waiting for {what}");
             thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn wire_words_parse_with_shell_quoting() {
+        assert_eq!(tokenize("put a.wav 0").unwrap(), ["put", "a.wav", "0"]);
+        assert_eq!(
+            tokenize("put '/tmp/Bo FM.wav':00:00:00-00:00:10 0").unwrap(),
+            ["put", "/tmp/Bo FM.wav:00:00:00-00:00:10", "0"]
+        );
+        assert_eq!(tokenize("name 3 \"bed soft\"").unwrap(), ["name", "3", "bed soft"]);
+        assert_eq!(tokenize("put a\\ b.wav").unwrap(), ["put", "a b.wav"]);
+        assert!(tokenize("put 'unterminated").is_err());
+        // quote round-trips any argument, including quotes and backslashes.
+        for arg in [
+            "plain.wav",
+            "/tmp/Bo FM.wav",
+            "it's",
+            "a\"b\\c",
+            "bed-soft",
+            "00:00:00.000",
+        ] {
+            let quoted = quote_arg(arg);
+            assert_eq!(
+                tokenize(&quoted).unwrap(),
+                vec![arg.to_string()],
+                "quote({arg:?}) = {quoted:?}"
+            );
         }
     }
 
@@ -1493,6 +1542,10 @@ mod tests {
         // A bad timecode is refused with exit 2, session unaffected.
         let reply = send(&socket, "seek bogus");
         assert_eq!(reply.lines().next().unwrap(), "2", "{reply}");
+        // An unterminated quote is a protocol error, also exit 2.
+        let reply = send(&socket, "put 'unterminated");
+        assert_eq!(reply.lines().next().unwrap(), "2", "{reply}");
+        assert!(reply.contains("unterminated quote"), "{reply}");
 
         // stop ends the session: reply first, then cleanup.
         let reply = send(&socket, "stop");

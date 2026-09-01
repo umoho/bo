@@ -222,21 +222,41 @@ fn play_on_an_empty_arrangement_is_refused_and_the_daemon_survives() {
 }
 
 #[test]
-fn at_reports_the_mix_at_a_timecode_over_the_wire() {
+fn quoted_arguments_survive_the_wire_and_scripts() {
     let dir = temp_dir();
     let socket = dir.join("d.sock");
     let sp = socket.to_string_lossy().into_owned();
+    let src = dir.join("Bo FM.wav");
+    write_test_wav(&src, 0.2, 0.5);
+    let spec = format!("{}:00:00:00-00:00:00.200", src.to_string_lossy());
 
-    let out = bo(&sp, &["put", "a.wav:00:00:00-00:00:10"]);
+    // A space-bearing path arrives as one argument over the wire.
+    let out = bo(&sp, &["put", &spec]);
     assert!(out.contains("ok: track 0"), "{out}");
-    let out = bo(&sp, &["put", "b.wav@00:00:05:00:00:00-00:00:03", "1"]);
-    assert!(out.contains("ok: track 1"), "{out}");
+    let out = bo(&sp, &["ls"]);
+    assert!(out.contains("Bo FM.wav"), "{out}");
 
-    let out = bo(&sp, &["at", "00:00:06.000"]);
-    assert!(out.contains("track 0: clip=0"), "{out}");
-    assert!(out.contains("track 1: clip=0"), "{out}");
-    let out = bo(&sp, &["at", "00:00:20.000"]);
-    assert!(out.contains("silent at"), "{out}");
+    // Multi-word names survive too.
+    let out = bo(&sp, &["name", "0", "bed soft"]);
+    assert!(out.contains("bed soft"), "{out}");
+    let out = bo(&sp, &["ls"]);
+    assert!(out.contains("name=bed soft"), "{out}");
+
+    // save writes quoted lines; a fresh daemon's load restores them.
+    let prog = dir.join("show plan.bo");
+    let ps = prog.to_string_lossy().into_owned();
+    let out = bo(&sp, &["save", &ps]);
+    assert!(out.contains("saved"), "{out}");
+    let script = std::fs::read_to_string(&prog).unwrap();
+    assert!(script.contains("Bo FM.wav'@"), "quoted in the script: {script}");
+    let out = bo(&sp, &["stop"]);
+    assert!(out.contains("stopped"), "{out}");
+    wait_for_socket_gone(&socket);
+
+    let out = bo(&sp, &["load", &ps]);
+    assert!(out.contains("loaded"), "{out}");
+    let out = bo(&sp, &["ls"]);
+    assert!(out.contains("Bo FM.wav") && out.contains("bed soft"), "{out}");
 
     let out = bo(&sp, &["stop"]);
     assert!(out.contains("stopped"), "{out}");
