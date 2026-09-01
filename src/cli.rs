@@ -200,6 +200,14 @@ fn run_command(a: &mut Arrangement, args: &[String]) -> Result<String, (i32, Str
 /// fresh track and prints its index; an explicit one names a track, created on
 /// demand so that state scripts rebuild the same layout.
 fn put_command(a: &mut Arrangement, args: &[String]) -> Result<String, (i32, String)> {
+    // Options after `put` were not consumed by the top-level loop; `-h` shows
+    // the usage, anything else leading with `-` is a mistake, and crucially
+    // neither may become a clip spec.
+    match args.get(1).map(String::as_str) {
+        Some("-h") | Some("--help") => return Ok(USAGE.to_string()),
+        Some(s) if s.starts_with('-') => return Err(usage(format!("unknown option {s:?}"))),
+        _ => {}
+    }
     let (spec_arg, want_track) = parse_put_args(args)?;
     let spec = parse_spec(&spec_arg).map_err(usage)?;
     let track_index = match want_track {
@@ -514,11 +522,24 @@ mod tests {
     }
 
     #[test]
+    fn put_help_shows_usage_and_does_not_mutate() {
+        let mut a = Arrangement::default();
+        let out = run_ok(&mut a, &["put", "--help"]);
+        assert!(out.contains("bo put <spec> [track]"), "{out}");
+        assert!(a.player.tracks().is_empty(), "help must not create an arrangement");
+        let out = run_ok(&mut a, &["put", "-h"]);
+        assert!(out.contains("bo put <spec> [track]"), "{out}");
+        assert!(a.player.tracks().is_empty());
+    }
+
+    #[test]
     fn usage_errors_exit_with_code_two() {
         let mut a = Arrangement::default();
         assert_eq!(run_err(&mut a, &["nope"]).0, 2);
         assert_eq!(run_err(&mut a, &["put"]).0, 2);
         assert_eq!(run_err(&mut a, &["put", "a.wav", "x"]).0, 2, "bad track index");
         assert_eq!(run_err(&mut a, &["put", "a.wav", "0", "extra"]).0, 2, "too many arguments");
+        assert_eq!(run_err(&mut a, &["put", "--bogus"]).0, 2, "unknown option");
+        assert!(a.player.tracks().is_empty(), "an option must not become a clip");
     }
 }
