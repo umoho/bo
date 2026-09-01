@@ -30,7 +30,7 @@
 //! # Commands
 //!
 //! * `put <spec> [track]` — place a clip on a track; without `[track]` a new
-//!   track is created and its index printed, so later puts can name it. With
+//!   track is created and its index printed, so later puts can target it. With
 //!   `[track]` the track is used, created on demand (up to that index).
 //! * `play` — start playback from the current playhead; refused with exit 1
 //!   when the arrangement has nothing to play, and the reply opens with a
@@ -363,8 +363,8 @@ Transport:
   resume                   continue after a pause
   stop                     stop, rewind, end the session
   seek <t>                 move the playhead
-  apply                    rebuild the running transport, so pending
-                           volume/mute changes take effect now
+  apply                    rebuild the running transport, so pending mix
+                           changes take effect now
 
 OPTIONS
   --socket PATH            unix socket the daemon listens on
@@ -380,7 +380,7 @@ CLIP SPEC
 EXAMPLES
   bo put bed.wav:00:00:00-00:00:30
   bo put voice.wav:00:00:00-00:00:30 1
-  bo volume 0 0.4          # duck the bed under the voice
+  bo set track.0.volume 0.4  # duck the bed under the voice
   bo apply                 # make the change audible now
   bo play
   bo ls
