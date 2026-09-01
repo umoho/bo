@@ -40,9 +40,9 @@
 //! * `seek <t>` — move the playhead; a running transport re-plans.
 //! * `apply` — rebuild the running transport from the current playhead, so
 //!   pending mix changes take effect now.
-//! * `volume <track> <v>` — set a track's gain in the mix (0..1, clamped).
-//! * `mute <track>` / `unmute <track>` — silence or restore a track in the
-//!   mix.
+//! * `set <var> <value>` — set an attribute: `master` (real-time), or
+//!   `track.N.volume` / `track.N.muted` / `track.N.name` (arrangement data;
+//!   volume and mute land on the next `play` or `apply`).
 //! * `take <track> <clip>` — remove a clip; the clip is addressed by its
 //!   stable id or an `@timecode` (the clip covering that moment).
 //! * `render <file> [from-to]` — mix the arrangement to a wav file,
@@ -54,8 +54,6 @@
 //! * `check` — verify every distinct source is readable.
 //! * `probe [uri]` — measure the length of a source, or of every distinct
 //!   source in the arrangement; a bare uri is probed locally, no daemon.
-//! * `name <track> <name>` — label a track; names are single tokens in
-//!   scripts.
 //! * `ls` — dump the whole arrangement as machine-readable text: a `key: value`
 //!   status block, then one `key=value` line per track and per clip.
 //! * `at <t>` — show the mix at track time `t`: every clip covering that
@@ -175,29 +173,13 @@ enum Command {
         /// Source uri to measure; omit to probe the arrangement's sources.
         uri: Option<String>,
     },
-    /// Label a track; names are single tokens in scripts.
-    Name {
-        /// Track index.
-        track: usize,
-        /// Label.
-        name: String,
-    },
-    /// Set a track's gain in the mix, 0.0 ..= 1.0 (clamped).
-    Volume {
-        /// Track index.
-        track: usize,
-        /// Gain.
-        v: f32,
-    },
-    /// Mute a track in the mix.
-    Mute {
-        /// Track index.
-        track: usize,
-    },
-    /// Restore a muted track in the mix.
-    Unmute {
-        /// Track index.
-        track: usize,
+    /// Set an attribute: `master`, or `track.N.volume` / `track.N.muted` /
+    /// `track.N.name`.
+    Set {
+        /// Attribute path.
+        var: String,
+        /// Value: a gain, `true`/`false`, or a name.
+        value: String,
     },
     /// Start playback from the current playhead.
     Play,
@@ -367,12 +349,12 @@ Arrangement:
   check                    verify every source is readable
   probe [uri]              measure a source's length; without a uri, every
                            source in the arrangement
-  name <track> <name>      label a track
 
 Mix:
-  volume <track> <v>       set a track's gain, 0..1 (clamped)
-  mute <track>             silence a track in the mix
-  unmute <track>           restore a muted track
+  set master <v>           set the master gain, 0..1 (real-time)
+  set track.N.volume <v>   set a track's gain, 0..1 (apply to land)
+  set track.N.muted <b>    mute (true) or restore (false) a track
+  set track.N.name <name>  label a track
 
 Transport:
   play                     start playback from the current playhead
@@ -407,9 +389,9 @@ EXAMPLES
 
 /// Names of the user-facing subcommands: `bo <name> --help` must keep
 /// clap's own per-command help, while `bo --help` shows the grouped [`HELP`].
-const SUBCOMMAND_NAMES: [&str; 20] = [
-    "put", "take", "ls", "at", "render", "save", "load", "reset", "check", "probe", "name", "play", "pause",
-    "resume", "stop", "seek", "apply", "volume", "mute", "unmute",
+const SUBCOMMAND_NAMES: [&str; 17] = [
+    "put", "take", "ls", "at", "render", "save", "load", "reset", "check", "probe", "play", "pause",
+    "resume", "stop", "seek", "apply", "set",
 ];
 
 /// Tokenize a wire or script line: whitespace-separated words with
@@ -571,33 +553,7 @@ fn dispatch(a: &mut Arrangement, command: Command) -> Result<String, (i32, Strin
             Ok(format!("playhead at {}\n", format_time(t)))
         }
         Command::Apply => apply_command(a),
-        Command::Volume { track, v } => {
-            let t = a
-                .player
-                .tracks_mut()
-                .get_mut(track)
-                .ok_or_else(|| fail(format!("no track {track}")))?;
-            t.set_volume(v);
-            Ok(format!("track {track} volume {:.2}\n", t.volume()))
-        }
-        Command::Mute { track } => {
-            let t = a
-                .player
-                .tracks_mut()
-                .get_mut(track)
-                .ok_or_else(|| fail(format!("no track {track}")))?;
-            t.set_muted(true);
-            Ok(format!("track {track} muted\n"))
-        }
-        Command::Unmute { track } => {
-            let t = a
-                .player
-                .tracks_mut()
-                .get_mut(track)
-                .ok_or_else(|| fail(format!("no track {track}")))?;
-            t.set_muted(false);
-            Ok(format!("track {track} unmuted\n"))
-        }
+        Command::Set { var, value } => set_command(a, &var, &value),
         Command::Take { track, clip } => take_command(a, track, &clip),
         Command::Render { file, range } => {
             let (from, to) = match range {
@@ -642,15 +598,6 @@ fn dispatch(a: &mut Arrangement, command: Command) -> Result<String, (i32, Strin
             None => probe_arrangement(a),
             Some(uri) => probe_uri(&uri),
         },
-        Command::Name { track, name } => {
-            let t = a
-                .player
-                .tracks_mut()
-                .get_mut(track)
-                .ok_or_else(|| fail(format!("no track {track}")))?;
-            t.set_name(name.clone());
-            Ok(format!("track {track} named {name:?}\n"))
-        }
         // Help is handled locally by the client; this arm keeps a stray
         // "help" line over the socket harmless.
         Command::Help => Ok(HELP.to_string()),
@@ -858,6 +805,63 @@ fn reset_command(a: &mut Arrangement) -> Result<String, (i32, String)> {
     Ok(format!("reset: {tracks} {noun} removed\n"))
 }
 
+/// `set <var> <value>`: set an attribute. `master` is real-time — the backend
+/// is told immediately. `track.N.volume` / `track.N.muted` / `track.N.name`
+/// are arrangement data that land on the next `play` or `apply`.
+fn set_command(a: &mut Arrangement, var: &str, value: &str) -> Result<String, (i32, String)> {
+    match var {
+        "master" => {
+            let v: f32 = value
+                .parse()
+                .map_err(|_| usage(format!("bad gain {value:?}")))?;
+            a.player.set_volume(v);
+            Ok(format!("master {:.2}\n", a.player.volume()))
+        }
+        _ => {
+            let (index, prop) = var
+                .strip_prefix("track.")
+                .and_then(|rest| rest.split_once('.'))
+                .ok_or_else(|| usage(format!("unknown var {var:?}")))?;
+            let index: usize = index
+                .parse()
+                .map_err(|_| usage(format!("bad track {index:?}")))?;
+            let t = a
+                .player
+                .tracks_mut()
+                .get_mut(index)
+                .ok_or_else(|| fail(format!("no track {index}")))?;
+            match prop {
+                "volume" => {
+                    let v: f32 = value
+                        .parse()
+                        .map_err(|_| usage(format!("bad gain {value:?}")))?;
+                    t.set_volume(v);
+                    Ok(format!("track {index} volume {:.2}\n", t.volume()))
+                }
+                "muted" => {
+                    let b = parse_bool(value).map_err(usage)?;
+                    t.set_muted(b);
+                    Ok(format!("track {index} {}\n", if b { "muted" } else { "unmuted" }))
+                }
+                "name" => {
+                    t.set_name(value.to_string());
+                    Ok(format!("track {index} named {value:?}\n"))
+                }
+                _ => Err(usage(format!("unknown property {prop:?} on a track"))),
+            }
+        }
+    }
+}
+
+/// Parse a boolean value: `true`/`false` (or `1`/`0`).
+fn parse_bool(s: &str) -> Result<bool, String> {
+    match s.trim() {
+        "true" | "1" => Ok(true),
+        "false" | "0" => Ok(false),
+        _ => Err(format!("bad boolean {s:?}: true or false")),
+    }
+}
+
 /// `probe <uri>`: measure one source. Used both locally (no daemon) and over
 /// the wire.
 fn probe_uri(uri: &str) -> Result<String, (i32, String)> {
@@ -941,9 +945,7 @@ fn command_line(command: &Command) -> String {
         Command::Stop => "stop".to_string(),
         Command::Seek { at } => format!("seek {}", quote_arg(at)),
         Command::Apply => "apply".to_string(),
-        Command::Volume { track, v } => format!("volume {track} {v}"),
-        Command::Mute { track } => format!("mute {track}"),
-        Command::Unmute { track } => format!("unmute {track}"),
+        Command::Set { var, value } => format!("set {} {}", quote_arg(var), quote_arg(value)),
         Command::Take { track, clip } => format!("take {track} {}", quote_arg(clip)),
         Command::Render { file, range } => match range {
             Some(r) => format!("render {} {}", quote_arg(file), quote_arg(r)),
@@ -957,7 +959,6 @@ fn command_line(command: &Command) -> String {
             Some(uri) => format!("probe {}", quote_arg(uri)),
             None => "probe".to_string(),
         },
-        Command::Name { track, name } => format!("name {track} {}", quote_arg(name)),
         Command::Help => unreachable!("help is handled locally, never sent"),
         Command::Daemon => unreachable!("the daemon is spawned, not sent"),
     }
@@ -969,6 +970,7 @@ fn command_line(command: &Command) -> String {
 fn serialize(a: &Arrangement) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "# bo arrangement v1");
+    let _ = writeln!(out, "set master {}", a.player.volume());
     for (ti, t) in a.player.tracks().iter().enumerate() {
         if t.clips().is_empty() {
             continue; // empty tracks carry nothing worth saving
@@ -985,11 +987,11 @@ fn serialize(a: &Arrangement) -> String {
             );
         }
         if let Some(name) = t.name() {
-            let _ = writeln!(out, "name {ti} {}", quote_arg(name));
+            let _ = writeln!(out, "set track.{ti}.name {}", quote_arg(name));
         }
-        let _ = writeln!(out, "volume {ti} {}", t.volume());
+        let _ = writeln!(out, "set track.{ti}.volume {}", t.volume());
         if t.muted() {
-            let _ = writeln!(out, "mute {ti}");
+            let _ = writeln!(out, "set track.{ti}.muted true");
         }
     }
     out
@@ -1356,7 +1358,7 @@ mod tests {
             tokenize("put '/tmp/Bo FM.wav':00:00:00-00:00:10 0").unwrap(),
             ["put", "/tmp/Bo FM.wav:00:00:00-00:00:10", "0"]
         );
-        assert_eq!(tokenize("name 3 \"bed soft\"").unwrap(), ["name", "3", "bed soft"]);
+        assert_eq!(tokenize("set track.3.name \"bed soft\"").unwrap(), ["set", "track.3.name", "bed soft"]);
         assert_eq!(tokenize("put a\\ b.wav").unwrap(), ["put", "a b.wav"]);
         assert!(tokenize("put 'unterminated").is_err());
         // quote round-trips any argument, including quotes and backslashes.
@@ -1539,18 +1541,27 @@ mod tests {
     }
 
     #[test]
-    fn volume_sets_a_tracks_gain_in_the_mix() {
+    fn set_writes_track_volume_and_master() {
         let mut a = Arrangement::default();
         run_ok(&mut a, &["put", "a.wav:00:00:00-00:00:10"]);
-        let out = run_ok(&mut a, &["volume", "0", "0.5"]);
+        let out = run_ok(&mut a, &["set", "track.0.volume", "0.5"]);
         assert!(out.contains("track 0 volume 0.50"), "{out}");
         assert_eq!(a.player.tracks()[0].volume(), 0.5);
-        run_ok(&mut a, &["volume", "0", "2.5"]);
+        run_ok(&mut a, &["set", "track.0.volume", "2.5"]);
         assert_eq!(a.player.tracks()[0].volume(), 1.0, "clamped");
-        let (code, msg) = run_err(&mut a, &["volume", "9", "0.5"]);
+        let (code, msg) = run_err(&mut a, &["set", "track.9.volume", "0.5"]);
         assert_eq!(code, 1);
         assert!(msg.contains("no track 9"), "{msg}");
         assert!(run_ok(&mut a, &["ls"]).contains("volume=1.00"), "ls shows the gain");
+
+        // Master is real-time and clamped too.
+        let out = run_ok(&mut a, &["set", "master", "0.78"]);
+        assert!(out.contains("master 0.78"), "{out}");
+        assert_eq!(a.player.volume(), 0.78);
+        let (code, _) = run_err(&mut a, &["set", "master", "abc"]);
+        assert_eq!(code, 2);
+        let (code, _) = run_err(&mut a, &["set", "track.0.volume", "abc"]);
+        assert_eq!(code, 2);
     }
 
     #[test]
@@ -1595,7 +1606,7 @@ mod tests {
         // Playing: rebuild from the current playhead; playhead untouched.
         run_ok(&mut a, &["play"]);
         run_ok(&mut a, &["seek", "00:00:04"]);
-        run_ok(&mut a, &["volume", "0", "0.5"]);
+        run_ok(&mut a, &["set", "track.0.volume", "0.5"]);
         let out = run_ok(&mut a, &["apply"]);
         assert!(out.contains("rebuilt from 00:00:04.000"), "{out}");
         assert_eq!(plays(&a), 3, "play + seek + apply");
@@ -1611,7 +1622,7 @@ mod tests {
         let mut a = Arrangement::default();
         run_ok(&mut a, &["put", "a.wav:00:00:00-00:00:10"]);
         run_ok(&mut a, &["put", "b.wav:00:00:00-00:00:05"]);
-        run_ok(&mut a, &["name", "0", "bed"]);
+        run_ok(&mut a, &["set", "track.0.name", "bed"]);
         run_ok(&mut a, &["play"]);
         let out = run_ok(&mut a, &["reset"]);
         assert!(out.contains("reset: 2 tracks removed"), "{out}");
@@ -1666,24 +1677,26 @@ mod tests {
     }
 
     #[test]
-    fn mute_and_unmute_toggle_a_track_in_the_mix() {
+    fn set_mutes_and_restores_a_track() {
         let mut a = Arrangement::default();
         run_ok(&mut a, &["put", "a.wav:00:00:00-00:00:10"]);
-        let out = run_ok(&mut a, &["mute", "0"]);
+        let out = run_ok(&mut a, &["set", "track.0.muted", "true"]);
         assert!(out.contains("track 0 muted"), "{out}");
         assert!(a.player.tracks()[0].muted());
-        let out = run_ok(&mut a, &["unmute", "0"]);
+        let out = run_ok(&mut a, &["set", "track.0.muted", "false"]);
         assert!(out.contains("track 0 unmuted"), "{out}");
         assert!(!a.player.tracks()[0].muted());
         assert!(!run_ok(&mut a, &["ls"]).contains("muted"), "no marker when unmuted");
-        run_ok(&mut a, &["mute", "0"]);
+        run_ok(&mut a, &["set", "track.0.muted", "true"]);
         assert!(run_ok(&mut a, &["ls"]).contains("muted"), "ls shows the marker");
-        let (code, msg) = run_err(&mut a, &["mute", "9"]);
+        let (code, msg) = run_err(&mut a, &["set", "track.9.muted", "true"]);
         assert_eq!(code, 1);
         assert!(msg.contains("no track 9"), "{msg}");
-        let (code, msg) = run_err(&mut a, &["unmute", "9"]);
+        let (code, msg) = run_err(&mut a, &["set", "track.9.muted", "false"]);
         assert_eq!(code, 1);
         assert!(msg.contains("no track 9"), "{msg}");
+        let (code, _) = run_err(&mut a, &["set", "track.0.muted", "yes"]);
+        assert_eq!(code, 2, "bad boolean is a usage error");
     }
 
     #[test]
@@ -1718,11 +1731,11 @@ mod tests {
         let reply = send(&socket, "ls");
         assert!(reply.contains("track 0: volume=1.00 clips=1") && reply.contains("a.wav"), "{reply}");
 
-        let reply = send(&socket, "volume 0 0.5");
+        let reply = send(&socket, "set track.0.volume 0.5");
         assert!(reply.contains("track 0 volume 0.50"), "{reply}");
-        let reply = send(&socket, "mute 0");
+        let reply = send(&socket, "set track.0.muted true");
         assert!(reply.contains("track 0 muted"), "{reply}");
-        let reply = send(&socket, "unmute 0");
+        let reply = send(&socket, "set track.0.muted false");
         assert!(reply.contains("track 0 unmuted"), "{reply}");
         let reply = send(&socket, "take 0 0");
         assert!(reply.contains("removed track 0 clip #0"), "{reply}");
@@ -1742,7 +1755,7 @@ mod tests {
 
         // Refill the empty arrangement, name the track, and check the source.
         send(&socket, "put a.wav:00:00:00-00:00:10");
-        let reply = send(&socket, "name 0 bed");
+        let reply = send(&socket, "set track.0.name bed");
         assert!(reply.contains("named \"bed\""), "{reply}");
         // a.wav does not exist, so check must report it.
         let reply = send(&socket, "check");
@@ -1818,13 +1831,13 @@ mod tests {
     }
 
     #[test]
-    fn name_labels_a_track() {
+    fn set_names_a_track() {
         let mut a = Arrangement::default();
         run_ok(&mut a, &["put", "a.wav:00:00:00-00:00:10"]);
-        let out = run_ok(&mut a, &["name", "0", "bed"]);
+        let out = run_ok(&mut a, &["set", "track.0.name", "bed"]);
         assert!(out.contains("track 0 named \"bed\""), "{out}");
         assert!(run_ok(&mut a, &["ls"]).contains("track 0: name=bed"), "ls shows the label");
-        let (code, msg) = run_err(&mut a, &["name", "9", "x"]);
+        let (code, msg) = run_err(&mut a, &["set", "track.9.name", "x"]);
         assert_eq!(code, 1);
         assert!(msg.contains("no track 9"), "{msg}");
     }
@@ -1834,12 +1847,16 @@ mod tests {
         let mut a = Arrangement::default();
         run_ok(&mut a, &["put", "bed.wav:00:00:05-00:00:25"]);
         run_ok(&mut a, &["put", "ding.wav@00:00:00:00:00:01-00:00:02", "1"]);
-        run_ok(&mut a, &["name", "0", "bed"]);
-        run_ok(&mut a, &["volume", "0", "0.5"]);
-        run_ok(&mut a, &["mute", "1"]);
+        run_ok(&mut a, &["set", "track.0.name", "bed"]);
+        run_ok(&mut a, &["set", "track.0.volume", "0.5"]);
+        run_ok(&mut a, &["set", "track.1.muted", "true"]);
+        run_ok(&mut a, &["set", "master", "0.78"]);
 
         let script = serialize(&a);
-        assert!(script.contains("name 0 bed") && script.contains("volume 0 0.5") && script.contains("mute 1"), "{script}");
+        assert!(script.contains("set track.0.name bed"), "{script}");
+        assert!(script.contains("set track.0.volume 0.5"), "{script}");
+        assert!(script.contains("set track.1.muted true"), "{script}");
+        assert!(script.contains("set master 0.78"), "master is saved: {script}");
         let mut fresh = Arrangement::default();
         run_script(&mut fresh, &script, "test").unwrap();
         assert_eq!(serialize(&fresh), script, "the script rebuilds the same arrangement");
@@ -1852,13 +1869,15 @@ mod tests {
         let path = file.to_string_lossy().into_owned();
         let mut a = Arrangement::default();
         run_ok(&mut a, &["put", "a.wav:00:00:00-00:00:10"]);
-        run_ok(&mut a, &["name", "0", "bed"]);
-        run_ok(&mut a, &["volume", "0", "0.5"]);
+        run_ok(&mut a, &["set", "track.0.name", "bed"]);
+        run_ok(&mut a, &["set", "track.0.volume", "0.5"]);
+        run_ok(&mut a, &["set", "master", "0.78"]);
         run_ok(&mut a, &["save", &path]);
 
         let mut b = Arrangement::default();
         run_ok(&mut b, &["load", &path]);
         assert_eq!(serialize(&b), serialize(&a));
+        assert_eq!(b.player.volume(), 0.78, "master survives the round trip");
 
         // A failing script leaves the live arrangement untouched.
         std::fs::write(&file, "put a.wav:00:00:00-00:00:10 0\nput b.wav@00:00:05:00:00:00-00:00:10 0\n")
