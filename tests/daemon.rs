@@ -50,7 +50,9 @@ fn client_spawns_a_daemon_and_it_cleans_up_when_done() {
 
     // The second command sees the same arrangement over the wire.
     let out = bo(&sp, &["ls"]);
-    assert!(out.contains("track 0  2 clips"), "{out}");
+    assert!(out.contains("track 0  volume 1.00  2 clips"), "{out}");
+    let out = bo(&sp, &["volume", "0", "0.25"]);
+    assert!(out.contains("track 0 volume 0.25"), "{out}");
 
     // Play the 0.4s program: the daemon exits and removes its socket.
     let out = bo(&sp, &["play"]);

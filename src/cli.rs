@@ -28,6 +28,7 @@
 //! * `pause` / `resume` — hold and continue, keeping the position.
 //! * `stop` — stop and rewind; ends the daemon's session (cleanup as usual).
 //! * `seek <t>` — move the playhead; a running transport re-plans.
+//! * `volume <track> <v>` — set a track's gain in the mix (0..1, clamped).
 //! * `ls` — dump the whole arrangement.
 //!
 //! # Clip specs
@@ -107,6 +108,13 @@ enum Command {
     Seek {
         /// Target timecode.
         at: String,
+    },
+    /// Set a track's gain in the mix, 0.0 ..= 1.0 (clamped).
+    Volume {
+        /// Track index.
+        track: usize,
+        /// Gain.
+        v: f32,
     },
     /// Hidden: run the playback daemon (spawned by the client on demand).
     #[command(hide = true)]
@@ -275,6 +283,15 @@ fn dispatch(a: &mut Arrangement, command: Command) -> Result<String, (i32, Strin
             a.player.seek(t).map_err(|e| fail(e.to_string()))?;
             Ok(format!("playhead at {}\n", format_time(t)))
         }
+        Command::Volume { track, v } => {
+            let t = a
+                .player
+                .tracks_mut()
+                .get_mut(track)
+                .ok_or_else(|| fail(format!("no track {track}")))?;
+            t.set_volume(v);
+            Ok(format!("track {track} volume {:.2}\n", t.volume()))
+        }
         Command::Daemon => Err(fail("the daemon runs standalone, not over the socket")),
     }
 }
@@ -296,8 +313,8 @@ fn format_arrangement(a: &Arrangement) -> String {
         let dur = t.duration().map(format_time).unwrap_or_else(|| "inf".into());
         let noun = if t.len() == 1 { "clip" } else { "clips" };
         let head = match t.name() {
-            Some(name) => format!("track {ti} {name:?}  {} {noun}", t.len()),
-            None => format!("track {ti}  {} {noun}", t.len()),
+            Some(name) => format!("track {ti} {name:?}  volume {:.2}  {} {noun}", t.volume(), t.len()),
+            None => format!("track {ti}  volume {:.2}  {} {noun}", t.volume(), t.len()),
         };
         let _ = writeln!(out, "{head}  -> {dur}");
         for (ci, c) in t.clips().iter().enumerate() {
@@ -377,6 +394,7 @@ fn command_line(command: &Command) -> String {
         Command::Resume => "resume".to_string(),
         Command::Stop => "stop".to_string(),
         Command::Seek { at } => format!("seek {at}"),
+        Command::Volume { track, v } => format!("volume {track} {v}"),
         Command::Daemon => unreachable!("the daemon is spawned, not sent"),
     }
 }
@@ -725,10 +743,25 @@ mod tests {
         run_ok(&mut a, &["put", "b.wav@00:00:10:00:00:00-00:00:05", "0"]);
         let out = run_ok(&mut a, &["ls"]);
         assert!(out.contains("player: stopped"), "{out}");
-        assert!(out.contains("track 0  2 clips"), "{out}");
+        assert!(out.contains("track 0  volume 1.00  2 clips"), "{out}");
         assert!(out.contains("a.wav") && out.contains("b.wav"), "{out}");
         let out = run_ok(&mut a, &["ls"]);
         assert!(out.contains("00:00:10.000 -> 00:00:15.000"), "butt-joined clip: {out}");
+    }
+
+    #[test]
+    fn volume_sets_a_tracks_gain_in_the_mix() {
+        let mut a = Arrangement::default();
+        run_ok(&mut a, &["put", "a.wav:00:00:00-00:00:10"]);
+        let out = run_ok(&mut a, &["volume", "0", "0.5"]);
+        assert!(out.contains("track 0 volume 0.50"), "{out}");
+        assert_eq!(a.player.tracks()[0].volume(), 0.5);
+        run_ok(&mut a, &["volume", "0", "2.5"]);
+        assert_eq!(a.player.tracks()[0].volume(), 1.0, "clamped");
+        let (code, msg) = run_err(&mut a, &["volume", "9", "0.5"]);
+        assert_eq!(code, 1);
+        assert!(msg.contains("no track 9"), "{msg}");
+        assert!(run_ok(&mut a, &["ls"]).contains("volume 1.00"), "ls shows the gain");
     }
 
     #[test]
@@ -761,7 +794,10 @@ mod tests {
 
         send(&socket, "put a.wav:00:00:00-00:00:10");
         let reply = send(&socket, "ls");
-        assert!(reply.contains("track 0  1 clip") && reply.contains("a.wav"), "{reply}");
+        assert!(reply.contains("track 0  volume 1.00  1 clip") && reply.contains("a.wav"), "{reply}");
+
+        let reply = send(&socket, "volume 0 0.5");
+        assert!(reply.contains("track 0 volume 0.50"), "{reply}");
 
         let reply = send(&socket, "seek 00:00:05");
         assert!(reply.contains("playhead at 00:00:05.000"), "{reply}");

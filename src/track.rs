@@ -169,10 +169,21 @@ impl std::error::Error for Overlap {}
 /// Non-overlap is this type's invariant — a single track cannot play two
 /// sources at the same timecode. Stacking happens *across* tracks, which is what
 /// [`Player`](crate::engine::Player) mixes.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Track {
     name: Option<String>,
+    volume: f32,
     clips: Vec<Clip>,
+}
+
+impl Default for Track {
+    fn default() -> Self {
+        Self {
+            name: None,
+            volume: 1.0,
+            clips: Vec::new(),
+        }
+    }
 }
 
 impl Track {
@@ -187,6 +198,7 @@ impl Track {
     pub fn named(name: impl Into<String>) -> Self {
         Self {
             name: Some(name.into()),
+            volume: 1.0,
             clips: Vec::new(),
         }
     }
@@ -200,6 +212,20 @@ impl Track {
     /// Relabel the track.
     pub fn set_name(&mut self, name: impl Into<String>) {
         self.name = Some(name.into());
+    }
+
+    /// Gain of this track in the mix, `0.0 ..= 1.0`; full gain by default.
+    ///
+    /// Volume is arrangement data — the backend reads it from the track when
+    /// planning a mix, so gain can never drift from the arrangement.
+    #[must_use]
+    pub fn volume(&self) -> f32 {
+        self.volume
+    }
+
+    /// Set the track's gain in the mix, clamped to `0.0 ..= 1.0`.
+    pub fn set_volume(&mut self, volume: f32) {
+        self.volume = volume.clamp(0.0, 1.0);
     }
 
     /// The clips, ordered by track position.
@@ -361,6 +387,21 @@ mod tests {
             "it still covers later time"
         );
         assert!(t.clip_at(secs(1)).is_none(), "silent before it starts");
+    }
+
+    #[test]
+    fn tracks_carry_their_own_volume() {
+        let mut t = Track::named("bed");
+        assert_eq!(t.volume(), 1.0, "full gain by default");
+        t.set_volume(0.5);
+        assert_eq!(t.volume(), 0.5);
+        t.set_volume(2.5);
+        assert_eq!(t.volume(), 1.0, "clamped");
+        t.set_volume(-1.0);
+        assert_eq!(t.volume(), 0.0);
+        // Gain does not touch the timeline.
+        t.insert(Clip::new(src("a", Some(secs(10))))).unwrap();
+        assert_eq!(t.duration(), Some(secs(10)));
     }
 
     #[test]
