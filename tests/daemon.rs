@@ -319,6 +319,24 @@ fn reset_clears_the_arrangement_for_a_run_sheet_replay() {
 }
 
 #[test]
+fn put_repeat_places_butt_joined_copies_over_the_wire() {
+    let dir = temp_dir();
+    let socket = dir.join("d.sock");
+    let sp = socket.to_string_lossy().into_owned();
+
+    let out = bo(&sp, &["put", "--repeat", "3", "crackle.wav:00:00:00-00:00:12"]);
+    assert_eq!(out.matches("ok: track 0 clip #").count(), 3, "{out}");
+    let out = bo(&sp, &["ls"]);
+    assert!(out.contains("clips=3"), "{out}");
+    assert!(out.contains("at=00:00:12.000") && out.contains("at=00:00:24.000"), "{out}");
+
+    let out = bo(&sp, &["stop"]);
+    assert!(out.contains("stopped"), "{out}");
+    wait_for_socket_gone(&socket);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn idle_timeout_cleans_up_a_quiet_paused_daemon() {
     let dir = temp_dir();
     let socket = dir.join("d.sock");

@@ -29,9 +29,12 @@
 //!
 //! # Commands
 //!
-//! * `put <spec> [track]` — place a clip on a track; without `[track]` a new
-//!   track is created and its index printed, so later puts can target it. With
-//!   `[track]` the track is used, created on demand (up to that index).
+//! * `put [--repeat n] <spec> [track]` — place a clip, or n butt-joined
+//!   copies of it, on a track; without `[track]` a new track is created and
+//!   its index printed, so later puts can target it. With `[track]` the track
+//!   is used, created on demand (up to that index). A repeated clip must have
+//!   a known end (`uri:from-to`), and the whole batch is refused atomically
+//!   if any copy collides.
 //! * `play` — start playback from the current playhead; refused with exit 1
 //!   when the arrangement has nothing to play, and the reply opens with a
 //!   `session:` summary of what is about to play.
@@ -129,6 +132,9 @@ enum Command {
         spec: String,
         /// Track index; omit to create a fresh track.
         track: Option<usize>,
+        /// Place this many butt-joined copies of the clip.
+        #[arg(long)]
+        repeat: Option<u32>,
     },
     /// Remove a clip by its id or the `@timecode` it covers.
     Take {
@@ -335,6 +341,7 @@ COMMANDS
 Arrangement:
   put <spec> [track]       place a clip; without [track] a new track is
                            created and its index printed
+                           (--repeat n places n butt-joined copies)
   take <track> <clip>      remove a clip — by its id, or the @timecode it
                            covers
   ls                       dump the arrangement; a key: value status block,
@@ -531,7 +538,7 @@ fn parse_command(args: &[String]) -> Result<Command, clap::Error> {
 /// Run a parsed subcommand against the arrangement.
 fn dispatch(a: &mut Arrangement, command: Command) -> Result<String, (i32, String)> {
     match command {
-        Command::Put { spec, track } => put_command(a, &spec, track),
+        Command::Put { spec, track, repeat } => put_command(a, &spec, track, repeat),
         Command::Play => play_command(a),
         Command::Ls => Ok(format_arrangement(a)),
         Command::At { at } => at_command(a, &at),
@@ -715,13 +722,25 @@ fn take_command(
 ///
 /// The identifier in the output is the contract: an implicit put creates a
 /// fresh track and prints its index; an explicit one names a track, created on
-/// demand so that repeated puts rebuild the same layout.
+/// demand so that repeated puts rebuild the same layout. With `--repeat n`,
+/// places n butt-joined copies as ordinary clips; the whole batch is checked
+/// before any insert, so a collision refuses everything.
 fn put_command(
     a: &mut Arrangement,
     spec_arg: &str,
     want_track: Option<usize>,
+    repeat: Option<u32>,
 ) -> Result<String, (i32, String)> {
+    let repeat = repeat.unwrap_or(1);
+    if repeat == 0 {
+        return Err(usage("repeat must be at least 1"));
+    }
     let spec = parse_spec(spec_arg).map_err(usage)?;
+    if repeat > 1 && spec.to.is_none() {
+        return Err(usage(
+            "cannot repeat a clip with no known end (slice it: uri:from-to)",
+        ));
+    }
     let track_index = match want_track {
         Some(i) => {
             while a.player.tracks().len() <= i {
@@ -732,26 +751,50 @@ fn put_command(
         None => a.player.add_track(Track::new()),
     };
     let source = Arc::new(Source::new(spec.uri.clone()));
-    let clip = Clip::sliced(source, spec.from, spec.to);
-    let clip = match spec.at {
-        Some(at) => clip.at(at),
-        None => clip,
+    let base_at = spec.at.unwrap_or_default();
+    let slice_len = if repeat > 1 {
+        let len = spec.to.unwrap_or_default() - spec.from;
+        if len == Duration::ZERO {
+            return Err(usage("cannot repeat a zero-length slice"));
+        }
+        len
+    } else {
+        Duration::ZERO
     };
-    let id = match a.player.tracks_mut()[track_index].insert(clip) {
-        Ok(id) => id,
-        Err((_, overlap)) => return Err(fail(format!("refused: {overlap}"))),
-    };
-    let placed = a.player.tracks()[track_index]
-        .clips()
-        .iter()
-        .find(|c| c.id == id)
-        .expect("the inserted clip is in the track");
-    let open = if placed.duration().is_none() { " (open-ended)" } else { "" };
-    Ok(format!(
-        "ok: track {track_index} clip #{id} {} @ {}{open}\n",
-        placed.source.uri,
-        format_time(placed.at)
-    ))
+    let clips: Vec<Clip> = (0..repeat)
+        .map(|i| Clip::sliced(source.clone(), spec.from, spec.to).at(base_at + slice_len * i))
+        .collect();
+    // Atomic: verify every copy fits before inserting any, so a collision
+    // leaves no trace. The daemon holds the arrangement lock throughout.
+    let track = &a.player.tracks()[track_index];
+    for (i, c) in clips.iter().enumerate() {
+        if let Some(conflict) = track.clips().iter().find(|x| x.overlaps(c)) {
+            return Err(fail(format!(
+                "refused: copy {i} at {}s collides with clip #{}",
+                c.at.as_secs_f64(),
+                conflict.id
+            )));
+        }
+    }
+    let mut out = String::new();
+    for c in clips {
+        let id = a.player.tracks_mut()[track_index]
+            .insert(c)
+            .expect("pre-checked: the insert cannot collide");
+        let placed = a.player.tracks()[track_index]
+            .clips()
+            .iter()
+            .find(|x| x.id == id)
+            .expect("the inserted clip is in the track");
+        let open = if placed.duration().is_none() { " (open-ended)" } else { "" };
+        let _ = writeln!(
+            out,
+            "ok: track {track_index} clip #{id} {} @ {}{open}",
+            placed.source.uri,
+            format_time(placed.at)
+        );
+    }
+    Ok(out)
 }
 
 /// `play`: refuse an arrangement with nothing to play, then start playback
@@ -933,10 +976,17 @@ fn parse_range(s: &str) -> Result<(Duration, Option<Duration>), String> {
 /// names with whitespace survive [`handle_line`]'s tokenizer.
 fn command_line(command: &Command) -> String {
     match command {
-        Command::Put { spec, track } => match track {
-            Some(t) => format!("put {} {t}", quote_arg(spec)),
-            None => format!("put {}", quote_arg(spec)),
-        },
+        Command::Put { spec, track, repeat } => {
+            let mut line = String::from("put");
+            if let Some(n) = repeat {
+                let _ = write!(line, " --repeat {n}");
+            }
+            let _ = write!(line, " {}", quote_arg(spec));
+            if let Some(t) = track {
+                let _ = write!(line, " {t}");
+            }
+            line
+        }
         Command::Play => "play".to_string(),
         Command::Ls => "ls".to_string(),
         Command::At { at } => format!("at {}", quote_arg(at)),
@@ -1561,6 +1611,49 @@ mod tests {
         let (code, _) = run_err(&mut a, &["set", "master", "abc"]);
         assert_eq!(code, 2);
         let (code, _) = run_err(&mut a, &["set", "track.0.volume", "abc"]);
+        assert_eq!(code, 2);
+    }
+
+    #[test]
+    fn put_repeat_places_butt_joined_copies() {
+        let mut a = Arrangement::default();
+        let out = run_ok(&mut a, &["put", "--repeat", "3", "crackle.wav:00:00:00-00:00:12"]);
+        assert_eq!(out.matches("ok: track 0 clip #").count(), 3, "{out}");
+        let t = &a.player.tracks()[0];
+        assert_eq!(t.clips().len(), 3);
+        assert_eq!(t.clips()[0].at, Duration::ZERO);
+        assert_eq!(t.clips()[1].at, Duration::from_secs(12));
+        assert_eq!(t.clips()[2].at, Duration::from_secs(24));
+        assert_eq!(
+            (t.clips()[0].id, t.clips()[1].id, t.clips()[2].id),
+            (0, 1, 2),
+            "each copy is an ordinary clip with its own id"
+        );
+        // Copies are independent: removing one leaves the others.
+        let out = run_ok(&mut a, &["take", "0", "1"]);
+        assert!(out.contains("removed track 0 clip #1"), "{out}");
+        assert_eq!(a.player.tracks()[0].clips().len(), 2);
+    }
+
+    #[test]
+    fn put_repeat_is_atomic_and_refuses_bad_input() {
+        let mut a = Arrangement::default();
+        // a occupies 15s..25s; copy 3 of a 5s slice lands at 15s and collides.
+        run_ok(&mut a, &["put", "a.wav@00:00:15:00:00:00-00:00:10"]);
+        let (code, msg) = run_err(&mut a, &["put", "--repeat", "4", "b.wav:00:00:00-00:00:05", "0"]);
+        assert_eq!(code, 1);
+        assert!(msg.contains("copy 3") && msg.contains("collides"), "{msg}");
+        assert_eq!(a.player.tracks()[0].clips().len(), 1, "no trace");
+
+        // Open-ended clips cannot repeat.
+        let (code, msg) = run_err(&mut a, &["put", "--repeat", "2", "live.wav"]);
+        assert_eq!(code, 2);
+        assert!(msg.contains("no known end"), "{msg}");
+
+        // Zero copies and zero-length slices are nonsense.
+        let (code, _) = run_err(&mut a, &["put", "--repeat", "0", "c.wav:00:00:00-00:00:10"]);
+        assert_eq!(code, 2);
+        let (code, _) = run_err(&mut a, &["put", "--repeat", "2", "c.wav:00:00:00-00:00:00"]);
         assert_eq!(code, 2);
     }
 
