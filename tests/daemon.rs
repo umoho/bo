@@ -24,6 +24,21 @@ fn bo(socket: &str, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+/// Run `bo` and return (exit code, stdout), without asserting success.
+fn bo_exit(socket: &str, args: &[&str]) -> (i32, String) {
+    let out = Command::new(env!("CARGO_BIN_EXE_bo"))
+        .env("BO_BACKEND", "silent")
+        .arg("--socket")
+        .arg(socket)
+        .args(args)
+        .output()
+        .expect("bo runs");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+    )
+}
+
 fn temp_dir() -> PathBuf {
     static N: AtomicUsize = AtomicUsize::new(0);
     let dir = std::env::temp_dir().join(format!(
@@ -172,6 +187,33 @@ fn probe_measures_locally_without_a_daemon_and_over_the_wire() {
     let out = bo(&sp, &["probe"]);
     assert!(out.contains("probe: 1 source"), "{out}");
     assert!(out.contains("00:00:00.200"), "{out}");
+
+    let out = bo(&sp, &["stop"]);
+    assert!(out.contains("stopped"), "{out}");
+    wait_for_socket_gone(&socket);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn play_on_an_empty_arrangement_is_refused_and_the_daemon_survives() {
+    let dir = temp_dir();
+    let socket = dir.join("d.sock");
+    let sp = socket.to_string_lossy().into_owned();
+
+    // Spawn a daemon, then empty the arrangement out from under it.
+    let out = bo(&sp, &["put", "a.wav:00:00:00-00:00:10"]);
+    assert!(out.contains("ok: track 0"), "{out}");
+    let out = bo(&sp, &["take", "0", "0"]);
+    assert!(out.contains("removed"), "{out}");
+
+    // play on nothing: refused with exit 1, not a fake success.
+    let (code, out) = bo_exit(&sp, &["play"]);
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("no clips: nothing to play"), "{out}");
+
+    // The daemon is still alive: the session did not vanish.
+    let out = bo(&sp, &["ls"]);
+    assert!(out.contains("player: stopped"), "{out}");
 
     let out = bo(&sp, &["stop"]);
     assert!(out.contains("stopped"), "{out}");

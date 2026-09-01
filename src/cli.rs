@@ -28,7 +28,9 @@
 //! * `put <spec> [track]` — place a clip on a track; without `[track]` a new
 //!   track is created and its index printed, so later puts can name it. With
 //!   `[track]` the track is used, created on demand (up to that index).
-//! * `play` — start playback from the current playhead.
+//! * `play` — start playback from the current playhead; refused with exit 1
+//!   when the arrangement has nothing to play, and the reply opens with a
+//!   `session:` summary of what is about to play.
 //! * `pause` / `resume` — hold and continue, keeping the position.
 //! * `stop` — stop and rewind; ends the daemon's session (cleanup as usual).
 //! * `seek <t>` — move the playhead; a running transport re-plans.
@@ -342,6 +344,7 @@ Mix:
 
 Transport:
   play                     start playback from the current playhead
+                           (refused when there is nothing to play)
   pause                    hold position
   resume                   continue after a pause
   stop                     stop, rewind, end the session
@@ -683,13 +686,31 @@ fn put_command(
     ))
 }
 
-/// `play`: start playback from the current playhead. The daemon's clock loop
-/// advances the playhead and exits when the program is done.
+/// `play`: refuse an arrangement with nothing to play, then start playback
+/// from the current playhead. The session line tells the caller what is
+/// about to play; the daemon's clock loop advances the playhead and exits
+/// when the program is done.
 fn play_command(a: &mut Arrangement) -> Result<String, (i32, String)> {
+    // An empty arrangement (or one whose clips are all zero-length) would
+    // finish instantly: refuse before touching the transport, so the daemon
+    // neither fakes success nor tears itself down.
+    if a.player.duration() == Some(Duration::ZERO) {
+        return Err(fail("no clips: nothing to play"));
+    }
+    let tracks = a.player.tracks().iter().filter(|t| !t.is_empty()).count();
+    let clips: usize = a.player.tracks().iter().map(Track::len).sum();
+    let end = a.player
+        .duration()
+        .map(format_time)
+        .unwrap_or_else(|| "inf".into());
+    let mut out = format!(
+        "session: {tracks} tracks | {clips} clips | ends {end} | backend {}\n",
+        a.player.backend().name()
+    );
     a.player.play().map_err(|e| fail(e.to_string()))?;
-    let mut out = format!("playing from {}\n", format_time(a.player.playhead()));
+    let _ = writeln!(out, "playing from {}", format_time(a.player.playhead()));
     if let Some(note) = a.player.backend().note() {
-        let _ = writeln!(out, "({note})\n");
+        let _ = writeln!(out, "({note})");
     }
     Ok(out)
 }
@@ -1218,6 +1239,38 @@ mod tests {
         let out = run_ok(&mut a, &["play"]);
         assert!(out.contains("playing from 00:00:00.000"), "{out}");
         assert_eq!(a.player.state(), State::Playing);
+    }
+
+    #[test]
+    fn play_refuses_an_empty_arrangement() {
+        let mut a = Arrangement::default();
+        let (code, msg) = run_err(&mut a, &["play"]);
+        assert_eq!(code, 1);
+        assert!(msg.contains("no clips: nothing to play"), "{msg}");
+        assert_eq!(a.player.state(), State::Stopped, "the transport is untouched");
+
+        // An arrangement whose clips are all zero-length is equally empty.
+        run_ok(&mut a, &["put", "a.wav@00:00:00:00:00:00-00:00:00"]);
+        let (code, msg) = run_err(&mut a, &["play"]);
+        assert_eq!(code, 1);
+        assert!(msg.contains("no clips"), "{msg}");
+    }
+
+    #[test]
+    fn play_reports_the_session_before_starting() {
+        let mut a = Arrangement::default();
+        run_ok(&mut a, &["put", "a.wav:00:00:00-00:00:10"]);
+        run_ok(&mut a, &["put", "b.wav@00:00:10:00:00:00-00:00:05", "0"]);
+        run_ok(&mut a, &["put", "c.wav:00:00:00-00:00:03"]);
+        let out = run_ok(&mut a, &["play"]);
+        let session = out.lines().next().unwrap();
+        assert!(session.contains("session: 2 tracks | 3 clips"), "{out}");
+        assert!(session.contains("ends 00:00:15.000"), "{out}");
+        assert!(session.contains("backend"), "{out}");
+        assert!(
+            out.find("session:").unwrap() < out.find("playing from").unwrap(),
+            "the session line comes first: {out}"
+        );
     }
 
     #[test]
