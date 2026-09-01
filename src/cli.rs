@@ -37,6 +37,7 @@
 //!   mix.
 //! * `take <track> <clip>` — remove a clip; the indices are the ones `put`
 //!   and `ls` print.
+//! * `render <file>` — mix the arrangement to a wav file, offline.
 //! * `ls` — dump the whole arrangement.
 //!
 //! # Clip specs
@@ -70,7 +71,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use bo::engine::rodio::Rodio;
+use bo::engine::rodio::{render_to_file, Rodio};
 use bo::engine::{Backend, BackendError, Player, Silent, State};
 use bo::track::{Clip, Source, Track};
 use clap::error::ErrorKind;
@@ -119,6 +120,11 @@ enum Command {
     },
     /// Show the whole arrangement.
     Ls,
+    /// Mix the arrangement to a wav file, offline.
+    Render {
+        /// Output wav path.
+        file: String,
+    },
     /// Set a track's gain in the mix, 0.0 ..= 1.0 (clamped).
     Volume {
         /// Track index.
@@ -289,6 +295,7 @@ Arrangement:
                            created and its index printed
   take <track> <clip>      remove a clip — the reverse of put
   ls                       dump the whole arrangement
+  render <file>            mix the arrangement to a wav file
 
 Mix:
   volume <track> <v>       set a track's gain, 0..1 (clamped)
@@ -324,9 +331,9 @@ EXAMPLES
 
 /// Names of the user-facing subcommands: `bo <name> --help` must keep
 /// clap's own per-command help, while `bo --help` shows the grouped [`HELP`].
-const SUBCOMMAND_NAMES: [&str; 11] = [
-    "put", "take", "ls", "play", "pause", "resume", "stop", "seek", "volume", "mute",
-    "unmute",
+const SUBCOMMAND_NAMES: [&str; 12] = [
+    "put", "take", "ls", "render", "play", "pause", "resume", "stop", "seek", "volume",
+    "mute", "unmute",
 ];
 
 /// Parse `SS`, `MM:SS` or `HH:MM:SS` (optional `.fff` fraction) into a
@@ -505,6 +512,11 @@ fn dispatch(a: &mut Arrangement, command: Command) -> Result<String, (i32, Strin
                 None => Err(fail(format!("no clip {track}#{clip}"))),
             }
         }
+        Command::Render { file } => {
+            let duration = render_to_file(a.player.tracks(), &file)
+                .map_err(|e| fail(format!("render failed: {e}")))?;
+            Ok(format!("rendered {file} ({})\n", format_time(duration)))
+        }
         // Help is handled locally by the client; this arm keeps a stray
         // "help" line over the socket harmless.
         Command::Help => Ok(HELP.to_string()),
@@ -620,6 +632,7 @@ fn command_line(command: &Command) -> String {
         Command::Mute { track } => format!("mute {track}"),
         Command::Unmute { track } => format!("unmute {track}"),
         Command::Take { track, clip } => format!("take {track} {clip}"),
+        Command::Render { file } => format!("render {file}"),
         Command::Help => unreachable!("help is handled locally, never sent"),
         Command::Daemon => unreachable!("the daemon is spawned, not sent"),
     }
@@ -863,6 +876,35 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// A tiny mono PCM wav with a sine at `amp` amplitude.
+    fn write_test_wav(path: &std::path::Path, seconds: f32, amp: f32) {
+        let rate = 44_100u32;
+        let n = (rate as f32 * seconds) as usize;
+        let mut data = Vec::with_capacity(n * 2);
+        for i in 0..n {
+            let v = (amp
+                * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / rate as f32).sin()
+                * 32767.0) as i16;
+            data.extend_from_slice(&v.to_le_bytes());
+        }
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data.len() as u32).to_le_bytes());
+        wav.extend_from_slice(b"WAVE");
+        wav.extend_from_slice(b"fmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&rate.to_le_bytes());
+        wav.extend_from_slice(&(rate * 2).to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        wav.extend_from_slice(&data);
+        std::fs::write(path, wav).unwrap();
     }
 
     fn send(socket: &Path, line: &str) -> String {
@@ -1122,6 +1164,25 @@ mod tests {
         wait_until("cleanup", || !socket.exists());
         assert_eq!(handle.join().unwrap(), 0);
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn render_exports_the_arrangement_to_wav() {
+        let dir = temp_dir();
+        let src = dir.join("a.wav");
+        write_test_wav(&src, 0.2, 0.5);
+        let spec = format!("{}:00:00:00-00:00:00.200", src.to_string_lossy());
+        let out = dir.join("out.wav");
+        let out_s = out.to_string_lossy().into_owned();
+
+        let mut a = Arrangement::default();
+        let put = parse_command(&["put".to_string(), spec]).unwrap();
+        dispatch(&mut a, put).unwrap();
+        let render = parse_command(&["render".to_string(), out_s.clone()]).unwrap();
+        let reply = dispatch(&mut a, render).unwrap();
+        assert!(reply.contains("rendered") && reply.contains("00:00:00.200"), "{reply}");
+        assert!(out.exists() && out.metadata().unwrap().len() > 1000, "a real wav was written");
         std::fs::remove_dir_all(&dir).ok();
     }
 
