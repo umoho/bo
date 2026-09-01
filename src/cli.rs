@@ -34,6 +34,8 @@
 //! * `pause` / `resume` — hold and continue, keeping the position.
 //! * `stop` — stop and rewind; ends the daemon's session (cleanup as usual).
 //! * `seek <t>` — move the playhead; a running transport re-plans.
+//! * `apply` — rebuild the running transport from the current playhead, so
+//!   pending mix changes take effect now.
 //! * `volume <track> <v>` — set a track's gain in the mix (0..1, clamped).
 //! * `mute <track>` / `unmute <track>` — silence or restore a track in the
 //!   mix.
@@ -198,6 +200,9 @@ enum Command {
         /// Target timecode.
         at: String,
     },
+    /// Apply the arrangement to a running transport, so pending mix
+    /// changes (volume, mute) take effect now.
+    Apply,
     /// Show the grouped help.
     #[command(hide = true)]
     Help,
@@ -360,6 +365,8 @@ Transport:
   resume                   continue after a pause
   stop                     stop, rewind, end the session
   seek <t>                 move the playhead
+  apply                    rebuild the running transport, so pending
+                           volume/mute changes take effect now
 
 OPTIONS
   --socket PATH            unix socket the daemon listens on
@@ -376,6 +383,7 @@ EXAMPLES
   bo put bed.wav:00:00:00-00:00:30
   bo put voice.wav:00:00:00-00:00:30 1
   bo volume 0 0.4          # duck the bed under the voice
+  bo apply                 # make the change audible now
   bo play
   bo ls
   bo stop                  # end the session; daemon cleans up
@@ -383,9 +391,9 @@ EXAMPLES
 
 /// Names of the user-facing subcommands: `bo <name> --help` must keep
 /// clap's own per-command help, while `bo --help` shows the grouped [`HELP`].
-const SUBCOMMAND_NAMES: [&str; 18] = [
+const SUBCOMMAND_NAMES: [&str; 19] = [
     "put", "take", "ls", "at", "render", "save", "load", "check", "probe", "name", "play", "pause",
-    "resume", "stop", "seek", "volume", "mute", "unmute",
+    "resume", "stop", "seek", "apply", "volume", "mute", "unmute",
 ];
 
 /// Tokenize a wire or script line: whitespace-separated words with
@@ -546,6 +554,7 @@ fn dispatch(a: &mut Arrangement, command: Command) -> Result<String, (i32, Strin
             a.player.seek(t).map_err(|e| fail(e.to_string()))?;
             Ok(format!("playhead at {}\n", format_time(t)))
         }
+        Command::Apply => apply_command(a),
         Command::Volume { track, v } => {
             let t = a
                 .player
@@ -774,6 +783,19 @@ fn play_command(a: &mut Arrangement) -> Result<String, (i32, String)> {
     Ok(out)
 }
 
+/// `apply`: rebuild the running transport from the current playhead, so
+/// pending mix changes (volume, mute) take effect now.
+fn apply_command(a: &mut Arrangement) -> Result<String, (i32, String)> {
+    if !a.player.is_playing() {
+        return Ok("apply: transport not playing; changes land at next play\n".to_string());
+    }
+    a.player.apply().map_err(|e| fail(e.to_string()))?;
+    Ok(format!(
+        "apply: rebuilt from {}\n",
+        format_time(a.player.playhead())
+    ))
+}
+
 /// `probe <uri>`: measure one source. Used both locally (no daemon) and over
 /// the wire.
 fn probe_uri(uri: &str) -> Result<String, (i32, String)> {
@@ -833,6 +855,7 @@ fn command_line(command: &Command) -> String {
         Command::Resume => "resume".to_string(),
         Command::Stop => "stop".to_string(),
         Command::Seek { at } => format!("seek {}", quote_arg(at)),
+        Command::Apply => "apply".to_string(),
         Command::Volume { track, v } => format!("volume {track} {v}"),
         Command::Mute { track } => format!("mute {track}"),
         Command::Unmute { track } => format!("unmute {track}"),
@@ -1131,7 +1154,7 @@ fn handle_line(state: &Mutex<Arrangement>, line: &str) -> (i32, String, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bo::engine::State;
+    use bo::engine::{BackendEvent, State};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn run_ok(a: &mut Arrangement, args: &[&str]) -> String {
@@ -1427,6 +1450,40 @@ mod tests {
         assert!(out.contains("silent at 00:00:20.000"), "{out}");
         let (code, _) = run_err(&mut a, &["at", "bogus"]);
         assert_eq!(code, 2);
+    }
+
+    #[test]
+    fn apply_rebuilds_a_running_transport_only() {
+        let mut a = Arrangement::default();
+        run_ok(&mut a, &["put", "a.wav:00:00:00-00:00:10"]);
+        let plays = |a: &Arrangement| -> usize {
+            match a.player.backend() {
+                AnyBackend::Silent(s, _) => s
+                    .events
+                    .iter()
+                    .filter(|e| **e == BackendEvent::Play)
+                    .count(),
+                AnyBackend::Rodio(_) => unreachable!("tests use the silent backend"),
+            }
+        };
+
+        // Stopped: a note, and nothing is rebuilt.
+        let out = run_ok(&mut a, &["apply"]);
+        assert!(out.contains("not playing"), "{out}");
+        assert_eq!(plays(&a), 0);
+
+        // Playing: rebuild from the current playhead; playhead untouched.
+        run_ok(&mut a, &["play"]);
+        run_ok(&mut a, &["seek", "00:00:04"]);
+        run_ok(&mut a, &["volume", "0", "0.5"]);
+        let out = run_ok(&mut a, &["apply"]);
+        assert!(out.contains("rebuilt from 00:00:04.000"), "{out}");
+        assert_eq!(plays(&a), 3, "play + seek + apply");
+        assert_eq!(
+            a.player.playhead(),
+            Duration::from_secs(4),
+            "apply does not move the playhead"
+        );
     }
 
     #[test]

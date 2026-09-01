@@ -324,6 +324,17 @@ impl<B: Backend> Player<B> {
         Ok(())
     }
 
+    /// Apply the arrangement to a running transport: rebuild the backend's
+    /// playback graph from the current playhead, so pending mix changes
+    /// (volume, mute) take effect now. No-op unless playing; the playhead is
+    /// untouched either way.
+    pub fn apply(&mut self) -> Result<(), BackendError> {
+        if self.state == State::Playing {
+            self.backend.play(&self.tracks, self.playhead)?;
+        }
+        Ok(())
+    }
+
     /// Move the playhead to match a backend-reported clock, without re-planning.
     pub fn set_playhead(&mut self, at: Duration) {
         self.playhead = at;
@@ -430,6 +441,40 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn apply_rebuilds_a_running_transport_only() {
+        let mut p: Player<Silent> = Player::default();
+        p.add_track(track_with("a.wav", 10));
+        let plays = |p: &Player<Silent>| {
+            p.backend()
+                .events
+                .iter()
+                .filter(|e| **e == BackendEvent::Play)
+                .count()
+        };
+
+        p.apply().unwrap();
+        assert_eq!(plays(&p), 0, "stopped: nothing to plan");
+        assert_eq!(p.backend().last_play, None);
+
+        p.play().unwrap();
+        p.seek(Duration::from_secs(4)).unwrap();
+        assert_eq!(plays(&p), 2);
+        p.apply().unwrap();
+        assert_eq!(plays(&p), 3, "apply rebuilds from the current playhead");
+        assert_eq!(p.backend().last_play, Some((1, Duration::from_secs(4))));
+        assert_eq!(
+            p.playhead(),
+            Duration::from_secs(4),
+            "apply does not move the playhead"
+        );
+
+        // Paused: nothing to rebuild.
+        p.pause();
+        p.apply().unwrap();
+        assert_eq!(plays(&p), 3);
     }
 
     #[test]

@@ -263,3 +263,53 @@ fn quoted_arguments_survive_the_wire_and_scripts() {
     wait_for_socket_gone(&socket);
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn at_reports_the_mix_at_a_timecode_over_the_wire() {
+    let dir = temp_dir();
+    let socket = dir.join("d.sock");
+    let sp = socket.to_string_lossy().into_owned();
+
+    let out = bo(&sp, &["put", "a.wav:00:00:00-00:00:10"]);
+    assert!(out.contains("ok: track 0"), "{out}");
+    let out = bo(&sp, &["put", "b.wav@00:00:05:00:00:00-00:00:03", "1"]);
+    assert!(out.contains("ok: track 1"), "{out}");
+
+    let out = bo(&sp, &["at", "00:00:06.000"]);
+    assert!(out.contains("track 0: clip=0"), "{out}");
+    assert!(out.contains("track 1: clip=0"), "{out}");
+    let out = bo(&sp, &["at", "00:00:20.000"]);
+    assert!(out.contains("silent at"), "{out}");
+
+    let out = bo(&sp, &["stop"]);
+    assert!(out.contains("stopped"), "{out}");
+    wait_for_socket_gone(&socket);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn apply_makes_mix_changes_land_on_the_running_transport() {
+    let dir = temp_dir();
+    let socket = dir.join("d.sock");
+    let sp = socket.to_string_lossy().into_owned();
+
+    let out = bo(&sp, &["put", "a.wav:00:00:00-00:00:10"]);
+    assert!(out.contains("ok: track 0"), "{out}");
+    // Stopped: apply explains itself and rebuilds nothing.
+    let out = bo(&sp, &["apply"]);
+    assert!(out.contains("not playing"), "{out}");
+    // Playing: mix changes land on the running transport.
+    let out = bo(&sp, &["play"]);
+    assert!(out.contains("playing from"), "{out}");
+    let out = bo(&sp, &["seek", "00:00:04"]);
+    assert!(out.contains("playhead at 00:00:04.000"), "{out}");
+    let out = bo(&sp, &["volume", "0", "0.5"]);
+    assert!(out.contains("volume 0.50"), "{out}");
+    let out = bo(&sp, &["apply"]);
+    assert!(out.contains("rebuilt from 00:00:04.000"), "{out}");
+
+    let out = bo(&sp, &["stop"]);
+    assert!(out.contains("stopped"), "{out}");
+    wait_for_socket_gone(&socket);
+    std::fs::remove_dir_all(&dir).ok();
+}
