@@ -10,6 +10,7 @@ use std::fmt;
 use std::time::Duration;
 
 pub mod rodio;
+pub mod timeline;
 
 use crate::track::{Clip, Track};
 

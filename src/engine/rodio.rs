@@ -20,8 +20,9 @@ use rodio::math::nz;
 use rodio::source::from_factory;
 use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink, Player, Sample, Source, wav_to_file};
 
+use crate::engine::timeline::{ClipPlan, Timeline};
 use crate::engine::{Backend, BackendError};
-use crate::track::{Clip, Track};
+use crate::track::Track;
 
 /// A backend that actually makes sound.
 pub struct Rodio {
@@ -99,26 +100,32 @@ impl Backend for Rodio {
 /// One player per non-empty track on `mixer`, every clip scheduled from
 /// `at`. Returns the players with the gains they were built with, and the end
 /// of the arrangement. Shared by playback and offline render.
+/// One planned clip as a rodio source chain: decoded, skipped into, cut to
+/// its scheduled length, and delayed to its timecode. Shared by playback and
+/// render, exactly like the [`Timeline`] it consumes.
+fn make_source(plan: &ClipPlan) -> Result<impl Source + Send + 'static, String> {
+    let file = File::open(&plan.uri).map_err(|e| format!("cannot open {}: {e}", plan.uri))?;
+    let decoder = Decoder::new(BufReader::new(file))
+        .map_err(|e| format!("cannot decode {}: {e}", plan.uri))?;
+    Ok(decoder.skip_duration(plan.into).take_duration(plan.length).delay(plan.delay))
+}
+
+/// One player per non-empty track on `mixer`, every clip from the shared
+/// [`Timeline`]. Returns the players with the gains they were built with, and
+/// the end of the arrangement.
 fn build_mix(
     mixer: &Mixer,
     tracks: &[Track],
     at: Duration,
     master: f32,
 ) -> Result<(Vec<(Player, f32)>, Duration), String> {
+    let timeline = Timeline::plan(tracks, at, probe)?;
     let mut players = Vec::new();
-    let mut end = Duration::ZERO;
-    for track in tracks {
-        if track.clips().is_empty() {
-            continue;
-        }
-        let gain = if track.muted() { 0.0 } else { track.volume() * master };
+    for track in timeline.tracks() {
+        let gain = if track.muted() { 0.0 } else { track.gain() * master };
         let mut current: Option<Player> = None;
-        let mut previous_end: Option<Duration> = None;
         for clip in track.clips() {
-            let Some((source, abs_end)) = schedule(clip, at, previous_end)? else {
-                continue;
-            };
-            end = end.max(abs_end);
+            let source = make_source(clip)?;
             match &current {
                 Some(player) => player.append(source),
                 None => {
@@ -128,93 +135,67 @@ fn build_mix(
                     current = Some(player);
                 }
             }
-            // The queue plays appended sources back to back, so the next
-            // clip's delay counts from this one's actual end.
-            previous_end = Some(abs_end);
         }
         if let Some(player) = current {
             players.push((player, gain));
         }
     }
-    Ok((players, end))
+    Ok((players, timeline.end()))
 }
 
 /// Mix the arrangement down to a wav file, offline — no device needed.
 ///
-/// The same scheduling as playback, but the mix lands in a file: each
-/// non-empty track becomes a finite, sequentially chained source at the
-/// track's gain, added to a 44.1 kHz stereo mixer, and the mix is pulled
-/// until every source is done. Returns the rendered duration.
+/// The same [`Timeline`] as playback, but each track becomes a finite,
+/// sequentially chained source at the track's gain on a 44.1 kHz stereo
+/// mixer, and the mix is pulled until every source is done. Returns the
+/// rendered duration.
 ///
 /// Unlike playback this does not use `Player` queues: those stay alive with
 /// silence when empty (right for a device, infinite for a render).
 pub fn render_to_file(tracks: &[Track], path: impl AsRef<std::path::Path>) -> Result<Duration, String> {
+    let timeline = Timeline::plan(tracks, Duration::ZERO, probe)?;
     let (input, source) = mixer::mixer(nz!(2), nz!(44100));
-    let mut end = Duration::ZERO;
-    for track in tracks {
-        if track.clips().is_empty() {
-            continue;
-        }
-        let gain = if track.muted() { 0.0 } else { track.volume() };
+    for track in timeline.tracks() {
+        let gain = if track.muted() { 0.0 } else { track.gain() };
         let mut pending: Vec<Box<dyn Source + Send>> = Vec::new();
-        let mut previous_end: Option<Duration> = None;
         for clip in track.clips() {
-            let Some((clip_source, abs_end)) = schedule(clip, Duration::ZERO, previous_end)? else {
-                continue;
-            };
-            end = end.max(abs_end);
-            pending.push(Box::new(clip_source));
-            previous_end = Some(abs_end);
+            pending.push(Box::new(make_source(clip)?));
         }
         let mut pending = pending.into_iter();
         let track_source = from_factory(move || pending.next());
         input.add(Gain::new(track_source, gain));
     }
     wav_to_file(source, path).map_err(|e| format!("cannot write wav: {e}"))?;
-    Ok(end)
+    Ok(timeline.end())
 }
 
-/// One clip as a rodio source chain, plus where it ends on the track.
-///
-/// `playhead` is where playback starts: clips that end before it are skipped,
-/// the clip covering it is entered mid-way, and later clips keep their full
-/// length with a silence gap up to their timecode. `previous_end` is the end
-/// of the last clip actually queued, which anchors the gap math.
-fn schedule(
-    clip: &Clip,
-    playhead: Duration,
-    previous_end: Option<Duration>,
-) -> Result<Option<(impl Source + Send + 'static, Duration)>, String> {
-    let from = clip.from;
-    let len = match clip.to {
-        Some(to) => to.saturating_sub(from),
-        None => {
-            let total = probe(&clip.source.uri)?;
-            total.saturating_sub(from)
-        }
-    };
-    if len == Duration::ZERO {
-        return Ok(None);
+/// An offline [`Backend`]: `play` renders the arrangement to a wav file.
+/// Transport controls are no-ops — the mix is computed eagerly, not
+/// streamed, so there is nothing to pause or resume.
+pub struct Renderer {
+    path: std::path::PathBuf,
+}
+
+impl Renderer {
+    /// Render to `path` (overwritten if it exists).
+    pub fn new(path: impl Into<std::path::PathBuf>) -> Self {
+        Self { path: path.into() }
     }
-    let abs_end = clip.at + len;
-    if abs_end <= playhead {
-        return Ok(None); // finished before the playhead
+}
+
+impl Backend for Renderer {
+    fn play(&mut self, tracks: &[Track], _at: Duration) -> Result<(), BackendError> {
+        render_to_file(tracks, &self.path).map_err(|e| BackendError::new("render", e))?;
+        Ok(())
     }
-    let into = playhead.saturating_sub(clip.at).min(len);
-    let remaining = len - into;
-    let gap = match previous_end {
-        Some(prev) => clip.at.saturating_sub(prev),
-        None => clip.at.saturating_sub(playhead),
-    };
-    let file = File::open(&clip.source.uri)
-        .map_err(|e| format!("cannot open {}: {e}", clip.source.uri))?;
-    let decoder = Decoder::new(BufReader::new(file))
-        .map_err(|e| format!("cannot decode {}: {e}", clip.source.uri))?;
-    let source = decoder
-        .skip_duration(from + into)
-        .take_duration(remaining)
-        .delay(gap);
-    Ok(Some((source, abs_end)))
+
+    fn pause(&mut self) {}
+
+    fn resume(&mut self) {}
+
+    fn stop(&mut self) {}
+
+    fn set_volume(&mut self, _volume: f32) {}
 }
 
 /// Scales every sample by a fixed factor — a track's gain in the mix.
@@ -268,6 +249,7 @@ fn probe(uri: &str) -> Result<Duration, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::Player;
     use crate::track::{Clip, Source, Track};
     use rodio::Source as _;
     use std::sync::Arc;
@@ -319,7 +301,15 @@ mod tests {
 
         let mut bed = Track::named("bed");
         bed.insert(clip_at(a.to_str().unwrap(), 0, 1)).unwrap();
-        bed.insert(clip_at(b.to_str().unwrap(), 1, 1)).unwrap(); // sliced to 0.5s by the file
+        // b is a 0.5s file at 1s; the model's length matches the file.
+        bed.insert(
+            Clip::new(Arc::new(Source {
+                uri: b.to_str().unwrap().to_string(),
+                duration: Some(Duration::from_millis(500)),
+            }))
+            .at(Duration::from_secs(1)),
+        )
+        .unwrap();
         let mut voice = Track::named("voice");
         voice.insert(clip_at(a.to_str().unwrap(), 0, 1)).unwrap();
         voice.set_volume(0.5);
@@ -334,6 +324,29 @@ mod tests {
         assert!(
             (total.as_secs_f64() - 1.5).abs() < 0.05,
             "rendered {total:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn renderer_backend_renders_on_play() {
+        let dir = std::env::temp_dir().join(format!("bo-renderer-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.wav");
+        write_wav(&a, 0.3, 440.0, 0.5);
+        let out = dir.join("out.wav");
+
+        let mut player = Player::new(Renderer::new(&out));
+        let mut track = Track::named("bed");
+        track.insert(clip_at(a.to_str().unwrap(), 0, 1)).unwrap();
+        player.add_track(track);
+        player.play().unwrap();
+
+        let decoder = Decoder::new(BufReader::new(File::open(&out).unwrap())).unwrap();
+        let total = decoder.total_duration().unwrap();
+        assert!(
+            (total.as_secs_f64() - 0.3).abs() < 0.05,
+            "the transport rendered a real file: {total:?}"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
