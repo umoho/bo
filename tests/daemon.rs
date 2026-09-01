@@ -319,6 +319,32 @@ fn reset_clears_the_arrangement_for_a_run_sheet_replay() {
 }
 
 #[test]
+fn idle_timeout_cleans_up_a_quiet_paused_daemon() {
+    let dir = temp_dir();
+    let socket = dir.join("d.sock");
+    let sp = socket.to_string_lossy().into_owned();
+
+    // Spawn a daemon with a 1-second idle timeout, then go quiet.
+    let out = Command::new(env!("CARGO_BIN_EXE_bo"))
+        .env("BO_BACKEND", "silent")
+        .env("BO_IDLE_TIMEOUT", "1")
+        .arg("--socket")
+        .arg(&sp)
+        .args(["put", "a.wav:00:00:00-00:00:10"])
+        .output()
+        .expect("bo runs");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+    // No further commands: the daemon exits and removes its socket.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while socket.exists() {
+        assert!(Instant::now() < deadline, "quiet daemon did not time out");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn take_addresses_clips_by_timecode_over_the_wire() {
     let dir = temp_dir();
     let socket = dir.join("d.sock");

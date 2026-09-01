@@ -23,6 +23,10 @@
 //! silence (with a note on `play`) when it is not; `BO_BACKEND=silent` forces
 //! the headless backend for tests and CI.
 //!
+//! A daemon that is not playing exits on its own after `BO_IDLE_TIMEOUT`
+//! seconds of silence (default 600; 0 disables), so a forgotten `pause`
+//! cannot leave a process and socket behind forever. Playing never times out.
+//!
 //! # Commands
 //!
 //! * `put <spec> [track]` — place a clip on a track; without `[track]` a new
@@ -1108,6 +1112,17 @@ fn daemon_main(socket: &Path) -> i32 {
     daemon_main_with(socket, AnyBackend::for_daemon())
 }
 
+/// The idle timeout from `BO_IDLE_TIMEOUT` seconds (default 600; 0 disables):
+/// a non-playing daemon that receives no commands for this long exits and
+/// cleans up its socket.
+fn idle_timeout() -> Duration {
+    let default = Duration::from_secs(600);
+    match std::env::var("BO_IDLE_TIMEOUT") {
+        Ok(v) => v.parse().map(Duration::from_secs).unwrap_or(default),
+        Err(_) => default,
+    }
+}
+
 /// The daemon over a specific backend; tests pass a silent one so no audio
 /// device is ever opened.
 fn daemon_main_with(socket: &Path, backend: AnyBackend) -> i32 {
@@ -1127,14 +1142,19 @@ fn daemon_main_with(socket: &Path, backend: AnyBackend) -> i32 {
     };
     let state = Arc::new(Mutex::new(Arrangement::with_backend(backend)));
     let exit = Arc::new(AtomicBool::new(false));
+    // Every served command resets this clock; a non-playing daemon that stays
+    // quiet for `BO_IDLE_TIMEOUT` seconds cleans itself up.
+    let idle = Arc::new(Mutex::new(Instant::now()));
+    let timeout = idle_timeout();
 
     let serve_state = state.clone();
     let serve_exit = exit.clone();
-    let serve = thread::spawn(move || serve_loop(listener, serve_state, serve_exit));
+    let serve_idle = idle.clone();
+    let serve = thread::spawn(move || serve_loop(listener, serve_state, serve_exit, serve_idle));
     let _ = serve;
 
-    // Clock loop: advance the playhead by real elapsed time and watch for
-    // completion. `stop` (via the exit flag) ends the session the same way.
+    // Clock loop: advance the playhead by real elapsed time; end the session
+    // on completion, `stop`, or an idle timeout while not playing.
     let mut last = Instant::now();
     loop {
         if exit.load(Ordering::Relaxed) {
@@ -1143,14 +1163,21 @@ fn daemon_main_with(socket: &Path, backend: AnyBackend) -> i32 {
         let now = Instant::now();
         let dt = now - last;
         last = now;
-        let finished = {
+        let quit = {
             let mut a = state.lock().unwrap();
             a.player.advance(dt);
-            // Only a played session completes: a freshly spawned daemon that
-            // has not been told to play must not tear itself down.
-            a.player.state() == State::Playing && a.player.is_finished()
+            if a.player.state() == State::Playing {
+                a.player.is_finished()
+            } else if timeout > Duration::ZERO
+                && now.duration_since(*idle.lock().unwrap()) > timeout
+            {
+                // Quiet and not playing: the session looks abandoned.
+                true
+            } else {
+                false
+            }
         };
-        if finished {
+        if quit {
             break;
         }
         thread::sleep(Duration::from_millis(50));
@@ -1162,16 +1189,23 @@ fn daemon_main_with(socket: &Path, backend: AnyBackend) -> i32 {
 
 /// Accept connections and handle each command on its own thread. The clock
 /// loop owns the transport; handlers only lock it briefly.
-fn serve_loop(listener: UnixListener, state: Arc<Mutex<Arrangement>>, exit: Arc<AtomicBool>) {
+fn serve_loop(
+    listener: UnixListener,
+    state: Arc<Mutex<Arrangement>>,
+    exit: Arc<AtomicBool>,
+    idle: Arc<Mutex<Instant>>,
+) {
     for connection in listener.incoming() {
         let Ok(mut stream) = connection else { continue };
         let state = state.clone();
         let exit = exit.clone();
+        let idle = idle.clone();
         thread::spawn(move || {
             let mut line = String::new();
             let mut reader = BufReader::new(&mut stream);
             let Ok(_) = reader.read_line(&mut line) else { return };
             let (code, output, ends_session) = handle_line(&state, line.trim_end());
+            *idle.lock().unwrap() = Instant::now();
             let _ = stream.write_all(format!("{code}\n{output}").as_bytes());
             // The reply is on the wire before the session may end, so the
             // client never sees a truncated response.
