@@ -5,3 +5,4 @@ edition = "2024"
 
 [dependencies]
 clap = { version = "4", features = ["derive", "env", "wrap_help"] }
+rodio = "0.22.2"

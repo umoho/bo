@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 fn bo(socket: &str, args: &[&str]) -> String {
     let out = Command::new(env!("CARGO_BIN_EXE_bo"))
+        .env("BO_BACKEND", "silent")
         .arg("--socket")
         .arg(socket)
         .args(args)

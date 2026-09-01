@@ -19,6 +19,10 @@
 //! daemon does. A stale socket left by a dead daemon is removed and replaced
 //! by the next command.
 //!
+//! The daemon plays through rodio when a device is available, falling back to
+//! silence (with a note on `play`) when it is not; `BO_BACKEND=silent` forces
+//! the headless backend for tests and CI.
+//!
 //! # Commands
 //!
 //! * `put <spec> [track]` — place a clip on a track; without `[track]` a new
@@ -66,7 +70,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use bo::engine::{Player, Silent, State};
+use bo::engine::rodio::Rodio;
+use bo::engine::{Backend, BackendError, Player, Silent, State};
 use bo::track::{Clip, Source, Track};
 use clap::error::ErrorKind;
 use clap::{Parser, Subcommand};
@@ -161,10 +166,106 @@ struct Spec {
     to: Option<Duration>,
 }
 
-/// The arrangement a command works on: the player's stacked tracks.
-#[derive(Debug, Default)]
+/// The arrangement a command works on: the player's stacked tracks over the
+/// daemon's runtime backend.
+#[derive(Debug)]
 struct Arrangement {
-    player: Player<Silent>,
+    player: Player<AnyBackend>,
+}
+
+impl Default for Arrangement {
+    fn default() -> Self {
+        Self::with_backend(AnyBackend::silent())
+    }
+}
+
+impl Arrangement {
+    fn with_backend(backend: AnyBackend) -> Self {
+        Self {
+            player: Player::new(backend),
+        }
+    }
+}
+
+/// The daemon's runtime backend: real audio when the device opened, silence
+/// otherwise (forced by `BO_BACKEND=silent`, or when no device exists).
+#[derive(Debug)]
+enum AnyBackend {
+    /// Headless. The `String` is why, when a device was wanted but absent.
+    Silent(Silent, Option<String>),
+    /// Real audio.
+    Rodio(Rodio),
+}
+
+impl AnyBackend {
+    /// The forced/test backend.
+    fn silent() -> Self {
+        Self::Silent(Silent::default(), None)
+    }
+
+    /// What the daemon should use at startup: rodio unless `BO_BACKEND=silent`
+    /// says otherwise, falling back to silence when no device can be opened.
+    fn for_daemon() -> Self {
+        if std::env::var("BO_BACKEND").as_deref() == Ok("silent") {
+            return Self::silent();
+        }
+        match Rodio::try_new() {
+            Ok(rodio) => Self::Rodio(rodio),
+            Err(e) => Self::Silent(Silent::default(), Some(format!("no audio device: {e}"))),
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Silent(..) => "silent",
+            Self::Rodio(..) => "rodio",
+        }
+    }
+
+    /// Why playback is silent, when it is a fallback rather than a choice.
+    fn note(&self) -> Option<&str> {
+        match self {
+            Self::Silent(_, note) => note.as_deref(),
+            Self::Rodio(..) => None,
+        }
+    }
+}
+
+impl Backend for AnyBackend {
+    fn play(&mut self, tracks: &[Track], at: Duration) -> Result<(), BackendError> {
+        match self {
+            Self::Silent(backend, _) => backend.play(tracks, at),
+            Self::Rodio(backend) => backend.play(tracks, at),
+        }
+    }
+
+    fn pause(&mut self) {
+        match self {
+            Self::Silent(backend, _) => backend.pause(),
+            Self::Rodio(backend) => backend.pause(),
+        }
+    }
+
+    fn resume(&mut self) {
+        match self {
+            Self::Silent(backend, _) => backend.resume(),
+            Self::Rodio(backend) => backend.resume(),
+        }
+    }
+
+    fn stop(&mut self) {
+        match self {
+            Self::Silent(backend, _) => backend.stop(),
+            Self::Rodio(backend) => backend.stop(),
+        }
+    }
+
+    fn set_volume(&mut self, volume: f32) {
+        match self {
+            Self::Silent(backend, _) => backend.set_volume(volume),
+            Self::Rodio(backend) => backend.set_volume(volume),
+        }
+    }
 }
 
 /// Where the daemon listens by default: `$TMPDIR/bo/daemon.sock`.
@@ -415,10 +516,11 @@ fn dispatch(a: &mut Arrangement, command: Command) -> Result<String, (i32, Strin
 fn format_arrangement(a: &Arrangement) -> String {
     let p = &a.player;
     let mut out = format!(
-        "player: {} | playhead {} | volume {:.2}\n",
+        "player: {} | playhead {} | volume {:.2} | backend {}\n",
         p.state(),
         format_time(p.playhead()),
-        p.volume()
+        p.volume(),
+        p.backend().name()
     );
     if p.tracks().is_empty() {
         out.push_str("no tracks\n");
@@ -493,7 +595,11 @@ fn put_command(
 /// advances the playhead and exits when the program is done.
 fn play_command(a: &mut Arrangement) -> Result<String, (i32, String)> {
     a.player.play().map_err(|e| fail(e.to_string()))?;
-    Ok(format!("playing from {}\n", format_time(a.player.playhead())))
+    let mut out = format!("playing from {}\n", format_time(a.player.playhead()));
+    if let Some(note) = a.player.backend().note() {
+        let _ = writeln!(out, "({note})\n");
+    }
+    Ok(out)
 }
 
 /// The command line the client puts on the wire, re-serialized from the
@@ -633,6 +739,12 @@ fn connect_or_spawn(socket: &Path) -> Result<UnixStream, String> {
 /// The daemon: bind the socket, serve commands, advance the clock, and exit
 /// (cleaning up the socket) when the program finishes or is stopped.
 fn daemon_main(socket: &Path) -> i32 {
+    daemon_main_with(socket, AnyBackend::for_daemon())
+}
+
+/// The daemon over a specific backend; tests pass a silent one so no audio
+/// device is ever opened.
+fn daemon_main_with(socket: &Path, backend: AnyBackend) -> i32 {
     if let Some(parent) = socket.parent()
         && let Err(e) = std::fs::create_dir_all(parent)
     {
@@ -647,7 +759,7 @@ fn daemon_main(socket: &Path) -> i32 {
             return 1;
         }
     };
-    let state = Arc::new(Mutex::new(Arrangement::default()));
+    let state = Arc::new(Mutex::new(Arrangement::with_backend(backend)));
     let exit = Arc::new(AtomicBool::new(false));
 
     let serve_state = state.clone();
@@ -871,6 +983,18 @@ mod tests {
     }
 
     #[test]
+    fn play_reports_a_silent_fallback_note() {
+        let mut a = Arrangement::with_backend(AnyBackend::Silent(
+            Silent::default(),
+            Some("no audio device: x".to_string()),
+        ));
+        run_ok(&mut a, &["put", "a.wav:00:00:00-00:00:10"]);
+        let out = run_ok(&mut a, &["play"]);
+        assert!(out.contains("(no audio device: x)"), "{out}");
+        assert!(run_ok(&mut a, &["ls"]).contains("backend silent"), "ls names the backend");
+    }
+
+    #[test]
     fn ls_shows_the_arrangement() {
         let mut a = Arrangement::default();
         run_ok(&mut a, &["put", "a.wav:00:00:00-00:00:10"]);
@@ -963,7 +1087,7 @@ mod tests {
         let socket = dir.join("d.sock");
         let handle = {
             let socket = socket.clone();
-            thread::spawn(move || daemon_main(&socket))
+            thread::spawn(move || daemon_main_with(&socket, AnyBackend::silent()))
         };
         wait_until("socket", || UnixStream::connect(&socket).is_ok());
 
@@ -1029,7 +1153,7 @@ mod tests {
 
         let handle = {
             let socket = socket.clone();
-            thread::spawn(move || daemon_main(&socket))
+            thread::spawn(move || daemon_main_with(&socket, AnyBackend::silent()))
         };
         wait_until("socket", || UnixStream::connect(&socket).is_ok());
 

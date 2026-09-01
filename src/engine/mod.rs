@@ -9,6 +9,8 @@
 use std::fmt;
 use std::time::Duration;
 
+pub mod rodio;
+
 use crate::track::{Clip, Track};
 
 /// Why a backend could not do what it was told.
@@ -42,7 +44,7 @@ impl std::error::Error for BackendError {}
 ///
 /// `Player` never decodes anything itself; it decides *what* should be audible
 /// and hands that over. Implementations: [`Silent`] here (headless, used by
-/// tests), and a rodio-backed one as the next step.
+/// tests and CI), and whatever real audio backend the daemon picks at startup.
 pub trait Backend {
     /// Start (or restart) playback of `tracks` from playhead `at`.
     ///
@@ -258,7 +260,8 @@ impl<B: Backend> Player<B> {
         &mut self.backend
     }
 
-    /// Replace the backend, e.g. silent -> rodio. Leaves transport stopped.
+    /// Replace the backend, e.g. swap in a real audio implementation. Leaves
+    /// transport stopped.
     pub fn with_backend<C: Backend>(self, backend: C) -> Player<C> {
         let Player {
             tracks,
