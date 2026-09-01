@@ -29,6 +29,9 @@
 //! * `stop` — stop and rewind; ends the daemon's session (cleanup as usual).
 //! * `seek <t>` — move the playhead; a running transport re-plans.
 //! * `volume <track> <v>` — set a track's gain in the mix (0..1, clamped).
+//! * `mute <track> [on|off]` — mute or unmute a track (default on).
+//! * `take <track> <clip>` — remove a clip; the indices are the ones `put`
+//!   and `ls` print.
 //! * `ls` — dump the whole arrangement.
 //!
 //! # Clip specs
@@ -64,7 +67,7 @@ use std::time::{Duration, Instant};
 
 use bo::engine::{Player, Silent, State};
 use bo::track::{Clip, Source, Track};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 /// bo — arrange and play a radio program.
 #[derive(Debug, Parser)]
@@ -116,9 +119,30 @@ enum Command {
         /// Gain.
         v: f32,
     },
+    /// Mute or unmute a track in the mix; defaults to on.
+    Mute {
+        /// Track index.
+        track: usize,
+        /// on or off; omitted means on.
+        state: Option<MuteState>,
+    },
+    /// Remove a clip by its indices — the reverse of `put`.
+    Take {
+        /// Track index.
+        track: usize,
+        /// Clip index.
+        clip: usize,
+    },
     /// Hidden: run the playback daemon (spawned by the client on demand).
     #[command(hide = true)]
     Daemon,
+}
+
+/// Mute switch value for [`Command::Mute`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum MuteState {
+    On,
+    Off,
 }
 
 /// A clip description before it exists: `uri[@at][:from-to]`.
@@ -292,6 +316,24 @@ fn dispatch(a: &mut Arrangement, command: Command) -> Result<String, (i32, Strin
             t.set_volume(v);
             Ok(format!("track {track} volume {:.2}\n", t.volume()))
         }
+        Command::Mute { track, state } => {
+            let muted = matches!(state, None | Some(MuteState::On));
+            let t = a
+                .player
+                .tracks_mut()
+                .get_mut(track)
+                .ok_or_else(|| fail(format!("no track {track}")))?;
+            t.set_muted(muted);
+            let word = if muted { "muted" } else { "unmuted" };
+            Ok(format!("track {track} {word}\n"))
+        }
+        Command::Take { track, clip } => {
+            let removed = a.player.tracks_mut().get_mut(track).and_then(|t| t.remove(clip));
+            match removed {
+                Some(_) => Ok(format!("removed track {track} clip #{clip}\n")),
+                None => Err(fail(format!("no clip {track}#{clip}"))),
+            }
+        }
         Command::Daemon => Err(fail("the daemon runs standalone, not over the socket")),
     }
 }
@@ -312,9 +354,10 @@ fn format_arrangement(a: &Arrangement) -> String {
     for (ti, t) in p.tracks().iter().enumerate() {
         let dur = t.duration().map(format_time).unwrap_or_else(|| "inf".into());
         let noun = if t.len() == 1 { "clip" } else { "clips" };
+        let mute = if t.muted() { "  muted" } else { "" };
         let head = match t.name() {
-            Some(name) => format!("track {ti} {name:?}  volume {:.2}  {} {noun}", t.volume(), t.len()),
-            None => format!("track {ti}  volume {:.2}  {} {noun}", t.volume(), t.len()),
+            Some(name) => format!("track {ti} {name:?}  volume {:.2}{mute}  {} {noun}", t.volume(), t.len()),
+            None => format!("track {ti}  volume {:.2}{mute}  {} {noun}", t.volume(), t.len()),
         };
         let _ = writeln!(out, "{head}  -> {dur}");
         for (ci, c) in t.clips().iter().enumerate() {
@@ -395,6 +438,12 @@ fn command_line(command: &Command) -> String {
         Command::Stop => "stop".to_string(),
         Command::Seek { at } => format!("seek {at}"),
         Command::Volume { track, v } => format!("volume {track} {v}"),
+        Command::Mute { track, state } => match state {
+            Some(MuteState::On) => format!("mute {track} on"),
+            Some(MuteState::Off) => format!("mute {track} off"),
+            None => format!("mute {track}"),
+        },
+        Command::Take { track, clip } => format!("take {track} {clip}"),
         Command::Daemon => unreachable!("the daemon is spawned, not sent"),
     }
 }
@@ -765,6 +814,44 @@ mod tests {
     }
 
     #[test]
+    fn take_removes_a_clip_by_its_identifiers() {
+        let mut a = Arrangement::default();
+        run_ok(&mut a, &["put", "a.wav:00:00:00-00:00:10"]);
+        run_ok(&mut a, &["put", "b.wav@00:00:10:00:00:00-00:00:05", "0"]);
+        let out = run_ok(&mut a, &["take", "0", "0"]);
+        assert!(out.contains("removed track 0 clip #0"), "{out}");
+        assert_eq!(a.player.tracks()[0].clips().len(), 1);
+        assert_eq!(
+            a.player.tracks()[0].clips()[0].source.uri,
+            "b.wav",
+            "later clips shift up"
+        );
+        let (code, msg) = run_err(&mut a, &["take", "0", "9"]);
+        assert_eq!(code, 1);
+        assert!(msg.contains("no clip 0#9"), "{msg}");
+        let (code, _) = run_err(&mut a, &["take", "9", "0"]);
+        assert_eq!(code, 1);
+    }
+
+    #[test]
+    fn mute_toggles_a_track_in_the_mix() {
+        let mut a = Arrangement::default();
+        run_ok(&mut a, &["put", "a.wav:00:00:00-00:00:10"]);
+        let out = run_ok(&mut a, &["mute", "0"]);
+        assert!(out.contains("track 0 muted"), "{out}");
+        assert!(a.player.tracks()[0].muted());
+        let out = run_ok(&mut a, &["mute", "0", "off"]);
+        assert!(out.contains("track 0 unmuted"), "{out}");
+        assert!(!a.player.tracks()[0].muted());
+        assert!(!run_ok(&mut a, &["ls"]).contains("muted"), "no marker when unmuted");
+        run_ok(&mut a, &["mute", "0"]);
+        assert!(run_ok(&mut a, &["ls"]).contains("muted"), "ls shows the marker");
+        let (code, msg) = run_err(&mut a, &["mute", "9"]);
+        assert_eq!(code, 1);
+        assert!(msg.contains("no track 9"), "{msg}");
+    }
+
+    #[test]
     fn transport_commands_drive_the_state_machine() {
         let mut a = Arrangement::default();
         run_ok(&mut a, &["put", "a.wav:00:00:00-00:00:10"]);
@@ -798,6 +885,14 @@ mod tests {
 
         let reply = send(&socket, "volume 0 0.5");
         assert!(reply.contains("track 0 volume 0.50"), "{reply}");
+        let reply = send(&socket, "mute 0");
+        assert!(reply.contains("track 0 muted"), "{reply}");
+        let reply = send(&socket, "mute 0 off");
+        assert!(reply.contains("track 0 unmuted"), "{reply}");
+        let reply = send(&socket, "take 0 0");
+        assert!(reply.contains("removed track 0 clip #0"), "{reply}");
+        let reply = send(&socket, "ls");
+        assert!(!reply.contains("a.wav"), "the clip is gone: {reply}");
 
         let reply = send(&socket, "seek 00:00:05");
         assert!(reply.contains("playhead at 00:00:05.000"), "{reply}");

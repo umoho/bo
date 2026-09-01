@@ -173,6 +173,7 @@ impl std::error::Error for Overlap {}
 pub struct Track {
     name: Option<String>,
     volume: f32,
+    muted: bool,
     clips: Vec<Clip>,
 }
 
@@ -181,6 +182,7 @@ impl Default for Track {
         Self {
             name: None,
             volume: 1.0,
+            muted: false,
             clips: Vec::new(),
         }
     }
@@ -199,6 +201,7 @@ impl Track {
         Self {
             name: Some(name.into()),
             volume: 1.0,
+            muted: false,
             clips: Vec::new(),
         }
     }
@@ -226,6 +229,18 @@ impl Track {
     /// Set the track's gain in the mix, clamped to `0.0 ..= 1.0`.
     pub fn set_volume(&mut self, volume: f32) {
         self.volume = volume.clamp(0.0, 1.0);
+    }
+
+    /// Whether the track is muted in the mix.
+    #[must_use]
+    pub fn muted(&self) -> bool {
+        self.muted
+    }
+
+    /// Mute or unmute the track. A muted track contributes nothing to the
+    /// mix regardless of its volume.
+    pub fn set_muted(&mut self, muted: bool) {
+        self.muted = muted;
     }
 
     /// The clips, ordered by track position.
@@ -387,6 +402,16 @@ mod tests {
             "it still covers later time"
         );
         assert!(t.clip_at(secs(1)).is_none(), "silent before it starts");
+    }
+
+    #[test]
+    fn tracks_can_be_muted() {
+        let mut t = Track::named("voice");
+        assert!(!t.muted(), "audible by default");
+        t.set_muted(true);
+        assert!(t.muted());
+        t.set_muted(false);
+        assert!(!t.muted());
     }
 
     #[test]
