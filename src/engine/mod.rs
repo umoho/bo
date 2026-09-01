@@ -314,6 +314,13 @@ impl<B: Backend> Player<B> {
         self.state = State::Stopped;
     }
 
+    /// Drop every track and reset the transport: stop playback, rewind the
+    /// playhead, and clear the arrangement.
+    pub fn reset(&mut self) {
+        self.stop();
+        self.tracks.clear();
+    }
+
     /// Jump the playhead. A running transport is re-planned from the new
     /// position, because most backends cannot seek mid-stream.
     pub fn seek(&mut self, at: Duration) -> Result<(), BackendError> {
@@ -566,5 +573,18 @@ mod tests {
         );
         assert_eq!(swapped.remove_track(0).map(|t| t.clips().len()), Some(1));
         assert_eq!(swapped.tracks().len(), 0);
+    }
+
+    #[test]
+    fn reset_clears_tracks_and_transport() {
+        let mut p: Player<Silent> = Player::default();
+        p.add_track(track_with("a.wav", 10));
+        p.play().unwrap();
+        p.seek(Duration::from_secs(3)).unwrap();
+        p.reset();
+        assert_eq!(p.tracks().len(), 0);
+        assert_eq!(p.state(), State::Stopped);
+        assert_eq!(p.playhead(), Duration::ZERO);
+        assert!(p.backend().events.iter().any(|e| *e == BackendEvent::Stop));
     }
 }

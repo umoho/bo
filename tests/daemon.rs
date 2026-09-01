@@ -288,6 +288,37 @@ fn at_reports_the_mix_at_a_timecode_over_the_wire() {
 }
 
 #[test]
+fn reset_clears_the_arrangement_for_a_run_sheet_replay() {
+    let dir = temp_dir();
+    let socket = dir.join("d.sock");
+    let sp = socket.to_string_lossy().into_owned();
+    let prog = dir.join("prog.bo");
+    let ps = prog.to_string_lossy().into_owned();
+
+    // Build a two-track program and save it as the run-sheet.
+    let out = bo(&sp, &["put", "a.wav:00:00:00-00:00:10"]);
+    assert!(out.contains("ok: track 0"), "{out}");
+    let out = bo(&sp, &["put", "b.wav:00:00:00-00:00:05"]);
+    assert!(out.contains("ok: track 1"), "{out}");
+    let out = bo(&sp, &["save", &ps]);
+    assert!(out.contains("saved"), "{out}");
+
+    // Reset, then replay: the arrangement is rebuilt, not duplicated.
+    let out = bo(&sp, &["reset"]);
+    assert!(out.contains("reset: 2 tracks removed"), "{out}");
+    let out = bo(&sp, &["load", &ps]);
+    assert!(out.contains("loaded"), "{out}");
+    let out = bo(&sp, &["ls"]);
+    assert!(out.contains("tracks: 2"), "{out}");
+    assert!(!out.contains("clips=2"), "no duplicates after reset + replay: {out}");
+
+    let out = bo(&sp, &["stop"]);
+    assert!(out.contains("stopped"), "{out}");
+    wait_for_socket_gone(&socket);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn take_addresses_clips_by_timecode_over_the_wire() {
     let dir = temp_dir();
     let socket = dir.join("d.sock");

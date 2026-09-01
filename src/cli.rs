@@ -44,6 +44,8 @@
 //! * `render <file>` — mix the arrangement to a wav file, offline.
 //! * `save <file>` / `load <file>` — write the arrangement as a script of
 //!   commands, or replace it from one (transport resets with the swap).
+//! * `reset` — drop every track and stop the transport: the daemon is back
+//!   to its fresh state, ready for a run-sheet to rebuild it.
 //! * `check` — verify every distinct source is readable.
 //! * `probe [uri]` — measure the length of a source, or of every distinct
 //!   source in the arrangement; a bare uri is probed locally, no daemon.
@@ -155,6 +157,8 @@ enum Command {
         /// Script path.
         file: String,
     },
+    /// Drop every track and stop the transport: back to a fresh session.
+    Reset,
     /// Verify every source in the arrangement is readable.
     Check,
     /// Measure the length of a source, or of every distinct source in the
@@ -349,6 +353,8 @@ Arrangement:
   render <file>            mix the arrangement to a wav file
   save <file>              write the arrangement as a script
   load <file>              replace the arrangement from a script
+  reset                    drop every track and stop; back to a fresh
+                           session
   check                    verify every source is readable
   probe [uri]              measure a source's length; without a uri, every
                            source in the arrangement
@@ -392,8 +398,8 @@ EXAMPLES
 
 /// Names of the user-facing subcommands: `bo <name> --help` must keep
 /// clap's own per-command help, while `bo --help` shows the grouped [`HELP`].
-const SUBCOMMAND_NAMES: [&str; 19] = [
-    "put", "take", "ls", "at", "render", "save", "load", "check", "probe", "name", "play", "pause",
+const SUBCOMMAND_NAMES: [&str; 20] = [
+    "put", "take", "ls", "at", "render", "save", "load", "reset", "check", "probe", "name", "play", "pause",
     "resume", "stop", "seek", "apply", "volume", "mute", "unmute",
 ];
 
@@ -604,6 +610,7 @@ fn dispatch(a: &mut Arrangement, command: Command) -> Result<String, (i32, Strin
             *a = fresh;
             Ok(format!("loaded {file}\n"))
         }
+        Command::Reset => reset_command(a),
         Command::Check => {
             let problems = check_sources(a.player.tracks());
             if problems.is_empty() {
@@ -829,6 +836,15 @@ fn apply_command(a: &mut Arrangement) -> Result<String, (i32, String)> {
     ))
 }
 
+/// `reset`: drop every track and stop the transport — the daemon is back to
+/// its fresh state, ready for a run-sheet to rebuild the arrangement.
+fn reset_command(a: &mut Arrangement) -> Result<String, (i32, String)> {
+    let tracks = a.player.tracks().len();
+    a.player.reset();
+    let noun = if tracks == 1 { "track" } else { "tracks" };
+    Ok(format!("reset: {tracks} {noun} removed\n"))
+}
+
 /// `probe <uri>`: measure one source. Used both locally (no daemon) and over
 /// the wire.
 fn probe_uri(uri: &str) -> Result<String, (i32, String)> {
@@ -896,6 +912,7 @@ fn command_line(command: &Command) -> String {
         Command::Render { file } => format!("render {}", quote_arg(file)),
         Command::Save { file } => format!("save {}", quote_arg(file)),
         Command::Load { file } => format!("load {}", quote_arg(file)),
+        Command::Reset => "reset".to_string(),
         Command::Check => "check".to_string(),
         Command::Probe { uri } => match uri {
             Some(uri) => format!("probe {}", quote_arg(uri)),
@@ -1517,6 +1534,20 @@ mod tests {
             Duration::from_secs(4),
             "apply does not move the playhead"
         );
+    }
+
+    #[test]
+    fn reset_clears_every_track_and_transport() {
+        let mut a = Arrangement::default();
+        run_ok(&mut a, &["put", "a.wav:00:00:00-00:00:10"]);
+        run_ok(&mut a, &["put", "b.wav:00:00:00-00:00:05"]);
+        run_ok(&mut a, &["name", "0", "bed"]);
+        run_ok(&mut a, &["play"]);
+        let out = run_ok(&mut a, &["reset"]);
+        assert!(out.contains("reset: 2 tracks removed"), "{out}");
+        assert_eq!(a.player.tracks().len(), 0);
+        assert_eq!(a.player.state(), State::Stopped);
+        assert_eq!(a.player.playhead(), Duration::ZERO);
     }
 
     #[test]
