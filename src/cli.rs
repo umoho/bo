@@ -68,11 +68,18 @@ use std::time::{Duration, Instant};
 
 use bo::engine::{Player, Silent, State};
 use bo::track::{Clip, Source, Track};
+use clap::error::ErrorKind;
 use clap::{Parser, Subcommand};
 
 /// bo — arrange and play a radio program.
 #[derive(Debug, Parser)]
-#[command(name = "bo", version, arg_required_else_help = true, max_term_width = 80)]
+#[command(
+    name = "bo",
+    version,
+    arg_required_else_help = true,
+    max_term_width = 80,
+    disable_help_subcommand = true
+)]
 struct Cli {
     /// Unix socket the daemon listens on.
     #[arg(long, global = true)]
@@ -98,21 +105,15 @@ enum Command {
         /// Track index; omit to create a fresh track.
         track: Option<usize>,
     },
-    /// Start playback from the current playhead.
-    Play,
+    /// Remove a clip by its indices — the reverse of `put`.
+    Take {
+        /// Track index.
+        track: usize,
+        /// Clip index.
+        clip: usize,
+    },
     /// Show the whole arrangement.
     Ls,
-    /// Pause the transport, keeping the position.
-    Pause,
-    /// Resume after a pause.
-    Resume,
-    /// Stop and rewind; ends the daemon's session.
-    Stop,
-    /// Move the playhead to a timecode (SS, MM:SS or HH:MM:SS).
-    Seek {
-        /// Target timecode.
-        at: String,
-    },
     /// Set a track's gain in the mix, 0.0 ..= 1.0 (clamped).
     Volume {
         /// Track index.
@@ -130,13 +131,22 @@ enum Command {
         /// Track index.
         track: usize,
     },
-    /// Remove a clip by its indices — the reverse of `put`.
-    Take {
-        /// Track index.
-        track: usize,
-        /// Clip index.
-        clip: usize,
+    /// Start playback from the current playhead.
+    Play,
+    /// Pause the transport, keeping the position.
+    Pause,
+    /// Resume after a pause.
+    Resume,
+    /// Stop and rewind; ends the daemon's session.
+    Stop,
+    /// Move the playhead to a timecode (SS, MM:SS or HH:MM:SS).
+    Seek {
+        /// Target timecode.
+        at: String,
     },
+    /// Show the grouped help.
+    #[command(hide = true)]
+    Help,
     /// Hidden: run the playback daemon (spawned by the client on demand).
     #[command(hide = true)]
     Daemon,
@@ -161,6 +171,62 @@ struct Arrangement {
 fn default_socket() -> PathBuf {
     std::env::temp_dir().join("bo").join("daemon.sock")
 }
+
+/// Hand-written top-level help: clap renders subcommands as one flat list,
+/// so grouping (Arrangement / Mix / Transport) and the examples live here.
+/// Keep in sync with [`Command`] when the surface changes.
+const HELP: &str = "\
+bo — arrange and play a radio program
+
+USAGE
+  bo [--socket PATH] <command> [args...]
+
+COMMANDS
+
+Arrangement:
+  put <spec> [track]       place a clip; without [track] a new track is
+                           created and its index printed
+  take <track> <clip>      remove a clip — the reverse of put
+  ls                       dump the whole arrangement
+
+Mix:
+  volume <track> <v>       set a track's gain, 0..1 (clamped)
+  mute <track>             silence a track in the mix
+  unmute <track>           restore a muted track
+
+Transport:
+  play                     start playback from the current playhead
+  pause                    hold position
+  resume                   continue after a pause
+  stop                     stop, rewind, end the session
+  seek <t>                 move the playhead
+
+OPTIONS
+  --socket PATH            unix socket the daemon listens on
+                           (default: $TMPDIR/bo/daemon.sock)
+  -h, --help               show this help
+  -V, --version            print version
+
+CLIP SPEC
+  uri[@at][:from-to]       at = position on the track (default 0)
+                           from-to = slice of the source (empty to = end)
+  Timecodes: SS, MM:SS or HH:MM:SS, optional .fff fraction.
+
+EXAMPLES
+  bo put bed.wav:00:00:00-00:00:30
+  bo put voice.wav:00:00:00-00:00:30 1
+  bo volume 0 0.4          # duck the bed under the voice
+  bo play
+  bo ls
+  bo stop                  # end the session; daemon cleans up
+";
+
+/// Names of the user-facing subcommands: `bo <name> --help` must keep
+/// clap's own per-command help, while `bo --help` shows the grouped [`HELP`].
+const SUBCOMMAND_NAMES: [&str; 11] = [
+    "put", "take", "ls", "play", "pause", "resume", "stop", "seek", "volume", "mute",
+    "unmute",
+];
 
 /// Parse `SS`, `MM:SS` or `HH:MM:SS` (optional `.fff` fraction) into a
 /// duration.
@@ -338,6 +404,9 @@ fn dispatch(a: &mut Arrangement, command: Command) -> Result<String, (i32, Strin
                 None => Err(fail(format!("no clip {track}#{clip}"))),
             }
         }
+        // Help is handled locally by the client; this arm keeps a stray
+        // "help" line over the socket harmless.
+        Command::Help => Ok(HELP.to_string()),
         Command::Daemon => Err(fail("the daemon runs standalone, not over the socket")),
     }
 }
@@ -445,6 +514,7 @@ fn command_line(command: &Command) -> String {
         Command::Mute { track } => format!("mute {track}"),
         Command::Unmute { track } => format!("unmute {track}"),
         Command::Take { track, clip } => format!("take {track} {clip}"),
+        Command::Help => unreachable!("help is handled locally, never sent"),
         Command::Daemon => unreachable!("the daemon is spawned, not sent"),
     }
 }
@@ -460,12 +530,26 @@ pub fn run(args: Vec<String>) -> i32 {
     let cli = match parse_full(&args) {
         Ok(cli) => cli,
         Err(e) => {
+            // Top-level help is our grouped text; a subcommand's own --help
+            // (some subcommand name on the line) stays clap's.
+            if matches!(
+                e.kind(),
+                ErrorKind::DisplayHelp | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+            ) && !args.iter().any(|a| SUBCOMMAND_NAMES.contains(&a.as_str()))
+            {
+                println!("{HELP}");
+                return 0;
+            }
             let _ = e.print();
             return e.exit_code();
         }
     };
     let socket = cli.socket.unwrap_or_else(default_socket);
     match cli.command {
+        Command::Help => {
+            println!("{HELP}");
+            0
+        }
         Command::Daemon => daemon_main(&socket),
         command => client_main(&socket, &command),
     }
@@ -915,6 +999,18 @@ mod tests {
         assert_eq!(handle.join().unwrap(), 0);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn top_level_help_is_grouped_and_subcommand_help_stays_clap() {
+        assert!(HELP.contains("Arrangement:"), "grouped: {HELP}");
+        assert!(HELP.contains("Mix:"), "grouped: {HELP}");
+        assert!(HELP.contains("Transport:"), "grouped: {HELP}");
+        assert!(HELP.contains("EXAMPLES"), "examples: {HELP}");
+        assert_eq!(run(vec![]), 0, "bare invocation shows the grouped help");
+        assert_eq!(run(vec!["--help".into()]), 0);
+        assert_eq!(run(vec!["help".into()]), 0);
+        assert_eq!(run(vec!["put".into(), "--help".into()]), 0, "subcommand help stays clap's");
     }
 
     #[test]
