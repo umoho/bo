@@ -38,6 +38,11 @@
 //! * `take <track> <clip>` — remove a clip; the indices are the ones `put`
 //!   and `ls` print.
 //! * `render <file>` — mix the arrangement to a wav file, offline.
+//! * `save <file>` / `load <file>` — write the arrangement as a script of
+//!   commands, or replace it from one (transport resets with the swap).
+//! * `check` — verify every distinct source is readable.
+//! * `name <track> <name>` — label a track; names are single tokens in
+//!   scripts.
 //! * `ls` — dump the whole arrangement.
 //!
 //! # Clip specs
@@ -71,7 +76,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use bo::engine::rodio::{render_to_file, Rodio};
+use bo::engine::rodio::{check_sources, render_to_file, Rodio};
 use bo::engine::{Backend, BackendError, Player, Silent, State};
 use bo::track::{Clip, Source, Track};
 use clap::error::ErrorKind;
@@ -124,6 +129,25 @@ enum Command {
     Render {
         /// Output wav path.
         file: String,
+    },
+    /// Write the arrangement as a script of commands.
+    Save {
+        /// Output script path.
+        file: String,
+    },
+    /// Replace the arrangement from a script written by `save`.
+    Load {
+        /// Script path.
+        file: String,
+    },
+    /// Verify every source in the arrangement is readable.
+    Check,
+    /// Label a track; names are single tokens in scripts.
+    Name {
+        /// Track index.
+        track: usize,
+        /// Label.
+        name: String,
     },
     /// Set a track's gain in the mix, 0.0 ..= 1.0 (clamped).
     Volume {
@@ -296,6 +320,10 @@ Arrangement:
   take <track> <clip>      remove a clip — the reverse of put
   ls                       dump the whole arrangement
   render <file>            mix the arrangement to a wav file
+  save <file>              write the arrangement as a script
+  load <file>              replace the arrangement from a script
+  check                    verify every source is readable
+  name <track> <name>      label a track
 
 Mix:
   volume <track> <v>       set a track's gain, 0..1 (clamped)
@@ -331,9 +359,9 @@ EXAMPLES
 
 /// Names of the user-facing subcommands: `bo <name> --help` must keep
 /// clap's own per-command help, while `bo --help` shows the grouped [`HELP`].
-const SUBCOMMAND_NAMES: [&str; 12] = [
-    "put", "take", "ls", "render", "play", "pause", "resume", "stop", "seek", "volume",
-    "mute", "unmute",
+const SUBCOMMAND_NAMES: [&str; 16] = [
+    "put", "take", "ls", "render", "save", "load", "check", "name", "play", "pause",
+    "resume", "stop", "seek", "volume", "mute", "unmute",
 ];
 
 /// Parse `SS`, `MM:SS` or `HH:MM:SS` (optional `.fff` fraction) into a
@@ -517,6 +545,44 @@ fn dispatch(a: &mut Arrangement, command: Command) -> Result<String, (i32, Strin
                 .map_err(|e| fail(format!("render failed: {e}")))?;
             Ok(format!("rendered {file} ({})\n", format_time(duration)))
         }
+        Command::Save { file } => {
+            std::fs::write(&file, serialize(a))
+                .map_err(|e| fail(format!("cannot write {file}: {e}")))?;
+            Ok(format!("saved {file}\n"))
+        }
+        Command::Load { file } => {
+            let text = std::fs::read_to_string(&file)
+                .map_err(|e| fail(format!("cannot read {file}: {e}")))?;
+            // Load into a fresh arrangement so a failing script leaves the
+            // current one untouched; transport resets with the swap.
+            let mut fresh = Arrangement::default();
+            run_script(&mut fresh, &text, &file).map_err(fail)?;
+            *a = fresh;
+            Ok(format!("loaded {file}\n"))
+        }
+        Command::Check => {
+            let problems = check_sources(a.player.tracks());
+            if problems.is_empty() {
+                let clips: usize = a.player.tracks().iter().map(Track::len).sum();
+                Ok(format!("check: {clips} clips, all sources ok\n"))
+            } else {
+                let noun = if problems.len() == 1 { "problem" } else { "problems" };
+                let mut out = format!("check: {} {noun}\n", problems.len());
+                for problem in &problems {
+                    let _ = writeln!(out, "  - {problem}");
+                }
+                Err((1, out))
+            }
+        }
+        Command::Name { track, name } => {
+            let t = a
+                .player
+                .tracks_mut()
+                .get_mut(track)
+                .ok_or_else(|| fail(format!("no track {track}")))?;
+            t.set_name(name.clone());
+            Ok(format!("track {track} named {name:?}\n"))
+        }
         // Help is handled locally by the client; this arm keeps a stray
         // "help" line over the socket harmless.
         Command::Help => Ok(HELP.to_string()),
@@ -633,9 +699,64 @@ fn command_line(command: &Command) -> String {
         Command::Unmute { track } => format!("unmute {track}"),
         Command::Take { track, clip } => format!("take {track} {clip}"),
         Command::Render { file } => format!("render {file}"),
+        Command::Save { file } => format!("save {file}"),
+        Command::Load { file } => format!("load {file}"),
+        Command::Check => "check".to_string(),
+        Command::Name { track, name } => format!("name {track} {name}"),
         Command::Help => unreachable!("help is handled locally, never sent"),
         Command::Daemon => unreachable!("the daemon is spawned, not sent"),
     }
+}
+
+/// The arrangement as a script: the commands that rebuild it. Every line is
+/// a valid command, so `load` runs the file through the same parse and
+/// dispatch. Names must be single tokens to survive the round trip.
+fn serialize(a: &Arrangement) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "# bo arrangement v1");
+    for (ti, t) in a.player.tracks().iter().enumerate() {
+        if t.clips().is_empty() {
+            continue; // empty tracks carry nothing worth saving
+        }
+        for c in t.clips() {
+            let to = c.to.map(format_time).unwrap_or_default();
+            let _ = writeln!(
+                out,
+                "put {}@{}:{}-{} {ti}",
+                c.source.uri,
+                format_time(c.at),
+                format_time(c.from),
+                to
+            );
+        }
+        if let Some(name) = t.name() {
+            let _ = writeln!(out, "name {ti} {name}");
+        }
+        let _ = writeln!(out, "volume {ti} {}", t.volume());
+        if t.muted() {
+            let _ = writeln!(out, "mute {ti}");
+        }
+    }
+    out
+}
+
+/// Execute a script (a `save`d arrangement) into the arrangement.
+///
+/// Stops at the first failing line and reports `src:line: message`; what ran
+/// before the failure stays applied. `load` runs into a fresh arrangement,
+/// so a failing script leaves the live one untouched.
+fn run_script(a: &mut Arrangement, text: &str, src: &str) -> Result<(), String> {
+    for (n, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let args: Vec<String> = line.split_whitespace().map(str::to_string).collect();
+        let command = parse_command(&args)
+            .map_err(|code| format!("{src}:{}: parse failed (exit {code})", n + 1))?;
+        dispatch(a, command).map_err(|(_, msg)| format!("{src}:{}: {msg}", n + 1))?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1148,6 +1269,26 @@ mod tests {
         let reply = send(&socket, "ls");
         assert!(!reply.contains("a.wav"), "the clip is gone: {reply}");
 
+        // save the (now empty) arrangement, restore it, and re-fill a clip.
+        let script = dir.join("prog.bo");
+        let sp = script.to_string_lossy().into_owned();
+        let reply = send(&socket, &format!("save {sp}"));
+        assert!(reply.contains("saved"), "{reply}");
+        send(&socket, "put a.wav:00:00:00-00:00:10");
+        let reply = send(&socket, &format!("load {sp}"));
+        assert!(reply.contains("loaded"), "{reply}");
+        let reply = send(&socket, "ls");
+        assert!(!reply.contains("a.wav"), "load replaced the arrangement: {reply}");
+
+        // Refill the empty arrangement, name the track, and check the source.
+        send(&socket, "put a.wav:00:00:00-00:00:10");
+        let reply = send(&socket, "name 0 bed");
+        assert!(reply.contains("named \"bed\""), "{reply}");
+        // a.wav does not exist, so check must report it.
+        let reply = send(&socket, "check");
+        assert_eq!(reply.lines().next().unwrap(), "1", "{reply}");
+        assert!(reply.contains("cannot open a.wav"), "{reply}");
+
         let reply = send(&socket, "seek 00:00:05");
         assert!(reply.contains("playhead at 00:00:05.000"), "{reply}");
         let reply = send(&socket, "pause");
@@ -1183,6 +1324,84 @@ mod tests {
         let reply = dispatch(&mut a, render).unwrap();
         assert!(reply.contains("rendered") && reply.contains("00:00:00.200"), "{reply}");
         assert!(out.exists() && out.metadata().unwrap().len() > 1000, "a real wav was written");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn name_labels_a_track() {
+        let mut a = Arrangement::default();
+        run_ok(&mut a, &["put", "a.wav:00:00:00-00:00:10"]);
+        let out = run_ok(&mut a, &["name", "0", "bed"]);
+        assert!(out.contains("track 0 named \"bed\""), "{out}");
+        assert!(run_ok(&mut a, &["ls"]).contains("track 0 \"bed\""), "ls shows the label");
+        let (code, msg) = run_err(&mut a, &["name", "9", "x"]);
+        assert_eq!(code, 1);
+        assert!(msg.contains("no track 9"), "{msg}");
+    }
+
+    #[test]
+    fn serialize_round_trips_names_volume_and_mute() {
+        let mut a = Arrangement::default();
+        run_ok(&mut a, &["put", "bed.wav:00:00:05-00:00:25"]);
+        run_ok(&mut a, &["put", "ding.wav@00:00:00:00:00:01-00:00:02", "1"]);
+        run_ok(&mut a, &["name", "0", "bed"]);
+        run_ok(&mut a, &["volume", "0", "0.5"]);
+        run_ok(&mut a, &["mute", "1"]);
+
+        let script = serialize(&a);
+        assert!(script.contains("name 0 bed") && script.contains("volume 0 0.5") && script.contains("mute 1"), "{script}");
+        let mut fresh = Arrangement::default();
+        run_script(&mut fresh, &script, "test").unwrap();
+        assert_eq!(serialize(&fresh), script, "the script rebuilds the same arrangement");
+    }
+
+    #[test]
+    fn save_and_load_round_trip_via_commands() {
+        let dir = temp_dir();
+        let file = dir.join("prog.bo");
+        let path = file.to_string_lossy().into_owned();
+        let mut a = Arrangement::default();
+        run_ok(&mut a, &["put", "a.wav:00:00:00-00:00:10"]);
+        run_ok(&mut a, &["name", "0", "bed"]);
+        run_ok(&mut a, &["volume", "0", "0.5"]);
+        run_ok(&mut a, &["save", &path]);
+
+        let mut b = Arrangement::default();
+        run_ok(&mut b, &["load", &path]);
+        assert_eq!(serialize(&b), serialize(&a));
+
+        // A failing script leaves the live arrangement untouched.
+        std::fs::write(&file, "put a.wav:00:00:00-00:00:10 0\nput b.wav@00:00:05:00:00:00-00:00:10 0\n")
+            .unwrap();
+        let (code, msg) = run_err(&mut b, &["load", &path]);
+        assert_eq!(code, 1);
+        assert!(msg.contains("refused"), "{msg}");
+        assert_eq!(b.player.tracks()[0].clips().len(), 1, "failed load left the arrangement alone");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn check_reports_unreadable_sources() {
+        let mut a = Arrangement::default();
+        run_ok(&mut a, &["put", "/nonexistent.wav:00:00:00-00:00:10"]);
+        let (code, msg) = run_err(&mut a, &["check"]);
+        assert_eq!(code, 1);
+        assert!(msg.contains("cannot open /nonexistent.wav"), "{msg}");
+        assert!(msg.contains("1 problem"), "{msg}");
+    }
+
+    #[test]
+    fn check_verifies_real_sources() {
+        let dir = temp_dir();
+        let src = dir.join("a.wav");
+        write_test_wav(&src, 0.2, 0.5);
+        let spec = format!("{}:00:00:00-00:00:00.200", src.to_string_lossy());
+        let mut a = Arrangement::default();
+        let put = parse_command(&["put".to_string(), spec]).unwrap();
+        dispatch(&mut a, put).unwrap();
+        let out = run_ok(&mut a, &["check"]);
+        assert!(out.contains("all sources ok"), "{out}");
         std::fs::remove_dir_all(&dir).ok();
     }
 

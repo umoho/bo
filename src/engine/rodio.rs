@@ -246,6 +246,26 @@ fn probe(uri: &str) -> Result<Duration, String> {
         .ok_or_else(|| format!("cannot determine the length of {uri}"))
 }
 
+/// Probe every distinct source in the arrangement, returning one problem
+/// string per source that cannot be opened, decoded, or measured. Duplicate
+/// uris are probed once.
+pub fn check_sources(tracks: &[Track]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut problems = Vec::new();
+    for track in tracks {
+        for clip in track.clips() {
+            let uri = clip.source.uri.as_str();
+            if !seen.insert(uri) {
+                continue;
+            }
+            if let Err(e) = probe(uri) {
+                problems.push(e);
+            }
+        }
+    }
+    problems
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
