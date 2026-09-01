@@ -116,6 +116,27 @@ impl Timeline {
     pub fn end(&self) -> Duration {
         self.end
     }
+
+    /// Cut the plan short: keep only the first `to` of playback, dropping
+    /// clips that start after it and trimming a clip that spans it. `to` is
+    /// measured from the plan's own start (`at`), not from track time zero.
+    /// Used by range renders; playback never truncates.
+    pub fn truncate(&mut self, to: Duration) {
+        for track in &mut self.tracks {
+            let mut cursor = Duration::ZERO;
+            track.clips.retain_mut(|clip| {
+                let start = cursor + clip.delay;
+                cursor = start + clip.length;
+                if start >= to {
+                    false
+                } else {
+                    clip.length = clip.length.min(to - start);
+                    true
+                }
+            });
+        }
+        self.end = self.end.min(to);
+    }
 }
 
 impl TrackPlan {
@@ -211,6 +232,27 @@ mod tests {
         let t = track_with(vec![Clip::new(src("missing.wav", None))]);
         let err = Timeline::plan(&[t], Duration::ZERO, |_| Err("cannot probe".into())).unwrap_err();
         assert_eq!(err, "cannot probe");
+    }
+
+    #[test]
+    fn truncate_cuts_a_plan_to_a_range() {
+        let t = track_with(vec![
+            Clip::new(src("a.wav", Some(secs(10)))),
+            Clip::new(src("b.wav", Some(secs(5)))).at(secs(10)),
+            Clip::new(src("c.wav", Some(secs(2)))).at(secs(20)),
+        ]);
+        let mut plan = Timeline::plan(&[t], Duration::ZERO, |_| unreachable!()).unwrap();
+        plan.truncate(secs(12));
+        assert_eq!(plan.end(), secs(12));
+        let clips = &plan.tracks()[0].clips();
+        assert_eq!(clips.len(), 2, "c starts at 20s, past the cut");
+        assert_eq!(clips[0].length, secs(10), "a untouched");
+        assert_eq!(clips[1].length, secs(2), "b cut at 12s");
+        // Starting mid-way, `to` is relative to the plan's start: entered
+        // 3s in, keep 4 more seconds (absolute 7s).
+        let mut plan = Timeline::plan(&[track_with(vec![Clip::new(src("a.wav", Some(secs(10))))])], secs(3), |_| unreachable!()).unwrap();
+        plan.truncate(secs(4));
+        assert_eq!(plan.tracks()[0].clips()[0].length, secs(4), "entered 3s in, keep 4s");
     }
 
     #[test]

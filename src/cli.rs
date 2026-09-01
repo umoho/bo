@@ -45,7 +45,8 @@
 //!   mix.
 //! * `take <track> <clip>` — remove a clip; the clip is addressed by its
 //!   stable id or an `@timecode` (the clip covering that moment).
-//! * `render <file>` — mix the arrangement to a wav file, offline.
+//! * `render <file> [from-to]` — mix the arrangement to a wav file,
+//!   offline; a range renders only that span.
 //! * `save <file>` / `load <file>` — write the arrangement as a script of
 //!   commands, or replace it from one (transport resets with the swap).
 //! * `reset` — drop every track and stop the transport: the daemon is back
@@ -146,10 +147,13 @@ enum Command {
         /// Track timecode.
         at: String,
     },
-    /// Mix the arrangement to a wav file, offline.
+    /// Mix the arrangement to a wav file, offline; optionally only a range.
     Render {
         /// Output wav path.
         file: String,
+        /// Range to render: `from-to`, `from-`, or nothing for the whole
+        /// program.
+        range: Option<String>,
     },
     /// Write the arrangement as a script of commands.
     Save {
@@ -354,7 +358,8 @@ Arrangement:
   ls                       dump the arrangement; a key: value status block,
                            then one key=value line per track and clip
   at <t>                   show what plays at track time t
-  render <file>            mix the arrangement to a wav file
+  render <file> [from-to]  mix the arrangement to a wav file; a range
+                           renders only that span (from- to the end)
   save <file>              write the arrangement as a script
   load <file>              replace the arrangement from a script
   reset                    drop every track and stop; back to a fresh
@@ -594,8 +599,12 @@ fn dispatch(a: &mut Arrangement, command: Command) -> Result<String, (i32, Strin
             Ok(format!("track {track} unmuted\n"))
         }
         Command::Take { track, clip } => take_command(a, track, &clip),
-        Command::Render { file } => {
-            let duration = render_to_file(a.player.tracks(), &file)
+        Command::Render { file, range } => {
+            let (from, to) = match range {
+                Some(r) => parse_range(&r).map_err(usage)?,
+                None => (Duration::ZERO, None),
+            };
+            let duration = render_to_file(a.player.tracks(), &file, from, to)
                 .map_err(|e| fail(format!("render failed: {e}")))?;
             Ok(format!("rendered {file} ({})\n", format_time(duration)))
         }
@@ -890,8 +899,31 @@ fn probe_arrangement(a: &Arrangement) -> Result<String, (i32, String)> {
     }
 }
 
-/// The command line the client puts on the wire, re-serialized from the
-/// already-parsed subcommand.
+/// Parse a render range: `from-to`, `from-` (to the end), or empty for the
+/// whole program.
+fn parse_range(s: &str) -> Result<(Duration, Option<Duration>), String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Ok((Duration::ZERO, None));
+    }
+    if let Some((from, to)) = s.split_once('-') {
+        let from = parse_timecode(from)?;
+        let to = if to.trim().is_empty() {
+            None
+        } else {
+            Some(parse_timecode(to)?)
+        };
+        if let Some(to) = to
+            && to < from
+        {
+            return Err(format!("bad range {s:?}: to before from"));
+        }
+        Ok((from, to))
+    } else {
+        Err(format!("bad range {s:?}: expected from-to"))
+    }
+}
+
 /// The command line the client puts on the wire, re-serialized from the
 /// already-parsed subcommand. String arguments are quoted so that paths and
 /// names with whitespace survive [`handle_line`]'s tokenizer.
@@ -913,7 +945,10 @@ fn command_line(command: &Command) -> String {
         Command::Mute { track } => format!("mute {track}"),
         Command::Unmute { track } => format!("unmute {track}"),
         Command::Take { track, clip } => format!("take {track} {}", quote_arg(clip)),
-        Command::Render { file } => format!("render {}", quote_arg(file)),
+        Command::Render { file, range } => match range {
+            Some(r) => format!("render {} {}", quote_arg(file), quote_arg(r)),
+            None => format!("render {}", quote_arg(file)),
+        },
         Command::Save { file } => format!("save {}", quote_arg(file)),
         Command::Load { file } => format!("load {}", quote_arg(file)),
         Command::Reset => "reset".to_string(),
@@ -1239,6 +1274,7 @@ fn handle_line(state: &Mutex<Arrangement>, line: &str) -> (i32, String, bool) {
 mod tests {
     use super::*;
     use bo::engine::{BackendEvent, State};
+    use rodio::Source as _;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn run_ok(a: &mut Arrangement, args: &[&str]) -> String {
@@ -1733,6 +1769,32 @@ mod tests {
         wait_until("cleanup", || !socket.exists());
         assert_eq!(handle.join().unwrap(), 0);
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn render_exports_a_range_of_the_arrangement() {
+        let dir = temp_dir();
+        let src = dir.join("a.wav");
+        write_test_wav(&src, 0.5, 0.5);
+        let spec = format!("{}:00:00:00-00:00:00.500", src.to_string_lossy());
+        let out = dir.join("out.wav");
+        let out_s = out.to_string_lossy().into_owned();
+
+        let mut a = Arrangement::default();
+        // Two butt-joined clips: 0..0.5s and 0.5..1.0s.
+        let put = parse_command(&["put".to_string(), spec.clone()]).unwrap();
+        dispatch(&mut a, put).unwrap();
+        let put2 = parse_command(&["put".to_string(), format!("{}@00:00:00.500:00:00:00-00:00:00.500", src.to_string_lossy())]).unwrap();
+        dispatch(&mut a, put2).unwrap();
+
+        // A 0.25s window from 0.25s: half of the first clip only.
+        let render = parse_command(&["render".to_string(), out_s.clone(), "00:00:00.250-00:00:00.500".to_string()]).unwrap();
+        let reply = dispatch(&mut a, render).unwrap();
+        assert!(reply.contains("00:00:00.250"), "rendered span: {reply}");
+        let decoder = rodio::Decoder::new(std::io::BufReader::new(std::fs::File::open(&out).unwrap())).unwrap();
+        let total = decoder.total_duration().unwrap();
+        assert!((total.as_secs_f64() - 0.25).abs() < 0.05, "rendered {total:?}");
         std::fs::remove_dir_all(&dir).ok();
     }
 

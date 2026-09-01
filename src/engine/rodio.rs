@@ -147,13 +147,23 @@ fn build_mix(
 ///
 /// The same [`Timeline`] as playback, but each track becomes a finite,
 /// sequentially chained source at the track's gain on a 44.1 kHz stereo
-/// mixer, and the mix is pulled until every source is done. Returns the
-/// rendered duration.
+/// mixer, and the mix is pulled until every source is done. Renders from
+/// `from` (entering the current clip mid-way); an optional `to` cuts the
+/// plan short. Returns the rendered duration.
 ///
 /// Unlike playback this does not use `Player` queues: those stay alive with
 /// silence when empty (right for a device, infinite for a render).
-pub fn render_to_file(tracks: &[Track], path: impl AsRef<std::path::Path>) -> Result<Duration, String> {
-    let timeline = Timeline::plan(tracks, Duration::ZERO, probe)?;
+pub fn render_to_file(
+    tracks: &[Track],
+    path: impl AsRef<std::path::Path>,
+    from: Duration,
+    to: Option<Duration>,
+) -> Result<Duration, String> {
+    let mut timeline = Timeline::plan(tracks, from, probe)?;
+    if let Some(to) = to {
+        // `to` is a track timecode; the plan's own timeline starts at `from`.
+        timeline.truncate(to.saturating_sub(from));
+    }
     let (input, source) = mixer::mixer(nz!(2), nz!(44100));
     for track in timeline.tracks() {
         let gain = if track.muted() { 0.0 } else { track.gain() };
@@ -184,8 +194,9 @@ impl Renderer {
 }
 
 impl Backend for Renderer {
-    fn play(&mut self, tracks: &[Track], _at: Duration) -> Result<(), BackendError> {
-        render_to_file(tracks, &self.path).map_err(|e| BackendError::new("render", e))?;
+    fn play(&mut self, tracks: &[Track], at: Duration) -> Result<(), BackendError> {
+        render_to_file(tracks, &self.path, at, None)
+            .map_err(|e| BackendError::new("render", e))?;
         Ok(())
     }
 
@@ -343,7 +354,7 @@ mod tests {
         voice.set_volume(0.5);
 
         let out = dir.join("out.wav");
-        let duration = render_to_file(&[bed, voice], &out).unwrap();
+        let duration = render_to_file(&[bed, voice], &out, Duration::ZERO, None).unwrap();
         assert_eq!(duration, Duration::from_millis(1500), "end of the last clip");
 
         let decoder = Decoder::new(BufReader::new(File::open(&out).unwrap())).unwrap();
@@ -393,14 +404,14 @@ mod tests {
         silent.set_muted(true);
 
         let out = dir.join("out.wav");
-        render_to_file(&[loud.clone(), silent.clone()], &out).unwrap();
+        render_to_file(&[loud.clone(), silent.clone()], &out, Duration::ZERO, None).unwrap();
         let decoder = Decoder::new(BufReader::new(File::open(&out).unwrap())).unwrap();
         let (peak, samples) = decoder.fold((0.0f32, 0u64), |(peak, n), s| (peak.max(s.abs()), n + 1));
         assert!(samples > 1000, "rendered a real mix, not a stub");
         assert!(peak > 0.1, "the loud track is audible, peak {peak}");
 
         let out = dir.join("out-muted.wav");
-        render_to_file(&[silent], &out).unwrap();
+        render_to_file(&[silent], &out, Duration::ZERO, None).unwrap();
         let decoder = Decoder::new(BufReader::new(File::open(&out).unwrap())).unwrap();
         let (peak, _) = decoder.fold((0.0f32, 0u64), |(peak, n), s| (peak.max(s.abs()), n + 1));
         assert!(peak < 1e-6, "a muted track contributes nothing, peak {peak}");
