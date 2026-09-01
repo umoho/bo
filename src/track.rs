@@ -63,6 +63,9 @@ impl Source {
 /// on the timeline without touching the source.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Clip {
+    /// Stable handle assigned by [`Track::insert`]: never reused while the
+    /// clip lives, untouched by later inserts or removals. `0` until placed.
+    pub id: u64,
     /// The cited source.
     pub source: Arc<Source>,
     /// Start position on the owning track.
@@ -79,6 +82,7 @@ impl Clip {
     /// The whole source, parked at the track origin.
     pub fn new(source: Arc<Source>) -> Self {
         Self {
+            id: 0,
             source,
             at: Duration::ZERO,
             from: Duration::ZERO,
@@ -89,6 +93,7 @@ impl Clip {
     /// The `from .. to` slice of a source, parked at the track origin.
     pub fn sliced(source: Arc<Source>, from: Duration, to: impl Into<Option<Duration>>) -> Self {
         Self {
+            id: 0,
             source,
             at: Duration::ZERO,
             from,
@@ -175,6 +180,7 @@ pub struct Track {
     volume: f32,
     muted: bool,
     clips: Vec<Clip>,
+    next_id: u64,
 }
 
 impl Default for Track {
@@ -184,6 +190,7 @@ impl Default for Track {
             volume: 1.0,
             muted: false,
             clips: Vec::new(),
+            next_id: 0,
         }
     }
 }
@@ -203,6 +210,7 @@ impl Track {
             volume: 1.0,
             muted: false,
             clips: Vec::new(),
+            next_id: 0,
         }
     }
 
@@ -261,19 +269,23 @@ impl Track {
         self.clips.is_empty()
     }
 
-    /// Insert a clip, preserving order and the non-overlap invariant.
+    /// Insert a clip, preserving order and the non-overlap invariant, and
+    /// return the stable id it was assigned.
     ///
     /// On collision the clip is handed back untouched, so a refused insert
     /// leaves the track exactly as it was.
-    pub fn insert(&mut self, clip: Clip) -> Result<usize, (Clip, Overlap)> {
+    pub fn insert(&mut self, mut clip: Clip) -> Result<u64, (Clip, Overlap)> {
         if let Some(conflict) = self.clips.iter().position(|c| c.overlaps(&clip)) {
             let at = clip.at;
             return Err((clip, Overlap { at, conflict }));
         }
+        clip.id = self.next_id;
+        self.next_id += 1;
+        let id = clip.id;
         let at = clip.at;
         let index = self.clips.partition_point(|c| c.at < at);
         self.clips.insert(index, clip);
-        Ok(index)
+        Ok(id)
     }
 
     /// Append a clip after the current tail.
@@ -281,22 +293,25 @@ impl Track {
     /// A track whose tail is unknowable (an open-ended clip on an unprobed
     /// source) has no "after", so the clip is attempted at position 0 and
     /// predictably refused.
-    pub fn push(&mut self, mut clip: Clip) -> Result<usize, (Clip, Overlap)> {
+    pub fn push(&mut self, mut clip: Clip) -> Result<u64, (Clip, Overlap)> {
         if let Some(tail) = self.duration() {
             clip.at = tail;
         }
         self.insert(clip)
     }
 
-    /// Remove the clip at `index`.
+    /// Remove the clip with `id`. Ids are never reused, so a removed id stays
+    /// gone.
     #[must_use]
-    pub fn remove(&mut self, index: usize) -> Option<Clip> {
-        (index < self.clips.len()).then(|| self.clips.remove(index))
+    pub fn remove(&mut self, id: u64) -> Option<Clip> {
+        let index = self.clips.iter().position(|c| c.id == id)?;
+        Some(self.clips.remove(index))
     }
 
-    /// Drop every clip, keeping the name.
+    /// Drop every clip, keeping the name; ids restart from zero.
     pub fn clear(&mut self) {
         self.clips.clear();
+        self.next_id = 0;
     }
 
     /// The furthest end of any clip; `None` if some clip has no knowable end.

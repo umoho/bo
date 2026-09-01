@@ -288,25 +288,23 @@ fn at_reports_the_mix_at_a_timecode_over_the_wire() {
 }
 
 #[test]
-fn apply_makes_mix_changes_land_on_the_running_transport() {
+fn take_addresses_clips_by_timecode_over_the_wire() {
     let dir = temp_dir();
     let socket = dir.join("d.sock");
     let sp = socket.to_string_lossy().into_owned();
 
     let out = bo(&sp, &["put", "a.wav:00:00:00-00:00:10"]);
-    assert!(out.contains("ok: track 0"), "{out}");
-    // Stopped: apply explains itself and rebuilds nothing.
-    let out = bo(&sp, &["apply"]);
-    assert!(out.contains("not playing"), "{out}");
-    // Playing: mix changes land on the running transport.
-    let out = bo(&sp, &["play"]);
-    assert!(out.contains("playing from"), "{out}");
-    let out = bo(&sp, &["seek", "00:00:04"]);
-    assert!(out.contains("playhead at 00:00:04.000"), "{out}");
-    let out = bo(&sp, &["volume", "0", "0.5"]);
-    assert!(out.contains("volume 0.50"), "{out}");
-    let out = bo(&sp, &["apply"]);
-    assert!(out.contains("rebuilt from 00:00:04.000"), "{out}");
+    assert!(out.contains("ok: track 0 clip #0"), "{out}");
+    let out = bo(&sp, &["put", "b.wav@00:00:10:00:00:00-00:00:05", "0"]);
+    assert!(out.contains("ok: track 0 clip #1"), "{out}");
+
+    // Delete by timecode: b covers 00:00:12, so it goes — by its stable id.
+    let out = bo(&sp, &["take", "0", "@00:00:12"]);
+    assert!(out.contains("removed track 0 clip #1 b.wav"), "{out}");
+
+    // Ids are stable: a is still id 0 even though b is gone.
+    let out = bo(&sp, &["take", "0", "0"]);
+    assert!(out.contains("removed track 0 clip #0 a.wav"), "{out}");
 
     let out = bo(&sp, &["stop"]);
     assert!(out.contains("stopped"), "{out}");

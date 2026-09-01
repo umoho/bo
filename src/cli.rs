@@ -39,8 +39,8 @@
 //! * `volume <track> <v>` — set a track's gain in the mix (0..1, clamped).
 //! * `mute <track>` / `unmute <track>` — silence or restore a track in the
 //!   mix.
-//! * `take <track> <clip>` — remove a clip; the indices are the ones `put`
-//!   and `ls` print.
+//! * `take <track> <clip>` — remove a clip; the clip is addressed by its
+//!   stable id or an `@timecode` (the clip covering that moment).
 //! * `render <file>` — mix the arrangement to a wav file, offline.
 //! * `save <file>` / `load <file>` — write the arrangement as a script of
 //!   commands, or replace it from one (transport resets with the swap).
@@ -125,12 +125,12 @@ enum Command {
         /// Track index; omit to create a fresh track.
         track: Option<usize>,
     },
-    /// Remove a clip by its indices — the reverse of `put`.
+    /// Remove a clip by its id or the `@timecode` it covers.
     Take {
         /// Track index.
         track: usize,
-        /// Clip index.
-        clip: usize,
+        /// Clip id, or `@timecode`.
+        clip: String,
     },
     /// Show the whole arrangement.
     Ls,
@@ -341,7 +341,8 @@ COMMANDS
 Arrangement:
   put <spec> [track]       place a clip; without [track] a new track is
                            created and its index printed
-  take <track> <clip>      remove a clip — the reverse of put
+  take <track> <clip>      remove a clip — by its id, or the @timecode it
+                           covers
   ls                       dump the arrangement; a key: value status block,
                            then one key=value line per track and clip
   at <t>                   show what plays at track time t
@@ -582,13 +583,7 @@ fn dispatch(a: &mut Arrangement, command: Command) -> Result<String, (i32, Strin
             t.set_muted(false);
             Ok(format!("track {track} unmuted\n"))
         }
-        Command::Take { track, clip } => {
-            let removed = a.player.tracks_mut().get_mut(track).and_then(|t| t.remove(clip));
-            match removed {
-                Some(_) => Ok(format!("removed track {track} clip #{clip}\n")),
-                None => Err(fail(format!("no clip {track}#{clip}"))),
-            }
-        }
+        Command::Take { track, clip } => take_command(a, track, &clip),
         Command::Render { file } => {
             let duration = render_to_file(a.player.tracks(), &file)
                 .map_err(|e| fail(format!("render failed: {e}")))?;
@@ -672,7 +667,7 @@ fn format_arrangement(a: &Arrangement) -> String {
             t.volume(),
             t.len()
         );
-        for (ci, c) in t.clips().iter().enumerate() {
+        for c in t.clips() {
             let end = c.end().map(format_time).unwrap_or_else(|| "inf".into());
             let src_to = c
                 .to
@@ -681,7 +676,8 @@ fn format_arrangement(a: &Arrangement) -> String {
                 .unwrap_or_else(|| "inf".into());
             let _ = writeln!(
                 out,
-                "  clip {ci}: uri={} at={} end={end} src={}-{src_to}",
+                "  clip {}: uri={} at={} end={end} src={}-{src_to}",
+                c.id,
                 c.source.uri,
                 format_time(c.at),
                 format_time(c.from)
@@ -697,13 +693,14 @@ fn at_command(a: &Arrangement, at_arg: &str) -> Result<String, (i32, String)> {
     let t = parse_timecode(at_arg).map_err(usage)?;
     let mut out = String::new();
     for (ti, track) in a.player.tracks().iter().enumerate() {
-        let Some((ci, clip)) = track.clips().iter().enumerate().find(|(_, c)| c.covers(t)) else {
+        let Some(clip) = track.clips().iter().find(|c| c.covers(t)) else {
             continue;
         };
         let end = clip.end().map(format_time).unwrap_or_else(|| "inf".into());
         let _ = writeln!(
             out,
-            "track {ti}: clip={ci} uri={} at={} end={end}",
+            "track {ti}: clip={} uri={} at={} end={end}",
+            clip.id,
             clip.source.uri,
             format_time(clip.at)
         );
@@ -712,6 +709,38 @@ fn at_command(a: &Arrangement, at_arg: &str) -> Result<String, (i32, String)> {
         Ok(format!("silent at {}\n", format_time(t)))
     } else {
         Ok(out)
+    }
+}
+
+/// `take <track> <clip>`: remove a clip from a track. The clip is addressed
+/// by its stable id, or by an `@timecode` — the clip covering that moment,
+/// unique per track by the non-overlap invariant.
+fn take_command(
+    a: &mut Arrangement,
+    track_index: usize,
+    clip_arg: &str,
+) -> Result<String, (i32, String)> {
+    let t = a
+        .player
+        .tracks_mut()
+        .get_mut(track_index)
+        .ok_or_else(|| fail(format!("no track {track_index}")))?;
+    let id = if let Ok(id) = clip_arg.parse::<u64>() {
+        Some(id)
+    } else if let Some(tc) = clip_arg.strip_prefix('@') {
+        let at = parse_timecode(tc).map_err(usage)?;
+        t.clip_at(at).map(|c| c.id)
+    } else {
+        return Err(usage(format!(
+            "clip must be an id or @timecode, got {clip_arg:?}"
+        )));
+    };
+    match id.and_then(|id| t.remove(id)) {
+        Some(clip) => Ok(format!(
+            "removed track {track_index} clip #{} {}\n",
+            clip.id, clip.source.uri
+        )),
+        None => Err(fail(format!("no clip {track_index}#{clip_arg}"))),
     }
 }
 
@@ -741,14 +770,18 @@ fn put_command(
         Some(at) => clip.at(at),
         None => clip,
     };
-    let idx = match a.player.tracks_mut()[track_index].insert(clip) {
-        Ok(i) => i,
+    let id = match a.player.tracks_mut()[track_index].insert(clip) {
+        Ok(id) => id,
         Err((_, overlap)) => return Err(fail(format!("refused: {overlap}"))),
     };
-    let placed = &a.player.tracks()[track_index].clips()[idx];
+    let placed = a.player.tracks()[track_index]
+        .clips()
+        .iter()
+        .find(|c| c.id == id)
+        .expect("the inserted clip is in the track");
     let open = if placed.duration().is_none() { " (open-ended)" } else { "" };
     Ok(format!(
-        "ok: track {track_index} clip #{idx} {} @ {}{open}\n",
+        "ok: track {track_index} clip #{id} {} @ {}{open}\n",
         placed.source.uri,
         format_time(placed.at)
     ))
@@ -859,7 +892,7 @@ fn command_line(command: &Command) -> String {
         Command::Volume { track, v } => format!("volume {track} {v}"),
         Command::Mute { track } => format!("mute {track}"),
         Command::Unmute { track } => format!("unmute {track}"),
-        Command::Take { track, clip } => format!("take {track} {clip}"),
+        Command::Take { track, clip } => format!("take {track} {}", quote_arg(clip)),
         Command::Render { file } => format!("render {}", quote_arg(file)),
         Command::Save { file } => format!("save {}", quote_arg(file)),
         Command::Load { file } => format!("load {}", quote_arg(file)),
@@ -1484,6 +1517,31 @@ mod tests {
             Duration::from_secs(4),
             "apply does not move the playhead"
         );
+    }
+
+    #[test]
+    fn take_addresses_clips_by_id_and_timecode() {
+        let mut a = Arrangement::default();
+        run_ok(&mut a, &["put", "a.wav:00:00:00-00:00:10"]);
+        run_ok(&mut a, &["put", "b.wav@00:00:10:00:00:00-00:00:05", "0"]);
+        run_ok(&mut a, &["put", "c.wav:00:00:00-00:00:03"]);
+
+        // By timecode: the clip covering 00:00:12 on track 0 is b (id 1).
+        let out = run_ok(&mut a, &["take", "0", "@00:00:12"]);
+        assert!(out.contains("removed track 0 clip #1 b.wav"), "{out}");
+
+        // By id: the remaining a on track 0 is id 0.
+        let out = run_ok(&mut a, &["take", "0", "0"]);
+        assert!(out.contains("removed track 0 clip #0 a.wav"), "{out}");
+
+        // A timecode nothing covers is a miss.
+        let (code, msg) = run_err(&mut a, &["take", "0", "@00:00:30"]);
+        assert_eq!(code, 1);
+        assert!(msg.contains("no clip 0#@00:00:30"), "{msg}");
+
+        // Neither an id nor a timecode is a usage error.
+        let (code, _) = run_err(&mut a, &["take", "0", "xyz"]);
+        assert_eq!(code, 2);
     }
 
     #[test]
