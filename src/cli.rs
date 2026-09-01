@@ -1,9 +1,20 @@
-//! The agent-facing CLI, one command so far: `put`.
+//! The agent-facing CLI: one command per invocation, parsed by clap.
 //!
-//! `bo put <spec> [track]` places a clip on a track. Without `[track]` a new
-//! track is created and its index is printed, so later puts can name it. With
-//! `[track]` the track is used, created on demand (up to that index) so that
-//! state scripts rebuild the exact same layout.
+//! `bo` is driven by an agent assembling a broadcast. Every invocation loads
+//! the arrangement from a state file, runs one command, and — when the
+//! arrangement changed — persists it back as the very commands that rebuild
+//! it, so the file doubles as a readable script. Command lines on the terminal
+//! and lines inside the state file go through the same clap parse and the
+//! same dispatch: one grammar, two entry points.
+//!
+//! # Commands
+//!
+//! * `put <spec> [track]` — place a clip on a track; without `[track]` a new
+//!   track is created and its index printed, so later puts can name it. With
+//!   `[track]` the track is used, created on demand (up to that index) so
+//!   state scripts rebuild the exact same layout.
+//! * `play` — start playback from the current playhead. Transport state is
+//!   runtime, not arrangement: `play` never rewrites the state file.
 //!
 //! # Clip specs
 //!
@@ -20,49 +31,51 @@
 //! that leaves two valid timecodes, so the serialized form — every field as
 //! `HH:MM:SS.fff` — round-trips exactly.
 //!
-//! # State
-//!
-//! Every successful `put` is persisted to a state file — `bo.state` in the
-//! current directory, overridable with `--state <path>` or the `BO_STATE`
-//! environment variable. The file holds the very commands that rebuild the
-//! arrangement, so it doubles as a readable script.
-//!
 //! A clip with no known end (an unsliced, unprobed source) is open-ended: it
 //! blocks everything after it on the same track, which is how the engine makes
 //! overlap failures predictable. Slice what you place (`uri:from-to`) to keep
-//! arranging on one track.
+//! arranging.
 
 use std::fmt::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use bo::engine::{Player, Silent};
 use bo::track::{Clip, Source, Track};
+use clap::{Parser, Subcommand};
 
-/// Default state file, when neither `--state` nor `$BO_STATE` says otherwise.
-const DEFAULT_STATE: &str = "bo.state";
+/// bo — arrange and play a radio program.
+#[derive(Debug, Parser)]
+#[command(name = "bo", version, arg_required_else_help = true)]
+struct Cli {
+    /// State file holding the arrangement script.
+    #[arg(long, global = true, env = "BO_STATE", default_value = "bo.state")]
+    state: PathBuf,
 
-const USAGE: &str = "\
-bo put <spec> [track]
+    #[command(subcommand)]
+    command: Command,
+}
 
-place a clip on a track. Without [track], a new track is created and its
-index is printed, so later puts can name it:
-
-  bo put bed.wav            -> creates track 0, prints it
-  bo put jingle.wav 0       -> onto the track from above
-
-<spec> is uri[@at][:from-to]:
-  at      position on the track; default 0
-  from-to slice of the source; an empty to (from-) plays to the source's end
-  timecodes are SS, MM:SS or HH:MM:SS, optional .fff fraction
-
-examples:
-  bo put bed.wav
-  bo put bed.wav@00:30:00
-  bo put jingle.wav:00:00:10-00:00:25
-  bo put news.wav@00:30:00:00:00:05-00:01:00
-";
+/// The one command an invocation runs.
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Place a clip on a track.
+    ///
+    /// The spec is `uri[@at][:from-to]`: `at` positions the clip on the track
+    /// (default 0), `from-to` slices the source (an empty `to` plays to the
+    /// source's end). Timecodes are SS, MM:SS or HH:MM:SS with an optional
+    /// .fff fraction. Without a track index a new track is created and its
+    /// index printed; a named track is created on demand.
+    Put {
+        /// uri[@at][:from-to]
+        spec: String,
+        /// Track index; omit to create a fresh track.
+        track: Option<usize>,
+    },
+    /// Start playback from the current playhead.
+    Play,
+}
 
 /// A clip description before it exists: `uri[@at][:from-to]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,6 +84,13 @@ struct Spec {
     at: Option<Duration>,
     from: Duration,
     to: Option<Duration>,
+}
+
+/// Whether a command changed the arrangement (and so must be persisted).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Effect {
+    None,
+    Persist,
 }
 
 /// The arrangement a command works on: the player's stacked tracks.
@@ -185,12 +205,11 @@ fn fail(msg: impl Into<String>) -> (i32, String) {
     (1, msg.into())
 }
 
-/// Execute one command line against the arrangement.
-fn run_command(a: &mut Arrangement, args: &[String]) -> Result<String, (i32, String)> {
-    match args.first().map(String::as_str) {
-        Some("put") => put_command(a, args),
-        Some(cmd) => Err(usage(format!("unknown command {cmd:?} — `bo put` is all there is"))),
-        None => Err(usage("missing command")),
+/// Run a parsed subcommand against the arrangement.
+fn dispatch(a: &mut Arrangement, command: Command) -> Result<(String, Effect), (i32, String)> {
+    match command {
+        Command::Put { spec, track } => put_command(a, &spec, track),
+        Command::Play => play_command(a),
     }
 }
 
@@ -199,17 +218,12 @@ fn run_command(a: &mut Arrangement, args: &[String]) -> Result<String, (i32, Str
 /// The identifier in the output is the contract: an implicit put creates a
 /// fresh track and prints its index; an explicit one names a track, created on
 /// demand so that state scripts rebuild the same layout.
-fn put_command(a: &mut Arrangement, args: &[String]) -> Result<String, (i32, String)> {
-    // Options after `put` were not consumed by the top-level loop; `-h` shows
-    // the usage, anything else leading with `-` is a mistake, and crucially
-    // neither may become a clip spec.
-    match args.get(1).map(String::as_str) {
-        Some("-h") | Some("--help") => return Ok(USAGE.to_string()),
-        Some(s) if s.starts_with('-') => return Err(usage(format!("unknown option {s:?}"))),
-        _ => {}
-    }
-    let (spec_arg, want_track) = parse_put_args(args)?;
-    let spec = parse_spec(&spec_arg).map_err(usage)?;
+fn put_command(
+    a: &mut Arrangement,
+    spec_arg: &str,
+    want_track: Option<usize>,
+) -> Result<(String, Effect), (i32, String)> {
+    let spec = parse_spec(spec_arg).map_err(usage)?;
     let track_index = match want_track {
         Some(i) => {
             while a.player.tracks().len() <= i {
@@ -231,25 +245,21 @@ fn put_command(a: &mut Arrangement, args: &[String]) -> Result<String, (i32, Str
     };
     let placed = &a.player.tracks()[track_index].clips()[idx];
     let open = if placed.duration().is_none() { " (open-ended)" } else { "" };
-    Ok(format!(
-        "ok: track {track_index} clip #{idx} {} @ {}{open}\n",
-        placed.source.uri,
-        format_time(placed.at)
+    Ok((
+        format!(
+            "ok: track {track_index} clip #{idx} {} @ {}{open}\n",
+            placed.source.uri,
+            format_time(placed.at)
+        ),
+        Effect::Persist,
     ))
 }
 
-/// Pull the clip spec and the optional positional `[track]` out of a `put`
-/// line.
-fn parse_put_args(args: &[String]) -> Result<(String, Option<usize>), (i32, String)> {
-    let spec = args.get(1).ok_or_else(|| usage("missing clip spec"))?;
-    let track = match args.get(2) {
-        Some(s) => Some(s.parse().map_err(|_| usage(format!("bad track index {s:?}")))?),
-        None => None,
-    };
-    if args.len() > 3 {
-        return Err(usage("too many arguments"));
-    }
-    Ok((spec.clone(), track))
+/// `play`: start playback from the current playhead. A pure transport action —
+/// the arrangement is untouched, so nothing is persisted.
+fn play_command(a: &mut Arrangement) -> Result<(String, Effect), (i32, String)> {
+    a.player.play().map_err(|e| fail(e.to_string()))?;
+    Ok((format!("playing from {}\n", format_time(a.player.playhead())), Effect::None))
 }
 
 /// The state file as a script: the commands that rebuild the arrangement.
@@ -274,8 +284,9 @@ fn serialize(a: &Arrangement) -> String {
 
 /// Execute a script (the state file) into the arrangement.
 ///
-/// Stops at the first failing line and reports `src:line: message`; what ran
-/// before the failure stays applied.
+/// Every line is parsed by the same clap parser as a command line, then
+/// dispatched. Stops at the first failing line and reports `src:line:
+/// message`; what ran before the failure stays applied.
 fn run_script(a: &mut Arrangement, text: &str, src: &str) -> Result<(), String> {
     for (n, line) in text.lines().enumerate() {
         let line = line.trim();
@@ -283,15 +294,41 @@ fn run_script(a: &mut Arrangement, text: &str, src: &str) -> Result<(), String> 
             continue;
         }
         let args: Vec<String> = line.split_whitespace().map(str::to_string).collect();
-        match run_command(a, &args) {
-            Ok(_) => {}
-            Err((_, msg)) => return Err(format!("{src}:{}: {msg}", n + 1)),
+        let command = match parse_command(&args) {
+            Ok(command) => command,
+            Err(code) => return Err(format!("{src}:{}: parse failed (exit {code})", n + 1)),
+        };
+        if let Err((_, msg)) = dispatch(a, command) {
+            return Err(format!("{src}:{}: {msg}", n + 1));
         }
     }
     Ok(())
 }
 
-fn load_into(a: &mut Arrangement, path: &Path) -> Result<(), String> {
+/// Parse a command line (argv or a state-file line) into a subcommand.
+///
+/// On failure the clap error is printed (help/version go to stdout, misuse to
+/// stderr) and its exit code returned: 0 for help, 2 for a parse error.
+fn parse_command(args: &[String]) -> Result<Command, i32> {
+    let argv = std::iter::once("bo".to_string()).chain(args.iter().cloned());
+    match Cli::try_parse_from(argv) {
+        Ok(cli) => Ok(cli.command),
+        Err(e) => {
+            let _ = e.print();
+            Err(e.exit_code())
+        }
+    }
+}
+
+/// Execute one command line against the arrangement: parse, then dispatch.
+/// Test-only convenience: production paths parse and dispatch separately.
+#[cfg(test)]
+fn run_command(a: &mut Arrangement, args: &[String]) -> Result<(String, Effect), (i32, String)> {
+    let command = parse_command(args).map_err(|code| (code, String::new()))?;
+    dispatch(a, command)
+}
+
+fn load_into(a: &mut Arrangement, path: &PathBuf) -> Result<(), String> {
     match std::fs::read_to_string(path) {
         Ok(text) => run_script(a, &text, &path.display().to_string()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -299,63 +336,35 @@ fn load_into(a: &mut Arrangement, path: &Path) -> Result<(), String> {
     }
 }
 
-fn write_state(a: &Arrangement, path: &Path) -> Result<(), String> {
+fn write_state(a: &Arrangement, path: &PathBuf) -> Result<(), String> {
     std::fs::write(path, serialize(a)).map_err(|e| format!("cannot write {}: {e}", path.display()))
 }
 
-/// Entry point for `main`: parse global options, load the state file, run one
-/// command, persist if it mutated the arrangement. Returns the exit code.
+/// Entry point for `main`: parse the command line, load the state file, run
+/// one command, persist if it mutated the arrangement. Returns the exit code.
 pub fn run(args: Vec<String>) -> i32 {
-    let mut state_path = std::env::var("BO_STATE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(DEFAULT_STATE));
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--state" => {
-                i += 1;
-                let Some(path) = args.get(i) else {
-                    eprintln!("bo: --state needs a path");
-                    return 2;
-                };
-                state_path = PathBuf::from(path);
-                i += 1;
-            }
-            s if let Some(path) = s.strip_prefix("--state=") => {
-                state_path = PathBuf::from(path);
-                i += 1;
-            }
-            "--help" | "-h" => {
-                println!("{USAGE}");
-                return 0;
-            }
-            s if s.starts_with('-') => {
-                eprintln!("bo: unknown option {s:?}");
-                return 2;
-            }
-            _ => break,
-        }
-    }
-    let command: Vec<String> = args[i..].to_vec();
-    if command.is_empty() {
-        println!("{USAGE}");
-        return 0;
-    }
-
+    let cli = match parse_full(&args) {
+        Ok(cli) => cli,
+        Err(code) => return code,
+    };
     let mut arrangement = Arrangement::default();
-    if let Err(msg) = load_into(&mut arrangement, &state_path) {
+    if let Err(msg) = load_into(&mut arrangement, &cli.state) {
         eprintln!("bo: state file {msg}");
         return 1;
     }
 
-    let out = match run_command(&mut arrangement, &command) {
-        Ok(out) => out,
+    let (out, effect) = match dispatch(&mut arrangement, cli.command) {
+        Ok(result) => result,
         Err((code, msg)) => {
-            eprintln!("bo: {msg}");
+            if !msg.is_empty() {
+                eprintln!("bo: {msg}");
+            }
             return code;
         }
     };
-    if let Err(msg) = write_state(&arrangement, &state_path) {
+    if effect == Effect::Persist
+        && let Err(msg) = write_state(&arrangement, &cli.state)
+    {
         eprintln!("bo: {msg}");
         return 1;
     }
@@ -363,15 +372,28 @@ pub fn run(args: Vec<String>) -> i32 {
     0
 }
 
+/// Parse the whole command line, including the global `--state` option.
+fn parse_full(args: &[String]) -> Result<Cli, i32> {
+    let argv = std::iter::once("bo".to_string()).chain(args.iter().cloned());
+    match Cli::try_parse_from(argv) {
+        Ok(cli) => Ok(cli),
+        Err(e) => {
+            let _ = e.print();
+            Err(e.exit_code())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bo::engine::State;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn run_ok(a: &mut Arrangement, args: &[&str]) -> String {
         let v: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         match run_command(a, &v) {
-            Ok(out) => out,
+            Ok((out, _)) => out,
             Err((code, msg)) => panic!("command {args:?} failed ({code}): {msg}"),
         }
     }
@@ -379,6 +401,11 @@ mod tests {
     fn run_err(a: &mut Arrangement, args: &[&str]) -> (i32, String) {
         let v: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         run_command(a, &v).unwrap_err()
+    }
+
+    fn run_effect(a: &mut Arrangement, args: &[&str]) -> Effect {
+        let v: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        run_command(a, &v).unwrap().1
     }
 
     fn temp_dir() -> PathBuf {
@@ -485,6 +512,17 @@ mod tests {
     }
 
     #[test]
+    fn play_starts_transport_without_persisting() {
+        let mut a = Arrangement::default();
+        run_ok(&mut a, &["put", "a.wav:00:00:00-00:00:10"]);
+        let out = run_ok(&mut a, &["play"]);
+        assert!(out.contains("playing from 00:00:00.000"), "{out}");
+        assert_eq!(a.player.state(), State::Playing);
+        assert_eq!(run_effect(&mut a, &["play"]), Effect::None, "transport is not arrangement");
+        assert_eq!(a.player.state(), State::Playing, "a second play re-plans, stays playing");
+    }
+
+    #[test]
     fn serialize_round_trips() {
         let mut a = Arrangement::default();
         run_ok(&mut a, &["put", "bed.wav:00:00:05-00:00:25"]);
@@ -522,21 +560,38 @@ mod tests {
     }
 
     #[test]
-    fn put_help_shows_usage_and_does_not_mutate() {
+    fn run_play_does_not_touch_the_state_file() {
+        let dir = temp_dir();
+        let state = dir.join("state.bo");
+        let sp = state.to_string_lossy().into_owned();
+
+        let code = run(vec!["--state".into(), sp.clone(), "put".into(), "a.wav:00:00:00-00:00:10".into()]);
+        assert_eq!(code, 0);
+        let before = std::fs::read_to_string(&state).unwrap();
+        let code = run(vec!["--state".into(), sp.clone(), "play".into()]);
+        assert_eq!(code, 0);
+        assert_eq!(
+            std::fs::read_to_string(&state).unwrap(),
+            before,
+            "play must not rewrite the arrangement"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn help_exits_zero_and_does_not_mutate() {
         let mut a = Arrangement::default();
-        let out = run_ok(&mut a, &["put", "--help"]);
-        assert!(out.contains("bo put <spec> [track]"), "{out}");
+        assert_eq!(run_err(&mut a, &["put", "--help"]).0, 0, "clap subcommand help exits 0");
+        assert_eq!(run_err(&mut a, &["play", "--help"]).0, 0);
+        assert_eq!(run_err(&mut a, &["--help"]).0, 0);
         assert!(a.player.tracks().is_empty(), "help must not create an arrangement");
-        let out = run_ok(&mut a, &["put", "-h"]);
-        assert!(out.contains("bo put <spec> [track]"), "{out}");
-        assert!(a.player.tracks().is_empty());
     }
 
     #[test]
     fn usage_errors_exit_with_code_two() {
         let mut a = Arrangement::default();
-        assert_eq!(run_err(&mut a, &["nope"]).0, 2);
-        assert_eq!(run_err(&mut a, &["put"]).0, 2);
+        assert_eq!(run_err(&mut a, &["nope"]).0, 2, "unknown subcommand");
+        assert_eq!(run_err(&mut a, &["put"]).0, 2, "missing spec");
         assert_eq!(run_err(&mut a, &["put", "a.wav", "x"]).0, 2, "bad track index");
         assert_eq!(run_err(&mut a, &["put", "a.wav", "0", "extra"]).0, 2, "too many arguments");
         assert_eq!(run_err(&mut a, &["put", "--bogus"]).0, 2, "unknown option");
