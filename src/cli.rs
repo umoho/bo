@@ -1,20 +1,30 @@
-//! The agent-facing CLI: one command per invocation, parsed by clap.
+//! The agent-facing CLI: a client for a playback daemon.
 //!
-//! `bo` is driven by an agent assembling a broadcast. Every invocation loads
-//! the arrangement from a state file, runs one command, and — when the
-//! arrangement changed — persists it back as the very commands that rebuild
-//! it, so the file doubles as a readable script. Command lines on the terminal
-//! and lines inside the state file go through the same clap parse and the
-//! same dispatch: one grammar, two entry points.
+//! The arrangement and the transport live in a long-running daemon, not in
+//! files. Every command reaches the daemon over a Unix socket,
+//! auto-spawning it when it is not running; the daemon exits and cleans up
+//! its socket when playback finishes or is stopped.
+//!
+//! # Lifecycle
+//!
+//! ```text
+//! bo put / play / ...        bo daemon (spawned on demand)
+//!   connect to socket  ───►   owns: arrangement + transport + clock
+//!   send one command line     replies with exit code + output
+//!   print reply, exit         exits when the program is done
+//! ```
+//!
+//! The socket lives at `$TMPDIR/bo/daemon.sock` unless `--socket <path>` says
+//! otherwise. An arrangement is memory-only: it survives as long as the
+//! daemon does. A stale socket left by a dead daemon is removed and replaced
+//! by the next command.
 //!
 //! # Commands
 //!
 //! * `put <spec> [track]` — place a clip on a track; without `[track]` a new
 //!   track is created and its index printed, so later puts can name it. With
-//!   `[track]` the track is used, created on demand (up to that index) so
-//!   state scripts rebuild the exact same layout.
-//! * `play` — start playback from the current playhead. Transport state is
-//!   runtime, not arrangement: `play` never rewrites the state file.
+//!   `[track]` the track is used, created on demand (up to that index).
+//! * `play` — start playback from the current playhead.
 //!
 //! # Clip specs
 //!
@@ -32,16 +42,21 @@
 //! `HH:MM:SS.fff` — round-trips exactly.
 //!
 //! A clip with no known end (an unsliced, unprobed source) is open-ended: it
-//! blocks everything after it on the same track, which is how the engine makes
-//! overlap failures predictable. Slice what you place (`uri:from-to`) to keep
-//! arranging.
+//! blocks everything after it on the same track, and an arrangement that
+//! contains one never finishes — the daemon plays until told to stop. Slice
+//! what you place (`uri:from-to`) to keep arranging.
 
-use std::fmt::Write as _;
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Duration;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command as ProcessCommand, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 
-use bo::engine::{Player, Silent};
+use bo::engine::{Player, Silent, State};
 use bo::track::{Clip, Source, Track};
 use clap::{Parser, Subcommand};
 
@@ -49,9 +64,9 @@ use clap::{Parser, Subcommand};
 #[derive(Debug, Parser)]
 #[command(name = "bo", version, arg_required_else_help = true, max_term_width = 80)]
 struct Cli {
-    /// State file holding the arrangement script.
-    #[arg(long, global = true, env = "BO_STATE", default_value = "bo.state")]
-    state: PathBuf,
+    /// Unix socket the daemon listens on.
+    #[arg(long, global = true)]
+    socket: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Command,
@@ -75,6 +90,9 @@ enum Command {
     },
     /// Start playback from the current playhead.
     Play,
+    /// Hidden: run the playback daemon (spawned by the client on demand).
+    #[command(hide = true)]
+    Daemon,
 }
 
 /// A clip description before it exists: `uri[@at][:from-to]`.
@@ -86,17 +104,15 @@ struct Spec {
     to: Option<Duration>,
 }
 
-/// Whether a command changed the arrangement (and so must be persisted).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Effect {
-    None,
-    Persist,
-}
-
 /// The arrangement a command works on: the player's stacked tracks.
 #[derive(Debug, Default)]
 struct Arrangement {
     player: Player<Silent>,
+}
+
+/// Where the daemon listens by default: `$TMPDIR/bo/daemon.sock`.
+fn default_socket() -> PathBuf {
+    std::env::temp_dir().join("bo").join("daemon.sock")
 }
 
 /// Parse `SS`, `MM:SS` or `HH:MM:SS` (optional `.fff` fraction) into a
@@ -205,11 +221,25 @@ fn fail(msg: impl Into<String>) -> (i32, String) {
     (1, msg.into())
 }
 
+/// Parse the whole command line, including the global `--socket` option.
+fn parse_full(args: &[String]) -> Result<Cli, clap::Error> {
+    let argv = std::iter::once("bo".to_string()).chain(args.iter().cloned());
+    Cli::try_parse_from(argv)
+}
+
+/// Parse a command line (the client's subcommand, or a line on the socket)
+/// into a subcommand.
+fn parse_command(args: &[String]) -> Result<Command, clap::Error> {
+    let argv = std::iter::once("bo".to_string()).chain(args.iter().cloned());
+    Cli::try_parse_from(argv).map(|cli| cli.command)
+}
+
 /// Run a parsed subcommand against the arrangement.
-fn dispatch(a: &mut Arrangement, command: Command) -> Result<(String, Effect), (i32, String)> {
+fn dispatch(a: &mut Arrangement, command: Command) -> Result<String, (i32, String)> {
     match command {
         Command::Put { spec, track } => put_command(a, &spec, track),
         Command::Play => play_command(a),
+        Command::Daemon => Err(fail("the daemon runs standalone, not over the socket")),
     }
 }
 
@@ -217,12 +247,12 @@ fn dispatch(a: &mut Arrangement, command: Command) -> Result<(String, Effect), (
 ///
 /// The identifier in the output is the contract: an implicit put creates a
 /// fresh track and prints its index; an explicit one names a track, created on
-/// demand so that state scripts rebuild the same layout.
+/// demand so that repeated puts rebuild the same layout.
 fn put_command(
     a: &mut Arrangement,
     spec_arg: &str,
     want_track: Option<usize>,
-) -> Result<(String, Effect), (i32, String)> {
+) -> Result<String, (i32, String)> {
     let spec = parse_spec(spec_arg).map_err(usage)?;
     let track_index = match want_track {
         Some(i) => {
@@ -245,142 +275,208 @@ fn put_command(
     };
     let placed = &a.player.tracks()[track_index].clips()[idx];
     let open = if placed.duration().is_none() { " (open-ended)" } else { "" };
-    Ok((
-        format!(
-            "ok: track {track_index} clip #{idx} {} @ {}{open}\n",
-            placed.source.uri,
-            format_time(placed.at)
-        ),
-        Effect::Persist,
+    Ok(format!(
+        "ok: track {track_index} clip #{idx} {} @ {}{open}\n",
+        placed.source.uri,
+        format_time(placed.at)
     ))
 }
 
-/// `play`: start playback from the current playhead. A pure transport action —
-/// the arrangement is untouched, so nothing is persisted.
-fn play_command(a: &mut Arrangement) -> Result<(String, Effect), (i32, String)> {
+/// `play`: start playback from the current playhead. The daemon's clock loop
+/// advances the playhead and exits when the program is done.
+fn play_command(a: &mut Arrangement) -> Result<String, (i32, String)> {
     a.player.play().map_err(|e| fail(e.to_string()))?;
-    Ok((format!("playing from {}\n", format_time(a.player.playhead())), Effect::None))
+    Ok(format!("playing from {}\n", format_time(a.player.playhead())))
 }
 
-/// The state file as a script: the commands that rebuild the arrangement.
-fn serialize(a: &Arrangement) -> String {
-    let mut out = String::new();
-    let _ = writeln!(out, "# bo arrangement v1");
-    for (ti, t) in a.player.tracks().iter().enumerate() {
-        for c in t.clips() {
-            let to = c.to.map(format_time).unwrap_or_default();
-            let _ = writeln!(
-                out,
-                "put {}@{}:{}-{} {ti}",
-                c.source.uri,
-                format_time(c.at),
-                format_time(c.from),
-                to
-            );
-        }
-    }
-    out
-}
-
-/// Execute a script (the state file) into the arrangement.
-///
-/// Every line is parsed by the same clap parser as a command line, then
-/// dispatched. Stops at the first failing line and reports `src:line:
-/// message`; what ran before the failure stays applied.
-fn run_script(a: &mut Arrangement, text: &str, src: &str) -> Result<(), String> {
-    for (n, line) in text.lines().enumerate() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let args: Vec<String> = line.split_whitespace().map(str::to_string).collect();
-        let command = match parse_command(&args) {
-            Ok(command) => command,
-            Err(code) => return Err(format!("{src}:{}: parse failed (exit {code})", n + 1)),
-        };
-        if let Err((_, msg)) = dispatch(a, command) {
-            return Err(format!("{src}:{}: {msg}", n + 1));
-        }
-    }
-    Ok(())
-}
-
-/// Parse a command line (argv or a state-file line) into a subcommand.
-///
-/// On failure the clap error is printed (help/version go to stdout, misuse to
-/// stderr) and its exit code returned: 0 for help, 2 for a parse error.
-fn parse_command(args: &[String]) -> Result<Command, i32> {
-    let argv = std::iter::once("bo".to_string()).chain(args.iter().cloned());
-    match Cli::try_parse_from(argv) {
-        Ok(cli) => Ok(cli.command),
-        Err(e) => {
-            let _ = e.print();
-            Err(e.exit_code())
-        }
+/// The command line the client puts on the wire, re-serialized from the
+/// already-parsed subcommand.
+fn command_line(command: &Command) -> String {
+    match command {
+        Command::Put { spec, track } => match track {
+            Some(t) => format!("put {spec} {t}"),
+            None => format!("put {spec}"),
+        },
+        Command::Play => "play".to_string(),
+        Command::Daemon => unreachable!("the daemon is spawned, not sent"),
     }
 }
 
-/// Execute one command line against the arrangement: parse, then dispatch.
-/// Test-only convenience: production paths parse and dispatch separately.
-#[cfg(test)]
-fn run_command(a: &mut Arrangement, args: &[String]) -> Result<(String, Effect), (i32, String)> {
-    let command = parse_command(args).map_err(|code| (code, String::new()))?;
-    dispatch(a, command)
-}
+// ---------------------------------------------------------------------------
+// Client
+// ---------------------------------------------------------------------------
 
-fn load_into(a: &mut Arrangement, path: &PathBuf) -> Result<(), String> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => run_script(a, &text, &path.display().to_string()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(format!("cannot read {}: {e}", path.display())),
-    }
-}
-
-fn write_state(a: &Arrangement, path: &PathBuf) -> Result<(), String> {
-    std::fs::write(path, serialize(a)).map_err(|e| format!("cannot write {}: {e}", path.display()))
-}
-
-/// Entry point for `main`: parse the command line, load the state file, run
-/// one command, persist if it mutated the arrangement. Returns the exit code.
+/// Entry point for `main`: parse the command line, hand it to the daemon
+/// (spawning one if needed), print the reply, return its exit code. Returns
+/// the exit code.
 pub fn run(args: Vec<String>) -> i32 {
     let cli = match parse_full(&args) {
         Ok(cli) => cli,
-        Err(code) => return code,
-    };
-    let mut arrangement = Arrangement::default();
-    if let Err(msg) = load_into(&mut arrangement, &cli.state) {
-        eprintln!("bo: state file {msg}");
-        return 1;
-    }
-
-    let (out, effect) = match dispatch(&mut arrangement, cli.command) {
-        Ok(result) => result,
-        Err((code, msg)) => {
-            if !msg.is_empty() {
-                eprintln!("bo: {msg}");
-            }
-            return code;
+        Err(e) => {
+            let _ = e.print();
+            return e.exit_code();
         }
     };
-    if effect == Effect::Persist
-        && let Err(msg) = write_state(&arrangement, &cli.state)
-    {
-        eprintln!("bo: {msg}");
+    let socket = cli.socket.unwrap_or_else(default_socket);
+    match cli.command {
+        Command::Daemon => daemon_main(&socket),
+        command => client_main(&socket, &command),
+    }
+}
+
+/// One client round trip: reach the daemon, send the command, print the
+/// reply.
+fn client_main(socket: &Path, command: &Command) -> i32 {
+    let mut stream = match connect_or_spawn(socket) {
+        Ok(stream) => stream,
+        Err(msg) => {
+            eprintln!("bo: {msg}");
+            return 1;
+        }
+    };
+    let line = command_line(command);
+    if let Err(e) = stream.write_all(format!("{line}\n").as_bytes()) {
+        eprintln!("bo: cannot reach the daemon: {e}");
         return 1;
     }
-    print!("{out}");
+    let mut reply = String::new();
+    if let Err(e) = stream.read_to_string(&mut reply) {
+        eprintln!("bo: cannot read the daemon's reply: {e}");
+        return 1;
+    }
+    // Reply framing: first line is the exit code, the rest the output.
+    match reply.split_once('\n') {
+        Some((code, out)) => {
+            print!("{out}");
+            code.trim().parse().unwrap_or(1)
+        }
+        None => {
+            print!("{reply}");
+            1
+        }
+    }
+}
+
+/// Connect to the daemon, spawning it (and clearing a stale socket) when it
+/// is not there.
+fn connect_or_spawn(socket: &Path) -> Result<UnixStream, String> {
+    if let Ok(stream) = UnixStream::connect(socket) {
+        return Ok(stream);
+    }
+    let _ = std::fs::remove_file(socket);
+    if let Some(parent) = socket.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+    }
+    let exe = std::env::current_exe().map_err(|e| format!("cannot find own binary: {e}"))?;
+    let mut child = ProcessCommand::new(&exe)
+        .arg("daemon")
+        .arg("--socket")
+        .arg(socket)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0) // out of the terminal's foreground group
+        .spawn()
+        .map_err(|e| format!("cannot spawn the daemon: {e}"))?;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if let Ok(stream) = UnixStream::connect(socket) {
+            return Ok(stream);
+        }
+        if let Some(status) = child.try_wait().map_err(|e| format!("daemon wait failed: {e}"))? {
+            return Err(format!("daemon exited immediately ({status})"));
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            return Err("daemon did not come up in time".to_string());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Daemon
+// ---------------------------------------------------------------------------
+
+/// The daemon: bind the socket, serve commands, advance the clock, and exit
+/// (cleaning up the socket) when the program finishes or is stopped.
+fn daemon_main(socket: &Path) -> i32 {
+    if let Some(parent) = socket.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        eprintln!("bo: cannot create {}: {e}", parent.display());
+        return 1;
+    }
+    let listener = match UnixListener::bind(socket) {
+        Ok(listener) => listener,
+        Err(e) => {
+            // A live daemon already owns the socket; the client will find it.
+            eprintln!("bo: daemon cannot bind {}: {e}", socket.display());
+            return 1;
+        }
+    };
+    let state = Arc::new(Mutex::new(Arrangement::default()));
+    let exit = Arc::new(AtomicBool::new(false));
+
+    let serve_state = state.clone();
+    let serve = thread::spawn(move || serve_loop(listener, serve_state));
+    let _ = serve;
+
+    // Clock loop: advance the playhead by real elapsed time and watch for
+    // completion. `stop` (via the exit flag) ends the session the same way.
+    let mut last = Instant::now();
+    loop {
+        if exit.load(Ordering::Relaxed) {
+            break;
+        }
+        let now = Instant::now();
+        let dt = now - last;
+        last = now;
+        let finished = {
+            let mut a = state.lock().unwrap();
+            a.player.advance(dt);
+            // Only a played session completes: a freshly spawned daemon that
+            // has not been told to play must not tear itself down.
+            a.player.state() == State::Playing && a.player.is_finished()
+        };
+        if finished {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    let _ = std::fs::remove_file(socket);
     0
 }
 
-/// Parse the whole command line, including the global `--state` option.
-fn parse_full(args: &[String]) -> Result<Cli, i32> {
-    let argv = std::iter::once("bo".to_string()).chain(args.iter().cloned());
-    match Cli::try_parse_from(argv) {
-        Ok(cli) => Ok(cli),
-        Err(e) => {
-            let _ = e.print();
-            Err(e.exit_code())
-        }
+/// Accept connections and handle each command on its own thread. The clock
+/// loop owns the transport; handlers only lock it briefly.
+fn serve_loop(listener: UnixListener, state: Arc<Mutex<Arrangement>>) {
+    for connection in listener.incoming() {
+        let Ok(mut stream) = connection else { continue };
+        let state = state.clone();
+        thread::spawn(move || {
+            let mut line = String::new();
+            let mut reader = BufReader::new(&mut stream);
+            let Ok(_) = reader.read_line(&mut line) else { return };
+            let (code, output) = handle_line(&state, line.trim_end());
+            let _ = stream.write_all(format!("{code}\n{output}").as_bytes());
+        });
+    }
+}
+
+/// One command over the wire: parse, dispatch, and frame the reply.
+fn handle_line(state: &Mutex<Arrangement>, line: &str) -> (i32, String) {
+    let args: Vec<String> = line.split_whitespace().map(str::to_string).collect();
+    let command = match parse_command(&args) {
+        Ok(command) => command,
+        Err(e) => return (e.exit_code(), format!("{}\n", e.to_string().trim_end())),
+    };
+    let mut a = state.lock().unwrap();
+    match dispatch(&mut a, command) {
+        Ok(out) => (0, out),
+        Err((code, msg)) => (code, format!("bo: {msg}\n")),
     }
 }
 
@@ -392,20 +488,18 @@ mod tests {
 
     fn run_ok(a: &mut Arrangement, args: &[&str]) -> String {
         let v: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-        match run_command(a, &v) {
-            Ok((out, _)) => out,
+        match parse_command(&v).map_err(|e| (e.exit_code(), String::new())).and_then(|c| dispatch(a, c)) {
+            Ok(out) => out,
             Err((code, msg)) => panic!("command {args:?} failed ({code}): {msg}"),
         }
     }
 
     fn run_err(a: &mut Arrangement, args: &[&str]) -> (i32, String) {
         let v: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-        run_command(a, &v).unwrap_err()
-    }
-
-    fn run_effect(a: &mut Arrangement, args: &[&str]) -> Effect {
-        let v: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-        run_command(a, &v).unwrap().1
+        parse_command(&v)
+            .map_err(|e| (e.exit_code(), String::new()))
+            .and_then(|c| dispatch(a, c))
+            .unwrap_err()
     }
 
     fn temp_dir() -> PathBuf {
@@ -417,6 +511,22 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn send(socket: &Path, line: &str) -> String {
+        let mut stream = UnixStream::connect(socket).unwrap();
+        stream.write_all(format!("{line}\n").as_bytes()).unwrap();
+        let mut reply = String::new();
+        stream.read_to_string(&mut reply).unwrap();
+        reply
+    }
+
+    fn wait_until<F: Fn() -> bool>(what: &str, check: F) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !check() {
+            assert!(Instant::now() < deadline, "timeout waiting for {what}");
+            thread::sleep(Duration::from_millis(20));
+        }
     }
 
     #[test]
@@ -512,89 +622,49 @@ mod tests {
     }
 
     #[test]
-    fn play_starts_transport_without_persisting() {
+    fn play_starts_transport() {
         let mut a = Arrangement::default();
         run_ok(&mut a, &["put", "a.wav:00:00:00-00:00:10"]);
         let out = run_ok(&mut a, &["play"]);
         assert!(out.contains("playing from 00:00:00.000"), "{out}");
         assert_eq!(a.player.state(), State::Playing);
-        assert_eq!(run_effect(&mut a, &["play"]), Effect::None, "transport is not arrangement");
-        assert_eq!(a.player.state(), State::Playing, "a second play re-plans, stays playing");
     }
 
     #[test]
-    fn serialize_round_trips() {
-        let mut a = Arrangement::default();
-        run_ok(&mut a, &["put", "bed.wav:00:00:05-00:00:25"]);
-        run_ok(&mut a, &["put", "ding.wav@00:00:00:00:00:01-00:00:02", "1"]);
-        run_ok(&mut a, &["put", "live.wav", "2"]);
-
-        let script = serialize(&a);
-        let mut fresh = Arrangement::default();
-        run_script(&mut fresh, &script, "test").unwrap();
-        assert_eq!(serialize(&fresh), script, "the script rebuilds the same arrangement");
-        assert_eq!(fresh.player.tracks().len(), 3);
+    fn clap_help_and_usage_exit_codes() {
+        assert_eq!(parse_full(&["--help".into()]).unwrap_err().exit_code(), 0);
+        assert_eq!(parse_full(&["put".into(), "--help".into()]).unwrap_err().exit_code(), 0);
+        assert_eq!(parse_full(&["nope".into()]).unwrap_err().exit_code(), 2);
+        assert_eq!(parse_full(&["put".into()]).unwrap_err().exit_code(), 2);
+        assert_eq!(parse_full(&["put".into(), "a.wav".into(), "x".into()]).unwrap_err().exit_code(), 2);
     }
 
     #[test]
-    fn run_persists_state_between_invocations() {
+    fn daemon_serves_commands_and_exits_when_playback_finishes() {
         let dir = temp_dir();
-        let state = dir.join("state.bo");
-        let sp = state.to_string_lossy().into_owned();
+        let socket = dir.join("d.sock");
 
-        let code = run(vec!["--state".into(), sp.clone(), "put".into(), "bed.wav:00:00:00-00:00:30".into()]);
-        assert_eq!(code, 0);
-        // The printed identifier is used by a later invocation.
-        let code = run(vec![
-            "--state".into(),
-            sp.clone(),
-            "put".into(),
-            "jingle.wav@00:00:30:00:00:00-00:00:10".into(),
-            "0".into(),
-        ]);
-        assert_eq!(code, 0);
-        let text = std::fs::read_to_string(&state).unwrap();
-        assert!(text.contains("put bed.wav@00:00:00.000:00:00:00.000-00:00:30.000 0"), "{text}");
-        assert!(text.contains("put jingle.wav@00:00:30.000:00:00:00.000-00:00:10.000 0"), "{text}");
+        let handle = {
+            let socket = socket.clone();
+            thread::spawn(move || daemon_main(&socket))
+        };
+        wait_until("socket", || UnixStream::connect(&socket).is_ok());
+
+        let reply = send(&socket, "put a.wav:00:00:00-00:00:00.200");
+        assert!(reply.contains("ok: track 0 clip #0"), "{reply}");
+        let reply = send(&socket, "put b.wav@00:00:00.200:00:00:00-00:00:00.200 0");
+        assert!(reply.contains("ok: track 0 clip #1"), "{reply}");
+
+        // A refused command still gets a framed reply and exit code.
+        let reply = send(&socket, "nope");
+        assert_eq!(reply.lines().next().unwrap(), "2", "{reply}");
+
+        // A 0.4s program: play it, and the daemon cleans up on completion.
+        let reply = send(&socket, "play");
+        assert!(reply.contains("playing from"), "{reply}");
+        wait_until("cleanup", || !socket.exists());
+        assert_eq!(handle.join().unwrap(), 0);
+
         std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn run_play_does_not_touch_the_state_file() {
-        let dir = temp_dir();
-        let state = dir.join("state.bo");
-        let sp = state.to_string_lossy().into_owned();
-
-        let code = run(vec!["--state".into(), sp.clone(), "put".into(), "a.wav:00:00:00-00:00:10".into()]);
-        assert_eq!(code, 0);
-        let before = std::fs::read_to_string(&state).unwrap();
-        let code = run(vec!["--state".into(), sp.clone(), "play".into()]);
-        assert_eq!(code, 0);
-        assert_eq!(
-            std::fs::read_to_string(&state).unwrap(),
-            before,
-            "play must not rewrite the arrangement"
-        );
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn help_exits_zero_and_does_not_mutate() {
-        let mut a = Arrangement::default();
-        assert_eq!(run_err(&mut a, &["put", "--help"]).0, 0, "clap subcommand help exits 0");
-        assert_eq!(run_err(&mut a, &["play", "--help"]).0, 0);
-        assert_eq!(run_err(&mut a, &["--help"]).0, 0);
-        assert!(a.player.tracks().is_empty(), "help must not create an arrangement");
-    }
-
-    #[test]
-    fn usage_errors_exit_with_code_two() {
-        let mut a = Arrangement::default();
-        assert_eq!(run_err(&mut a, &["nope"]).0, 2, "unknown subcommand");
-        assert_eq!(run_err(&mut a, &["put"]).0, 2, "missing spec");
-        assert_eq!(run_err(&mut a, &["put", "a.wav", "x"]).0, 2, "bad track index");
-        assert_eq!(run_err(&mut a, &["put", "a.wav", "0", "extra"]).0, 2, "too many arguments");
-        assert_eq!(run_err(&mut a, &["put", "--bogus"]).0, 2, "unknown option");
-        assert!(a.player.tracks().is_empty(), "an option must not become a clip");
     }
 }

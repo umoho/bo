@@ -332,6 +332,20 @@ impl<B: Backend> Player<B> {
             self.playhead += dt;
         }
     }
+
+    /// Whether playback of a finite arrangement has run to its end.
+    ///
+    /// The playhead is compared against the arrangement's known length; an
+    /// arrangement containing an open-ended clip has no knowable length and
+    /// never finishes. Long-running callers use this to decide when a program
+    /// is done.
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        match self.duration() {
+            Some(length) => self.playhead() >= length,
+            None => false,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -450,6 +464,31 @@ mod tests {
             "the ding has ended"
         );
         assert!(p.active_clips(secs(31)).next().is_none());
+    }
+
+    #[test]
+    fn a_finite_arrangement_finishes_when_the_playhead_passes_its_end() {
+        let mut p: Player<Silent> = Player::default();
+        p.add_track(track_with("a.wav", 10));
+        p.play().unwrap();
+        assert!(!p.is_finished());
+        p.advance(secs(9));
+        assert!(!p.is_finished(), "still inside the arrangement");
+        p.advance(secs(2));
+        assert!(p.is_finished(), "the playhead passed the end");
+
+        // An open-ended clip makes the length unknowable: never finishes.
+        let mut live: Player<Silent> = Player::default();
+        let mut t = Track::named("live");
+        t.insert(Clip::new(Arc::new(crate::track::Source {
+            uri: "live.wav".into(),
+            duration: None,
+        })))
+        .unwrap();
+        live.add_track(t);
+        live.play().unwrap();
+        live.advance(secs(9999));
+        assert!(!live.is_finished());
     }
 
     #[test]
