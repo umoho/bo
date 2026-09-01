@@ -4,11 +4,13 @@
 //! pure, deterministic data model that both the interactive CLI and an agent can
 //! reason about:
 //!
-//! * [`Track`] — an entry: an addressable stream plus lazily-resolved metadata.
-//! * [`Playlist`] — an ordered bag of tracks with a *playback cursor*, a
+//! * [`Entry`] — an entry: a [`Source`] (an address to open, or a script to
+//!   speak) plus a stable id. Title, artist, voice and friends are an optional
+//!   [`Meta`] sidecar the model does not interpret.
+//! * [`Playlist`] — an ordered bag of entries with a *playback cursor*, a
 //!   [`PlayMode`] (shuffle / [`Repeat`]) and a bounded history for `back()`.
 //! * [`Nav`] — the result of a navigation step, so a caller can tell "moved",
-//!   "wrapped", "requeued the same track" and "ran out of tracks" apart.
+//!   "wrapped", "requeued the same entry" and "ran out of entries" apart.
 //!
 //! Two orderings exist at once, which is the whole reason this is a struct and
 //! not a `Vec`:
@@ -21,9 +23,9 @@
 //!
 //! Invariants maintained by this module (checked in debug builds):
 //!
-//! 1. `order` is always a permutation of `0..tracks.len()` — no gaps, no dupes.
+//! 1. `order` is always a permutation of `0..entries.len()` — no gaps, no dupes.
 //! 2. `cursor` is `None` or a valid position in `order`.
-//! 3. Structural edits keep the cursor on the same *track* where possible, so
+//! 3. Structural edits keep the cursor on the same *entry* where possible, so
 //!    removing an entry ahead of the cursor does not skip the following one.
 //! 4. Turning shuffle off restores the identity permutation — play order only
 //!    ever diverges from user order while shuffle is on.
@@ -41,17 +43,17 @@ pub const HISTORY_LIMIT: usize = 64;
 // Ids and errors
 // ---------------------------------------------------------------------------
 
-/// Process-unique identity of a [`Track`].
+/// Process-unique identity of a [`Entry`].
 ///
 /// Indices shift when the playlist is edited; ids do not. Agents should quote ids
 /// when referring to an entry across turns, and indices only for positional
 /// commands ("delete the third one").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct TrackId(u64);
+pub struct EntryId(u64);
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
-impl TrackId {
+impl EntryId {
     /// Allocate the next id.
     #[must_use]
     pub fn next() -> Self {
@@ -71,7 +73,7 @@ impl TrackId {
     }
 }
 
-impl fmt::Display for TrackId {
+impl fmt::Display for EntryId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "#{}", self.0)
     }
@@ -97,7 +99,7 @@ pub enum Error {
     /// No entry carries this id (it was removed, or belongs to another playlist).
     NotFound {
         /// The id that could not be resolved.
-        id: TrackId,
+        id: EntryId,
     },
 }
 
@@ -112,7 +114,7 @@ impl fmt::Display for Error {
         match self {
             Self::Empty => write!(f, "playlist is empty"),
             Self::IndexOutOfBounds { index, len } => {
-                write!(f, "index {index} out of bounds for {len} track(s)")
+                write!(f, "index {index} out of bounds for {len} entry(s)")
             }
             Self::BadLayout { len } => write!(f, "ordering must be a permutation of 0..{len}"),
             Self::NotFound { id } => write!(f, "no entry with id {id} in this playlist"),
@@ -126,191 +128,659 @@ impl std::error::Error for Error {}
 pub type Result<T> = std::result::Result<T, Error>;
 
 // ---------------------------------------------------------------------------
-// Track
+// Source, entry and its metadata sidecar
 // ---------------------------------------------------------------------------
 
-/// A single entry: something playable plus the metadata used to render and search it.
+/// How an entry becomes sound.
 ///
-/// Metadata is optional by design — a URI is always enough to queue something,
-/// and tags can be filled in later (`with_title`, `with_artist`, …) without the
-/// cursor or play order being disturbed.
+/// Exactly two shapes, because `bo` plays both collections of audio *and*
+/// generated speech:
+///
+/// * [`Source::Address`] — something the engine opens: file, URL, pipe, device.
+///   Playable the moment it is queued.
+/// * [`Source::Speech`] — a script to speak. Its `rendered` slot starts empty;
+///   the entry is *pending*, not broken. When a TTS worker writes the audio it
+///   calls [`Entry::resolved_at`], which fills the slot and keeps the script —
+///   so the same entry can later be re-synthesized at another rate or voice,
+///   and stays searchable by its words forever.
+///
+/// Anything beyond these two — voice id, speaking rate, pitch, and all the music
+/// tags like artist/album — is opaque metadata, never a field of the model.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Track {
-    id: TrackId,
-    uri: String,
-    title: String,
-    artist: Option<String>,
-    album: Option<String>,
-    duration: Option<Duration>,
+pub enum Source {
+    /// A path, URL or device the engine can open.
+    Address(String),
+    /// Text to be spoken, plus the address it was rendered to once that exists.
+    Speech {
+        /// The script.
+        text: String,
+        /// Where the synthesized audio landed, once it has.
+        rendered: Option<String>,
+    },
 }
 
-impl Track {
-    /// Queue `uri`, guessing the title from its last path segment.
-    pub fn new(uri: impl Into<String>) -> Self {
-        let uri = uri.into();
-        let title = derive_title(&uri);
-        Self {
-            id: TrackId::next(),
-            uri,
-            title,
-            artist: None,
-            album: None,
-            duration: None,
+impl Source {
+    /// An address the engine opens as-is.
+    pub fn address(address: impl Into<String>) -> Self {
+        Self::Address(address.into())
+    }
+
+    /// A script waiting to be spoken.
+    pub fn speech(text: impl Into<String>) -> Self {
+        Self::Speech {
+            text: text.into(),
+            rendered: None,
         }
     }
 
-    /// Reattach a known id — used when rehydrating a saved playlist.
+    /// What to open right now: the address itself, or the rendered audio of a
+    /// script. `None` means "still waiting for synthesis".
     #[must_use]
-    pub fn with_id(mut self, id: TrackId) -> Self {
+    pub fn uri(&self) -> Option<&str> {
+        match self {
+            Self::Address(a) => Some(a),
+            Self::Speech { rendered, .. } => rendered.as_deref(),
+        }
+    }
+
+    /// The address this source declares, ignoring any rendered audio.
+    #[must_use]
+    pub fn as_address(&self) -> Option<&str> {
+        match self {
+            Self::Address(a) => Some(a),
+            Self::Speech { .. } => None,
+        }
+    }
+
+    /// The script, for speech sources.
+    #[must_use]
+    pub fn as_text(&self) -> Option<&str> {
+        match self {
+            Self::Speech { text, .. } => Some(text),
+            Self::Address(_) => None,
+        }
+    }
+
+    /// Whether this entry is generated speech rather than a stored recording.
+    #[must_use]
+    pub const fn is_speech(&self) -> bool {
+        matches!(self, Self::Speech { .. })
+    }
+
+    /// Whether sound has to be synthesized before playing.
+    #[must_use]
+    pub fn needs_synthesis(&self) -> bool {
+        matches!(self, Self::Speech { rendered, .. } if rendered.is_none())
+    }
+
+    /// The payload either way — an address or a script. Used for labels and
+    /// search, where both are just text to match against.
+    #[must_use]
+    pub fn payload(&self) -> &str {
+        match self {
+            Self::Address(a) => a,
+            Self::Speech { text, .. } => text,
+        }
+    }
+
+    /// Turn this source into a plain address (dropping any script).
+    pub fn set_address(&mut self, address: impl Into<String>) {
+        *self = Self::Address(address.into());
+    }
+
+    /// Replace the script of a speech source (a no-op on plain addresses).
+    pub fn set_text(&mut self, text: impl Into<String>) {
+        if let Self::Speech { text: slot, .. } = self {
+            *slot = text.into();
+        }
+    }
+
+    /// Record rendered audio for a script. Returns `false` when there was
+    /// nothing to do — already audio, or already rendered to the same path — so
+    /// a worker can tell real work from a no-op.
+    pub fn set_rendered(&mut self, address: impl Into<String>) -> bool {
+        let address = address.into();
+        match self {
+            Self::Address(_) => false,
+            Self::Speech { rendered, .. } => {
+                if rendered.as_deref() == Some(address.as_str()) {
+                    false
+                } else {
+                    *rendered = Some(address);
+                    true
+                }
+            }
+        }
+    }
+}
+
+impl fmt::Display for Source {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Address(address) => f.write_str(address),
+            Self::Speech { text, rendered } => {
+                write!(f, "speak {:?}", truncate(text.trim(), 48))?;
+                if let Some(address) = rendered {
+                    write!(f, " -> {address}")?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+impl From<String> for Source {
+    fn from(address: String) -> Self {
+        Self::Address(address)
+    }
+}
+
+impl From<&str> for Source {
+    fn from(address: &str) -> Self {
+        Self::Address(address.to_owned())
+    }
+}
+
+/// What one entry fundamentally is: a source plus an id.
+///
+/// An entry is queued with a source and nothing else — that is all the player
+/// needs to produce sound, and all the model needs to order, search and navigate
+/// it. Everything else (title, artist, album, voice, year, bitrate, play count,
+/// whatever an agent decides to attach) is presentation metadata in an optional
+/// [`Meta`] sidecar, so that:
+///
+/// * adding a tag never changes this type's shape;
+/// * metadata can be missing, late, wrong or half-parsed without breaking the
+///   model (an entry with no metadata still queues, plays, lists and searches);
+/// * the agent can treat metadata as an opaque payload it copies around.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entry {
+    id: EntryId,
+    source: Source,
+    meta: Option<Box<Meta>>,
+}
+
+impl Entry {
+    /// Queue a source with no metadata. Strings are taken as addresses.
+    pub fn new(source: impl Into<Source>) -> Self {
+        Self {
+            id: EntryId::next(),
+            source: source.into(),
+            meta: None,
+        }
+    }
+
+    /// Queue something openable: a path, URL or device.
+    pub fn address(address: impl Into<String>) -> Self {
+        Self::new(Source::Address(address.into()))
+    }
+
+    /// Queue a script to speak.
+    pub fn speak(text: impl Into<String>) -> Self {
+        Self::new(Source::speech(text))
+    }
+
+    /// Reattach a known id, e.g. when reading a saved playlist back in.
+    #[must_use]
+    pub fn with_id(mut self, id: EntryId) -> Self {
         self.id = id;
         self
     }
 
-    /// Set the title.
+    /// Attach a metadata sidecar (replacing any existing one).
     #[must_use]
-    pub fn with_title(mut self, title: impl Into<String>) -> Self {
-        self.title = title.into();
+    pub fn with_meta(mut self, meta: Meta) -> Self {
+        if !meta.is_empty() {
+            self.meta = Some(Box::new(meta));
+        }
         self
     }
 
-    /// Set the artist.
+    /// Attach a display label.
     #[must_use]
-    pub fn with_artist(mut self, artist: impl Into<String>) -> Self {
-        self.artist = Some(artist.into());
+    pub fn with_label(mut self, label: impl Into<String>) -> Self {
+        self.set_label(label);
         self
     }
 
-    /// Set the album.
+    /// Attach a known length.
     #[must_use]
-    pub fn with_album(mut self, album: impl Into<String>) -> Self {
-        self.album = Some(album.into());
+    pub fn with_duration(mut self, duration: impl Into<Option<Duration>>) -> Self {
+        self.set_duration(duration);
         self
     }
 
-    /// Set the duration (`None` = unknown or live).
+    /// Attach one arbitrary tag (`artist`, `voice`, …).
+    #[must_use]
+    pub fn with_tag(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.set_tag(key, value);
+        self
+    }
+
+    /// Stable identity of this entry — survives reordering, renaming and
+    /// resolution, which is why agents should quote ids, not indices.
+    #[must_use]
+    pub const fn id(&self) -> EntryId {
+        self.id
+    }
+
+    /// The source: address or script.
+    #[must_use]
+    pub const fn source(&self) -> &Source {
+        &self.source
+    }
+
+    /// Mutate the source in place (re-point a file, edit a script before it is
+    /// spoken). Identity, cursor and play order are untouched.
+    pub fn source_mut(&mut self) -> &mut Source {
+        &mut self.source
+    }
+
+    /// The address to open, when the entry is directly playable. `None` while a
+    /// script is still waiting to be synthesized.
+    #[must_use]
+    pub fn uri(&self) -> Option<&str> {
+        self.source.uri()
+    }
+
+    /// The script to speak, for generated-speech entries.
+    #[must_use]
+    pub fn text(&self) -> Option<&str> {
+        self.source.as_text()
+    }
+
+    /// Whether this entry is generated speech rather than a stored recording.
+    #[must_use]
+    pub fn is_speech(&self) -> bool {
+        self.source.is_speech()
+    }
+
+    /// Whether this entry has to be synthesized before it can play.
+    #[must_use]
+    pub fn needs_synthesis(&self) -> bool {
+        self.source.needs_synthesis()
+    }
+
+    /// Record rendered audio for a script: the entry becomes playable while
+    /// keeping its id, index, metadata, play order, cursor *and* the script
+    /// itself (so it can be re-voiced later, and stays searchable by its words).
+    ///
+    /// Returns `false` when there was nothing to do, so a worker can tell real
+    /// work from a duplicate delivery.
+    pub fn resolved_at(&mut self, address: impl Into<String>) -> bool {
+        self.source.set_rendered(address)
+    }
+
+    /// The sidecar, if anything is known about this entry.
+    #[must_use]
+    pub fn meta(&self) -> Option<&Meta> {
+        self.meta.as_deref()
+    }
+
+    /// The sidecar, creating an empty one if needed.
+    pub fn meta_mut(&mut self) -> &mut Meta {
+        self.meta.get_or_insert_with(|| Box::new(Meta::default()))
+    }
+
+    /// Drop all metadata.
+    pub fn clear_meta(&mut self) {
+        self.meta = None;
+    }
+
+    /// A label to render and search by: the sidecar's, else a slug of the
+    /// address or the opening line of the script. Always borrows, never allocates.
+    #[must_use]
+    pub fn label(&self) -> &str {
+        if let Some(label) = self.meta.as_deref().and_then(|m| m.label())
+            && !label.trim().is_empty()
+        {
+            return label;
+        }
+        label_from_source(&self.source)
+    }
+
+    /// Set the label, leaving the rest of the sidecar alone.
+    pub fn set_label(&mut self, label: impl Into<String>) {
+        self.meta_mut().set_label(label);
+    }
+
+    /// Declared length, when known. Scripts are open-ended until synthesized,
+    /// which is the normal state, not an error.
+    #[must_use]
+    pub fn duration(&self) -> Option<Duration> {
+        self.meta.as_deref().and_then(|m| m.duration())
+    }
+
+    /// Set the length, leaving the rest of the sidecar alone.
+    pub fn set_duration(&mut self, duration: impl Into<Option<Duration>>) {
+        self.meta_mut().set_duration(duration);
+    }
+
+    /// Look up one metadata tag by key (exact match).
+    #[must_use]
+    pub fn tag(&self, key: &str) -> Option<&str> {
+        self.meta.as_deref().and_then(|m| m.tag(key))
+    }
+
+    /// Set one metadata tag, replacing any existing value for that key.
+    pub fn set_tag(&mut self, key: impl Into<String>, value: impl Into<String>) {
+        self.meta_mut().set_tag(key, value);
+    }
+
+    /// All metadata tags, in insertion order.
+    #[must_use]
+    pub fn tags(&self) -> &[StringTag] {
+        match self.meta.as_deref() {
+            Some(m) => m.tags(),
+            None => &[],
+        }
+    }
+
+    /// True when nothing is known about this entry beyond its source.
+    #[must_use]
+    pub fn is_untagged(&self) -> bool {
+        self.meta.is_none()
+    }
+
+    /// True when the entry has no known end: live stream, unprobed file, or a
+    /// script that has not been spoken yet.
+    #[must_use]
+    pub fn is_open_ended(&self) -> bool {
+        self.duration().is_none()
+    }
+
+    /// Right-aligned length column: `"mm:ss"`, `"h:mm:ss"` or `"--:--"`.
+    #[must_use]
+    pub fn duration_label(&self) -> String {
+        match self.duration() {
+            Some(d) => format_duration(d),
+            None => "--:--".into(),
+        }
+    }
+
+    /// Relevance of `query` (case-insensitive, trimmed) against this entry.
+    ///
+    /// Matches the label, then the payload (a script's text or the raw address),
+    /// then any metadata value — so tags the model knows nothing about are still
+    /// searchable, and "find the reminder about milk" works on unspoken text.
+    /// Lower is better; `None` means no match. See [`Playlist::search`].
+    #[must_use]
+    pub fn relevance(&self, query: &str) -> Option<u8> {
+        let lowered = query.trim().to_lowercase();
+        if lowered.is_empty() {
+            return Some(0);
+        }
+        let needle = lowered.as_str();
+        let label = self.label().to_lowercase();
+        if label == needle {
+            return Some(0);
+        }
+        if label.starts_with(needle) {
+            return Some(1);
+        }
+        if label.contains(needle) {
+            return Some(2);
+        }
+        if self.source.payload().to_lowercase().contains(needle) {
+            return Some(3);
+        }
+        let meta = self.meta.as_deref()?;
+        if meta.tags().iter().any(|t| t.value.to_lowercase() == needle) {
+            return Some(4);
+        }
+        if meta.tags().iter().any(|t| {
+            t.key.to_lowercase().contains(needle) || t.value.to_lowercase().contains(needle)
+        }) {
+            return Some(5);
+        }
+        None
+    }
+}
+
+impl fmt::Display for Entry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} [{}]", self.label(), self.duration_label())
+    }
+}
+
+/// One opaque metadata tag: the model never interprets keys, it only carries and
+/// matches them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StringTag {
+    /// Tag name, e.g. `artist` or `voice`.
+    pub key: String,
+    /// Tag value, e.g. `M83` or `nova`.
+    pub value: String,
+}
+
+/// Optional presentation sidecar hanging off an [`Entry`].
+///
+/// Only `label` and `duration` are interpreted by the model, for rendering and
+/// totals. `tags` is free-form key/value payload: the playlist stores it,
+/// searches it and hands it back to an agent, but has no idea what `artist` or
+/// `voice` means, and never will.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Meta {
+    label: Option<String>,
+    duration: Option<Duration>,
+    tags: Vec<StringTag>,
+}
+
+impl Meta {
+    /// An empty sidecar.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sidecar with just a label.
+    #[must_use]
+    pub fn labeled(label: impl Into<String>) -> Self {
+        Self {
+            label: Some(label.into()),
+            ..Self::default()
+        }
+    }
+
+    /// Sidecar with just a length.
+    #[must_use]
+    pub fn lasting(duration: impl Into<Duration>) -> Self {
+        Self {
+            duration: Some(duration.into()),
+            ..Self::default()
+        }
+    }
+
+    /// Set the label.
+    #[must_use]
+    pub fn with_label(mut self, label: impl Into<String>) -> Self {
+        self.label = Some(label.into());
+        self
+    }
+
+    /// Set the length (`None` = unknown or live).
     #[must_use]
     pub fn with_duration(mut self, duration: impl Into<Option<Duration>>) -> Self {
         self.duration = duration.into();
         self
     }
 
-    /// Replace the title in place — for tags that resolve after queueing.
-    pub fn set_title(&mut self, title: impl Into<String>) {
-        self.title = title.into();
-    }
-
-    /// Replace the artist in place.
-    pub fn set_artist(&mut self, artist: impl Into<String>) {
-        self.artist = Some(artist.into());
-    }
-
-    /// Replace the album in place.
-    pub fn set_album(&mut self, album: impl Into<String>) {
-        self.album = Some(album.into());
-    }
-
-    /// Replace the duration in place.
-    pub fn set_duration(&mut self, duration: impl Into<Option<Duration>>) {
-        self.duration = duration.into();
-    }
-
-    /// Stable identity of this entry.
+    /// Append a tag. Duplicate keys are kept as-is: the first wins for [`Meta::tag`].
     #[must_use]
-    pub const fn id(&self) -> TrackId {
-        self.id
+    pub fn with_tag(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.tags.push(StringTag {
+            key: key.into(),
+            value: value.into(),
+        });
+        self
     }
 
-    /// Where to read the audio from (file path, URL, device, …).
+    /// Tags from an iterator of pairs.
     #[must_use]
-    pub fn uri(&self) -> &str {
-        &self.uri
+    pub fn with_tags<K, V, I>(mut self, tags: I) -> Self
+    where
+        K: Into<String>,
+        V: Into<String>,
+        I: IntoIterator<Item = (K, V)>,
+    {
+        self.tags
+            .extend(tags.into_iter().map(|(key, value)| StringTag {
+                key: key.into(),
+                value: value.into(),
+            }));
+        self
     }
 
-    /// Display title (never empty; falls back to the URI stem).
+    /// The label, when known.
     #[must_use]
-    pub fn title(&self) -> &str {
-        &self.title
+    pub fn label(&self) -> Option<&str> {
+        self.label.as_deref()
     }
 
-    /// Artist, when known.
-    #[must_use]
-    pub fn artist(&self) -> Option<&str> {
-        self.artist.as_deref()
-    }
-
-    /// Album, when known.
-    #[must_use]
-    pub fn album(&self) -> Option<&str> {
-        self.album.as_deref()
-    }
-
-    /// Declared duration, when known.
+    /// The length, when known.
     #[must_use]
     pub const fn duration(&self) -> Option<Duration> {
         self.duration
     }
 
-    /// True when the track has no known end (live stream, unresolved probe).
+    /// Every tag, in insertion order.
     #[must_use]
-    pub const fn is_open_ended(&self) -> bool {
-        self.duration.is_none()
+    pub fn tags(&self) -> &[StringTag] {
+        &self.tags
     }
 
-    /// `"artist — title"`, or just the title when the artist is unknown.
+    /// Value of the first tag with this key.
     #[must_use]
-    pub fn display_line(&self) -> String {
-        match self.artist() {
-            Some(artist) => format!("{artist} \u{2014} {}", self.title),
-            None => self.title.clone(),
+    pub fn tag(&self, key: &str) -> Option<&str> {
+        self.tags
+            .iter()
+            .find(|t| t.key == key)
+            .map(|t| t.value.as_str())
+    }
+
+    /// Replace the label.
+    pub fn set_label(&mut self, label: impl Into<String>) {
+        self.label = Some(label.into());
+    }
+
+    /// Replace the length.
+    pub fn set_duration(&mut self, duration: impl Into<Option<Duration>>) {
+        self.duration = duration.into();
+    }
+
+    /// Set a tag, replacing any existing value for that key.
+    pub fn set_tag(&mut self, key: impl Into<String>, value: impl Into<String>) {
+        let key = key.into();
+        let value = value.into();
+        match self.tags.iter_mut().find(|t| t.key == key) {
+            Some(existing) => existing.value = value,
+            None => self.tags.push(StringTag { key, value }),
         }
     }
 
-    /// Right-aligned length column: `"mm:ss"`, `"h:mm:ss"` or `"--:--"`.
-    #[must_use]
-    pub fn duration_label(&self) -> String {
-        match self.duration {
-            Some(d) => format_duration(d),
-            None => "--:--".into(),
-        }
+    /// Remove a tag, returning its value.
+    pub fn remove_tag(&mut self, key: &str) -> Option<String> {
+        let at = self.tags.iter().position(|t| t.key == key)?;
+        Some(self.tags.remove(at).value)
     }
 
-    /// Relevance of `needle` against this title/artist/album/uri, case-insensitive.
-    ///
-    /// Lower is better; `None` means no match. Used by [`Playlist::search`].
+    /// How many facts are recorded: label + duration + tags.
     #[must_use]
-    pub fn relevance(&self, needle: &str) -> Option<u8> {
-        let lowered = needle.trim().to_lowercase();
-        let needle = lowered.as_str();
-        if needle.is_empty() {
-            return Some(0);
-        }
-        let title = self.title.to_lowercase();
-        if title == needle {
-            return Some(0);
-        }
-        if title.starts_with(needle) {
-            return Some(1);
-        }
-        if title.contains(needle) {
-            return Some(2);
-        }
-        if self.artist().is_some_and(|a| a.to_lowercase() == needle) {
-            return Some(3);
-        }
-        if self
-            .artist()
-            .is_some_and(|a| a.to_lowercase().contains(needle))
-            || self
-                .album()
-                .is_some_and(|al| al.to_lowercase().contains(needle))
-        {
-            return Some(4);
-        }
-        if self.uri.to_lowercase().contains(needle) {
-            return Some(5);
-        }
-        None
+    pub fn len(&self) -> usize {
+        usize::from(self.label.is_some()) + usize::from(self.duration.is_some()) + self.tags.len()
     }
+
+    /// Whether the sidecar holds nothing at all.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.label.is_none() && self.duration.is_none() && self.tags.is_empty()
+    }
+
+    /// Tag keys that are present, in insertion order (de-duplicated).
+    #[must_use]
+    pub fn keys(&self) -> Vec<&str> {
+        let mut out: Vec<&str> = Vec::with_capacity(self.tags.len());
+        for t in &self.tags {
+            if !out.contains(&t.key.as_str()) {
+                out.push(&t.key);
+            }
+        }
+        out
+    }
+}
+
+impl fmt::Display for Meta {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut pieces: Vec<String> = self
+            .tags
+            .iter()
+            .map(|t| format!("{}={}", t.key, t.value))
+            .collect();
+        if let Some(label) = self.label() {
+            pieces.insert(0, format!("label={label}"));
+        }
+        if let Some(d) = self.duration {
+            pieces.insert(pieces.len().min(1), format!("dur={}", format_duration(d)));
+        }
+        if pieces.is_empty() {
+            f.write_str("-")
+        } else {
+            f.write_str(&pieces.join(" "))
+        }
+    }
+}
+
+/// Fallback label for a source: a last-segment slug of an address, or the
+/// opening line of a script. Never allocates.
+fn label_from_source(source: &Source) -> &str {
+    match source {
+        Source::Address(address) => label_from_address(address),
+        Source::Speech { text, .. } => {
+            let first = text
+                .lines()
+                .find(|line| !line.trim().is_empty())
+                .unwrap_or(text.as_str())
+                .trim();
+            if first.is_empty() {
+                "untitled"
+            } else {
+                truncate(first, 48)
+            }
+        }
+    }
+}
+
+/// Slug of an address: last path segment, minus query/fragment and extension.
+fn label_from_address(address: &str) -> &str {
+    let path = address.split(['?', '#']).next().unwrap_or(address);
+    let path = path.trim_end_matches(['/', '\\']);
+    let last = path.rsplit(['/', '\\']).next().unwrap_or("");
+    let stem = match last.rfind('.') {
+        None | Some(0) => last,
+        Some(dot) => &last[..dot],
+    };
+    if !stem.trim().is_empty() {
+        return stem;
+    }
+    // Nothing to slice off the address ("/", "::", ""): show the raw string when
+    // it says anything at all, otherwise a placeholder.
+    if address.chars().any(char::is_alphanumeric) {
+        address
+    } else {
+        "untitled"
+    }
+}
+
+/// Cut at most `max` bytes, on a char boundary, trailing whitespace trimmed.
+fn truncate(text: &str, max: usize) -> &str {
+    if text.len() <= max {
+        return text;
+    }
+    let mut end = max;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].trim_end()
 }
 
 /// Format a duration as `mm:ss`, or `h:mm:ss` past an hour.
@@ -322,27 +792,6 @@ pub fn format_duration(duration: Duration) -> String {
         format!("{h}:{m:02}:{s:02}")
     } else {
         format!("{m:02}:{s:02}")
-    }
-}
-
-fn derive_title(uri: &str) -> String {
-    let path = uri.split(['?', '#']).next().unwrap_or(uri);
-    let path = path.trim_end_matches(['/', '\\']);
-    let last = path.rsplit(['/', '\\']).next().unwrap_or("");
-    let stem = match last.rfind('.') {
-        None | Some(0) => last,
-        Some(dot) => &last[..dot],
-    };
-    if stem.trim().is_empty() {
-        "unknown".to_owned()
-    } else {
-        stem.to_owned()
-    }
-}
-
-impl fmt::Display for Track {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} [{}]", self.display_line(), self.duration_label())
     }
 }
 
@@ -439,7 +888,7 @@ impl fmt::Display for PlayMode {
 /// Outcome of a navigation step.
 ///
 /// The distinction matters to the player engine: `Moved` means "load and play",
-/// `Same` means "restart this track", `Wrapped` means "load, and it's a new pass",
+/// `Same` means "restart this entry", `Wrapped` means "load, and it's a new pass",
 /// `Ended` means "idle, wait for the user or the agent".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Nav {
@@ -497,7 +946,7 @@ impl Nav {
         matches!(self, Self::Ended)
     }
 
-    /// Whether playback continues on a track.
+    /// Whether playback continues on a entry.
     #[must_use]
     pub const fn played(self) -> bool {
         !self.ended()
@@ -508,12 +957,12 @@ impl fmt::Display for Nav {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Moved { position, index } => {
-                write!(f, "play track {index} at position {position}")
+                write!(f, "play entry {index} at position {position}")
             }
             Self::Wrapped { position, index } => {
-                write!(f, "wrap to track {index} at position {position}")
+                write!(f, "wrap to entry {index} at position {position}")
             }
-            Self::Same { index, .. } => write!(f, "requeue track {index}"),
+            Self::Same { index, .. } => write!(f, "requeue entry {index}"),
             Self::Ended => write!(f, "end of playlist"),
         }
     }
@@ -578,12 +1027,12 @@ fn system_seed() -> u64 {
 // Playlist
 // ---------------------------------------------------------------------------
 
-/// An ordered set of tracks with a playback cursor.
+/// An ordered set of entries with a playback cursor.
 #[derive(Debug, Clone)]
 pub struct Playlist {
     name: String,
-    tracks: Vec<Track>,
-    /// Permutation of `0..tracks.len()`: the play order.
+    entries: Vec<Entry>,
+    /// Permutation of `0..entries.len()`: the play order.
     order: Vec<usize>,
     /// Position in `order` of the current entry; `None` until something plays.
     cursor: Option<usize>,
@@ -613,7 +1062,7 @@ impl Playlist {
         let seed = system_seed();
         Self {
             name: name.into(),
-            tracks: Vec::new(),
+            entries: Vec::new(),
             order: Vec::new(),
             cursor: None,
             history: VecDeque::new(),
@@ -623,10 +1072,10 @@ impl Playlist {
         }
     }
 
-    /// A playlist in user order from any iterator of tracks.
+    /// A playlist in user order from any iterator of entries.
     #[must_use]
-    pub fn from_tracks(tracks: impl IntoIterator<Item = Track>) -> Self {
-        tracks.into_iter().collect()
+    pub fn from_entries(entries: impl IntoIterator<Item = Entry>) -> Self {
+        entries.into_iter().collect()
     }
 
     /// A playlist with a name and an explicit shuffle seed, so play order is
@@ -689,10 +1138,10 @@ impl Playlist {
         self.mode.shuffle
     }
 
-    /// Turn shuffle on or off, keeping the current track playing.
+    /// Turn shuffle on or off, keeping the current entry playing.
     ///
     /// Going *on*: the current entry is pinned to its current play position and
-    /// the rest is shuffled around it, so the track never restarts or skips.
+    /// the rest is shuffled around it, so the entry never restarts or skips.
     /// Going *off*: the play order collapses back to user order and the cursor
     /// lands on the current entry's own index. Returns the previous value.
     ///
@@ -721,7 +1170,7 @@ impl Playlist {
         self.seed
     }
 
-    /// Fix the shuffle seed and reshuffle (current track stays put).
+    /// Fix the shuffle seed and reshuffle (current entry stays put).
     pub fn set_shuffle_seed(&mut self, seed: u64) {
         self.seed = seed;
         self.rng = Rng::new(seed);
@@ -740,24 +1189,24 @@ impl Playlist {
     /// Number of entries.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.tracks.len()
+        self.entries.len()
     }
 
     /// Whether there is nothing to play.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.tracks.is_empty()
+        self.entries.is_empty()
     }
 
     /// Entries in user order.
     #[must_use]
-    pub fn tracks(&self) -> &[Track] {
-        &self.tracks
+    pub fn entries(&self) -> &[Entry] {
+        &self.entries
     }
 
     /// Entries in user order, mutable (e.g. to fill in tags after a probe).
-    pub fn tracks_mut(&mut self) -> &mut [Track] {
-        &mut self.tracks
+    pub fn entries_mut(&mut self) -> &mut [Entry] {
+        &mut self.entries
     }
 
     /// The play order: a permutation of user-order indices.
@@ -770,30 +1219,30 @@ impl Playlist {
     }
 
     /// Iterate entries in user order.
-    pub fn iter(&self) -> impl Iterator<Item = &Track> {
-        self.tracks.iter()
+    pub fn iter(&self) -> impl Iterator<Item = &Entry> {
+        self.entries.iter()
     }
 
     /// Iterate entries in play order.
-    pub fn iter_playback(&self) -> impl Iterator<Item = &Track> {
-        self.order.iter().map(move |&i| &self.tracks[i])
+    pub fn iter_playback(&self) -> impl Iterator<Item = &Entry> {
+        self.order.iter().map(move |&i| &self.entries[i])
     }
 
     /// Entry at a user-order index.
     #[must_use]
-    pub fn get(&self, index: usize) -> Option<&Track> {
-        self.tracks.get(index)
+    pub fn get(&self, index: usize) -> Option<&Entry> {
+        self.entries.get(index)
     }
 
     /// Mutable entry at a user-order index.
-    pub fn get_mut(&mut self, index: usize) -> Option<&mut Track> {
-        self.tracks.get_mut(index)
+    pub fn get_mut(&mut self, index: usize) -> Option<&mut Entry> {
+        self.entries.get_mut(index)
     }
 
     /// User-order index of an id, if still present.
     #[must_use]
-    pub fn index_of(&self, id: TrackId) -> Option<usize> {
-        self.tracks.iter().position(|t| t.id() == id)
+    pub fn index_of(&self, id: EntryId) -> Option<usize> {
+        self.entries.iter().position(|t| t.id() == id)
     }
 
     /// Play position of a user-order index.
@@ -822,8 +1271,8 @@ impl Playlist {
 
     /// The entry that is current, if playback has started.
     #[must_use]
-    pub fn current(&self) -> Option<&Track> {
-        self.current_index().map(|i| &self.tracks[i])
+    pub fn current(&self) -> Option<&Entry> {
+        self.current_index().map(|i| &self.entries[i])
     }
 
     /// Whether the cursor sits on the last entry of the play order.
@@ -848,15 +1297,15 @@ impl Playlist {
 
     /// The entry [`Playlist::advance`] would land on, honouring the mode.
     #[must_use]
-    pub fn peek_next(&self) -> Option<&Track> {
+    pub fn peek_next(&self) -> Option<&Entry> {
         if self.order.is_empty() {
             return None;
         }
         let Some(pos) = self.cursor else {
-            return Some(&self.tracks[self.order[0]]);
+            return Some(&self.entries[self.order[0]]);
         };
         if self.mode.repeat == Repeat::One {
-            return Some(&self.tracks[self.order[pos]]);
+            return Some(&self.entries[self.order[pos]]);
         }
         let next = if pos + 1 < self.order.len() {
             pos + 1
@@ -865,7 +1314,7 @@ impl Playlist {
         } else {
             return None;
         };
-        Some(&self.tracks[self.order[next]])
+        Some(&self.entries[self.order[next]])
     }
 
     /// Sum of known durations, and how many entries have none.
@@ -873,7 +1322,7 @@ impl Playlist {
     pub fn duration_known(&self) -> (Duration, usize) {
         let mut total = Duration::ZERO;
         let mut unknown = 0;
-        for t in &self.tracks {
+        for t in &self.entries {
             match t.duration() {
                 Some(d) => total += d,
                 None => unknown += 1,
@@ -886,17 +1335,17 @@ impl Playlist {
     #[must_use]
     pub fn duration_total(&self) -> Option<Duration> {
         let (total, unknown) = self.duration_known();
-        (unknown == 0 && !self.tracks.is_empty()).then_some(total)
+        (unknown == 0 && !self.entries.is_empty()).then_some(total)
     }
 
     /// Indices of entries matching `query` (case-insensitive, trimmed), best
-    /// match first; see [`Track::relevance`] for the ranking.
+    /// match first; see [`Entry::relevance`] for the ranking.
     ///
     /// An empty query returns every index, i.e. the whole list.
     #[must_use]
     pub fn search(&self, query: &str) -> Vec<usize> {
         let mut hits: Vec<(u8, usize)> = self
-            .tracks
+            .entries
             .iter()
             .enumerate()
             .filter_map(|(i, t)| t.relevance(query).map(|rank| (rank, i)))
@@ -909,23 +1358,60 @@ impl Playlist {
     #[must_use]
     pub fn find<P>(&self, predicate: P) -> Option<usize>
     where
-        P: FnMut(&Track) -> bool,
+        P: FnMut(&Entry) -> bool,
     {
-        self.tracks.iter().position(predicate)
+        self.entries.iter().position(predicate)
     }
 
-    /// Distinct artist labels, in first-seen order.
+    /// Distribution of a metadata key across the entries: value -> count, in
+    /// first-seen order, skipping entries that lack the key.
+    ///
+    /// The model has no idea what `artist` or `lossless` means; it only groups
+    /// the strings it was handed. Useful for an agent to summarise a list
+    /// ("4 of 10 tagged `lossless`") without a schema.
     #[must_use]
-    pub fn artists(&self) -> Vec<&str> {
-        let mut out: Vec<&str> = Vec::new();
-        for t in &self.tracks {
-            if let Some(a) = t.artist()
-                && !out.contains(&a)
-            {
-                out.push(a);
+    pub fn facet(&self, key: &str) -> Vec<(String, usize)> {
+        let mut out: Vec<(String, usize)> = Vec::new();
+        for t in &self.entries {
+            let Some(value) = t.tag(key) else { continue };
+            match out.iter_mut().find(|(v, _)| v == value) {
+                Some((_, count)) => *count += 1,
+                None => out.push((value.to_owned(), 1)),
             }
         }
         out
+    }
+
+    /// Indices of entries whose sound still has to be synthesized, in user order.
+    ///
+    /// This is the queue a TTS worker drains. Nothing here blocks playback — an
+    /// entry that is still text simply has no address to open until
+    /// [`Entry::resolved_at`] lands.
+    #[must_use]
+    pub fn needs_synthesis(&self) -> Vec<usize> {
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.needs_synthesis())
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Whether any entry is still waiting on synthesis.
+    #[must_use]
+    pub fn has_pending(&self) -> bool {
+        self.entries.iter().any(Entry::needs_synthesis)
+    }
+
+    /// Indices of entries carrying no metadata at all (still perfectly playable).
+    #[must_use]
+    pub fn untagged(&self) -> Vec<usize> {
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.is_untagged())
+            .map(|(i, _)| i)
+            .collect()
     }
 
     // -- editing ------------------------------------------------------------
@@ -934,18 +1420,18 @@ impl Playlist {
     ///
     /// New entries join at the *end of the play order* — even under shuffle — so
     /// adding something never changes what plays next.
-    pub fn push(&mut self, track: Track) -> usize {
-        let index = self.tracks.len();
-        self.tracks.push(track);
+    pub fn push(&mut self, entry: Entry) -> usize {
+        let index = self.entries.len();
+        self.entries.push(entry);
         self.order.push(index);
         self.debug_check();
         index
     }
 
     /// Append many entries. Returns how many were added.
-    pub fn append_tracks(&mut self, tracks: impl IntoIterator<Item = Track>) -> usize {
+    pub fn append_entries(&mut self, entries: impl IntoIterator<Item = Entry>) -> usize {
         let mut n = 0;
-        for t in tracks {
+        for t in entries {
             self.push(t);
             n += 1;
         }
@@ -958,22 +1444,22 @@ impl Playlist {
         if other.is_empty() {
             return None;
         }
-        let base = self.tracks.len();
+        let base = self.entries.len();
         let moved_order = mem::take(&mut other.order);
         other.cursor = None;
         other.history.clear();
-        self.tracks.extend(mem::take(&mut other.tracks));
+        self.entries.extend(mem::take(&mut other.entries));
         self.order.extend(moved_order.iter().map(|&i| base + i));
         self.debug_check();
         Some(base)
     }
 
     /// Insert at a user-order index; `at == len()` appends.
-    pub fn insert(&mut self, at: usize, track: Track) -> Result<usize> {
-        if at > self.tracks.len() {
-            return Err(Error::out_of_bounds(at, self.tracks.len()));
+    pub fn insert(&mut self, at: usize, entry: Entry) -> Result<usize> {
+        if at > self.entries.len() {
+            return Err(Error::out_of_bounds(at, self.entries.len()));
         }
-        self.tracks.insert(at, track);
+        self.entries.insert(at, entry);
         for slot in &mut self.order {
             if *slot >= at {
                 *slot += 1;
@@ -986,16 +1472,16 @@ impl Playlist {
 
     /// Remove the entry at a user-order index.
     ///
-    /// The cursor follows the track it was on; if that track is the one removed,
+    /// The cursor follows the entry it was on; if that entry is the one removed,
     /// the cursor stays on the same *position*, which now holds its successor —
     /// the behaviour of every real player's "skip and delete".
-    pub fn remove(&mut self, index: usize) -> Option<Track> {
-        if index >= self.tracks.len() {
+    pub fn remove(&mut self, index: usize) -> Option<Entry> {
+        if index >= self.entries.len() {
             return None;
         }
-        let removed = self.tracks.remove(index);
-        let dropped = mem::replace(&mut self.order, Vec::with_capacity(self.tracks.len()));
-        let mut next = Vec::with_capacity(self.tracks.len());
+        let removed = self.entries.remove(index);
+        let dropped = mem::replace(&mut self.order, Vec::with_capacity(self.entries.len()));
+        let mut next = Vec::with_capacity(self.entries.len());
         let mut dropped_position: Option<usize> = None;
         for old in dropped {
             if old == index {
@@ -1012,15 +1498,15 @@ impl Playlist {
         Some(removed)
     }
 
-    /// Remove an entry by id. Returns its old index alongside the track.
-    pub fn remove_id(&mut self, id: TrackId) -> Option<(usize, Track)> {
+    /// Remove an entry by id. Returns its old index alongside the entry.
+    pub fn remove_id(&mut self, id: EntryId) -> Option<(usize, Entry)> {
         let index = self.index_of(id)?;
         self.remove(index).map(|t| (index, t))
     }
 
     /// Drop every entry, keeping the name, mode and seed.
     pub fn clear(&mut self) {
-        self.tracks.clear();
+        self.entries.clear();
         self.order.clear();
         self.cursor = None;
         self.history.clear();
@@ -1030,40 +1516,40 @@ impl Playlist {
     /// Retain entries matching a predicate. Returns how many were dropped.
     pub fn retain<P>(&mut self, mut keep: P) -> usize
     where
-        P: FnMut(&Track) -> bool,
+        P: FnMut(&Entry) -> bool,
     {
         let layout: Vec<usize> = self
-            .tracks
+            .entries
             .iter()
             .enumerate()
             .filter(|(_, t)| keep(t))
             .map(|(i, _)| i)
             .collect();
-        let before = self.tracks.len();
+        let before = self.entries.len();
         if layout.len() == before {
             return 0;
         }
         let current = self.current_index();
         let anchor = self.cursor;
         self.relayout(layout);
-        // The anchored position may refer to a track that no longer exists.
+        // The anchored position may refer to a entry that no longer exists.
         if self.current_index() != current {
             self.cursor = anchor.filter(|&p| p < self.order.len());
         }
         self.debug_check();
-        before - self.tracks.len()
+        before - self.entries.len()
     }
 
     /// Swap two entries in user order.
     pub fn swap(&mut self, a: usize, b: usize) -> Result<()> {
-        let len = self.tracks.len();
+        let len = self.entries.len();
         if a >= len || b >= len {
             return Err(Error::out_of_bounds(if a >= len { a } else { b }, len));
         }
         if a == b {
             return Ok(());
         }
-        self.tracks.swap(a, b);
+        self.entries.swap(a, b);
         for slot in &mut self.order {
             *slot = match *slot {
                 x if x == a => b,
@@ -1076,8 +1562,8 @@ impl Playlist {
     }
 
     /// Move an entry to a new user-order index.
-    pub fn move_track(&mut self, from: usize, to: usize) -> Result<()> {
-        let len = self.tracks.len();
+    pub fn move_entry(&mut self, from: usize, to: usize) -> Result<()> {
+        let len = self.entries.len();
         if from >= len || to >= len {
             return Err(Error::out_of_bounds(
                 if from >= len { from } else { to },
@@ -1098,9 +1584,9 @@ impl Playlist {
     /// Replace the user order with `layout` (a permutation of `0..len`).
     ///
     /// This is the "apply the agent's reordering" entry point; play order and
-    /// cursor are carried along, so the current track keeps playing.
+    /// cursor are carried along, so the current entry keeps playing.
     pub fn reorder(&mut self, layout: &[usize]) -> Result<()> {
-        let len = self.tracks.len();
+        let len = self.entries.len();
         if layout.len() != len {
             return Err(Error::BadLayout { len });
         }
@@ -1115,13 +1601,13 @@ impl Playlist {
         Ok(())
     }
 
-    /// Sort entries by a comparator, keeping the current track playing.
+    /// Sort entries by a comparator, keeping the current entry playing.
     pub fn sort_by<F>(&mut self, mut compare: F)
     where
-        F: FnMut(&Track, &Track) -> std::cmp::Ordering,
+        F: FnMut(&Entry, &Entry) -> std::cmp::Ordering,
     {
-        let mut layout: Vec<usize> = (0..self.tracks.len()).collect();
-        layout.sort_by(|&a, &b| compare(&self.tracks[a], &self.tracks[b]));
+        let mut layout: Vec<usize> = (0..self.entries.len()).collect();
+        layout.sort_by(|&a, &b| compare(&self.entries[a], &self.entries[b]));
         self.relayout(layout);
         self.debug_check();
     }
@@ -1130,15 +1616,15 @@ impl Playlist {
 
     /// Jump to an entry by user-order index.
     pub fn jump_to(&mut self, index: usize) -> Result<Nav> {
-        if index >= self.tracks.len() {
-            return Err(Error::out_of_bounds(index, self.tracks.len()));
+        if index >= self.entries.len() {
+            return Err(Error::out_of_bounds(index, self.entries.len()));
         }
         let position = self.position_of(index).unwrap_or(0);
         Ok(self.set_cursor(position, true))
     }
 
     /// Jump to an entry by id.
-    pub fn jump_to_id(&mut self, id: TrackId) -> Result<Nav> {
+    pub fn jump_to_id(&mut self, id: EntryId) -> Result<Nav> {
         let index = self.index_of(id).ok_or(Error::NotFound { id })?;
         self.jump_to(index)
     }
@@ -1165,7 +1651,7 @@ impl Playlist {
         Some(self.set_cursor(last, true))
     }
 
-    /// Step forward, as a finished track would.
+    /// Step forward, as a finished entry would.
     ///
     /// From a stopped cursor this starts at the beginning. Under
     /// [`Repeat::One`] it requeues the current entry; at the end of the play
@@ -1320,7 +1806,7 @@ impl Playlist {
     }
 
     fn build_order(&mut self) -> Vec<usize> {
-        let mut order: Vec<usize> = (0..self.tracks.len()).collect();
+        let mut order: Vec<usize> = (0..self.entries.len()).collect();
         if self.mode.shuffle {
             self.rng.shuffle(&mut order);
         }
@@ -1360,23 +1846,23 @@ impl Playlist {
         self.debug_check();
     }
 
-    /// Rebuild `tracks` so that new slot `j` holds old index `layout[j]`,
+    /// Rebuild `entries` so that new slot `j` holds old index `layout[j]`,
     /// remapping play order, cursor and history along the way.
     fn relayout(&mut self, layout: Vec<usize>) {
-        let old_len = self.tracks.len();
-        let mut slots: Vec<Option<Track>> =
-            mem::take(&mut self.tracks).into_iter().map(Some).collect();
+        let old_len = self.entries.len();
+        let mut slots: Vec<Option<Entry>> =
+            mem::take(&mut self.entries).into_iter().map(Some).collect();
         let mut old_to_new = vec![usize::MAX; old_len];
-        let mut tracks = Vec::with_capacity(layout.len());
+        let mut entries = Vec::with_capacity(layout.len());
         for (new, old) in layout.into_iter().enumerate() {
             old_to_new[old] = new;
-            tracks.push(
+            entries.push(
                 slots[old]
                     .take()
                     .unwrap_or_else(|| panic!("playlist layout reused index {old}")),
             );
         }
-        self.tracks = tracks;
+        self.entries = entries;
         self.order = self
             .order
             .iter()
@@ -1401,7 +1887,7 @@ impl Playlist {
         }
         assert_eq!(
             self.order.len(),
-            self.tracks.len(),
+            self.entries.len(),
             "play order must cover every entry"
         );
         assert!(
@@ -1414,7 +1900,7 @@ impl Playlist {
             self.history.iter().all(|&p| p < self.order.len()),
             "history holds a stale position"
         );
-        let mut seen = vec![false; self.tracks.len()];
+        let mut seen = vec![false; self.entries.len()];
         for &i in &self.order {
             assert!(i < seen.len(), "play order index {i} out of bounds");
             assert!(!seen[i], "play order repeats index {i}");
@@ -1423,20 +1909,20 @@ impl Playlist {
     }
 }
 
-impl From<Vec<Track>> for Playlist {
-    fn from(tracks: Vec<Track>) -> Self {
-        Self::from_tracks(tracks)
+impl From<Vec<Entry>> for Playlist {
+    fn from(entries: Vec<Entry>) -> Self {
+        Self::from_entries(entries)
     }
 }
 
-impl FromIterator<Track> for Playlist {
-    fn from_iter<I: IntoIterator<Item = Track>>(iter: I) -> Self {
-        let tracks: Vec<Track> = iter.into_iter().collect();
-        let order = (0..tracks.len()).collect();
+impl FromIterator<Entry> for Playlist {
+    fn from_iter<I: IntoIterator<Item = Entry>>(iter: I) -> Self {
+        let entries: Vec<Entry> = iter.into_iter().collect();
+        let order = (0..entries.len()).collect();
         let seed = system_seed();
         Self {
             name: "playlist".into(),
-            tracks,
+            entries,
             order,
             cursor: None,
             history: VecDeque::new(),
@@ -1447,29 +1933,29 @@ impl FromIterator<Track> for Playlist {
     }
 }
 
-impl Extend<Track> for Playlist {
-    fn extend<I: IntoIterator<Item = Track>>(&mut self, iter: I) {
-        for track in iter {
-            self.push(track);
+impl Extend<Entry> for Playlist {
+    fn extend<I: IntoIterator<Item = Entry>>(&mut self, iter: I) {
+        for entry in iter {
+            self.push(entry);
         }
     }
 }
 
 impl IntoIterator for Playlist {
-    type Item = Track;
-    type IntoIter = std::vec::IntoIter<Track>;
+    type Item = Entry;
+    type IntoIter = std::vec::IntoIter<Entry>;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.tracks.into_iter()
+        self.entries.into_iter()
     }
 }
 
 impl<'a> IntoIterator for &'a Playlist {
-    type Item = &'a Track;
-    type IntoIter = std::slice::Iter<'a, Track>;
+    type Item = &'a Entry;
+    type IntoIter = std::slice::Iter<'a, Entry>;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.tracks.iter()
+        self.entries.iter()
     }
 }
 
@@ -1483,38 +1969,38 @@ impl fmt::Display for Playlist {
             f,
             "{} \u{b7} {} \u{b7} {}",
             self.name,
-            if self.tracks.len() == 1 {
-                "1 track".into()
+            if self.entries.len() == 1 {
+                "1 entry".into()
             } else {
-                format!("{} tracks", self.tracks.len())
+                format!("{} entries", self.entries.len())
             },
             self.mode.label()
         )?;
-        if !self.tracks.is_empty() {
+        if !self.entries.is_empty() {
             f.write_str(&format!(" \u{b7} {}", format_duration(known)))?;
             if unknown > 0 {
                 write!(f, " +{unknown}?")?;
             }
         }
         writeln!(f)?;
-        if self.tracks.is_empty() {
+        if self.entries.is_empty() {
             return writeln!(f, "(empty)");
         }
 
         let rows: Vec<(usize, String, String, Option<usize>)> = self
-            .tracks
+            .entries
             .iter()
             .enumerate()
-            .map(|(index, track)| {
+            .map(|(index, entry)| {
                 (
                     index,
-                    track.display_line(),
-                    track.duration_label(),
+                    entry.label().to_owned(),
+                    entry.duration_label(),
                     self.position_of(index),
                 )
             })
             .collect();
-        let index_width = self.tracks.len().to_string().len();
+        let index_width = self.entries.len().to_string().len();
         let label_width = rows
             .iter()
             .map(|(_, l, _, _)| l.chars().count())
@@ -1559,18 +2045,18 @@ impl fmt::Display for Playlist {
 mod tests {
     use super::*;
 
-    fn track(title: &str, mins: u64) -> Track {
-        Track::new(format!("music/{title}.flac"))
-            .with_title(title)
+    fn entry(label: &str, mins: u64) -> Entry {
+        Entry::new(format!("music/{label}.flac"))
+            .with_label(label)
             .with_duration(Duration::from_secs(mins * 60))
     }
 
     fn playlist(n: usize) -> Playlist {
-        Playlist::from_tracks((0..n).map(|i| track(&format!("t{i}"), (i as u64) + 1)))
+        Playlist::from_entries((0..n).map(|i| entry(&format!("t{i}"), (i as u64) + 1)))
     }
 
-    fn ids(pl: &Playlist) -> Vec<TrackId> {
-        pl.tracks().iter().map(|t| t.id()).collect()
+    fn ids(pl: &Playlist) -> Vec<EntryId> {
+        pl.entries().iter().map(|t| t.id()).collect()
     }
 
     #[test]
@@ -1579,7 +2065,7 @@ mod tests {
         assert!(pl.is_empty());
         assert_eq!(pl.current(), None);
         for i in 0..3 {
-            pl.push(track(&format!("t{i}"), i as u64));
+            pl.push(entry(&format!("t{i}"), i as u64));
         }
         assert_eq!(pl.len(), 3);
         assert_eq!(pl.play_order(), &[0, 1, 2]);
@@ -1587,12 +2073,30 @@ mod tests {
     }
 
     #[test]
-    fn uri_fallback_title() {
-        assert_eq!(Track::new("a/b/song.mp3").title(), "song");
-        assert_eq!(Track::new("https://x/y/z.wav?q=1").title(), "z");
-        assert_eq!(Track::new("https://host/radio/").title(), "radio");
-        assert_eq!(Track::new("").title(), "unknown");
-        assert_eq!(Track::new(".hidden").title(), ".hidden");
+    fn label_falls_back_to_a_uri_slug() {
+        assert_eq!(Entry::new("a/b/song.mp3").label(), "song");
+        assert_eq!(Entry::new("https://x/y/z.wav?q=1").label(), "z");
+        assert_eq!(Entry::new("https://host/radio/").label(), "radio");
+        assert_eq!(Entry::new(".hidden").label(), ".hidden");
+        assert_eq!(Entry::new("/").label(), "untitled");
+        assert_eq!(Entry::new("").label(), "untitled");
+
+        // Bare addresses are first-class citizens, not half-made entries.
+        let bare = Entry::new("https://host/radio/night-waves");
+        assert!(bare.is_untagged());
+        assert_eq!(bare.meta(), None);
+        assert_eq!(bare.label(), "night-waves");
+        assert!(bare.is_open_ended());
+        let labelled = bare.with_label("Night Waves").with_tag("artist", "Someone");
+        assert_eq!(labelled.label(), "Night Waves");
+        assert_eq!(labelled.tag("artist"), Some("Someone"));
+        assert_eq!(labelled.tags().len(), 1);
+        assert_eq!(
+            Entry::new("a/b/song.mp3").with_label("  ").label(),
+            "song",
+            "a blank label doesn't hide the slug"
+        );
+        assert_eq!(Meta::labeled("").len(), 1);
     }
 
     #[test]
@@ -1627,7 +2131,7 @@ mod tests {
         let mut pl = playlist(1);
         pl.advance();
         assert_eq!(pl.advance(), Nav::Ended);
-        pl.push(track("late", 3));
+        pl.push(entry("late", 3));
         assert!(matches!(
             pl.advance(),
             Nav::Moved {
@@ -1659,7 +2163,7 @@ mod tests {
                 index: 0
             }
         ));
-        assert_eq!(pl.peek_next().map(|t| t.title()), Some("t0"));
+        assert_eq!(pl.peek_next().map(|t| t.label()), Some("t0"));
         pl.set_repeat(Repeat::Off);
         assert!(matches!(
             pl.advance(),
@@ -1673,11 +2177,11 @@ mod tests {
     #[test]
     fn peek_next_respects_mode() {
         let mut pl = playlist(2);
-        assert_eq!(pl.peek_next().map(|t| t.title()), Some("t0"));
+        assert_eq!(pl.peek_next().map(|t| t.label()), Some("t0"));
         pl.jump_to(1).unwrap();
         assert_eq!(pl.peek_next(), None);
         pl.set_repeat(Repeat::All);
-        assert_eq!(pl.peek_next().map(|t| t.title()), Some("t0"));
+        assert_eq!(pl.peek_next().map(|t| t.label()), Some("t0"));
     }
 
     #[test]
@@ -1724,8 +2228,8 @@ mod tests {
         let mut a = Playlist::seeded("a", 7);
         let mut b = Playlist::seeded("b", 7);
         for i in 0..12 {
-            a.push(track(&format!("t{i}"), i as u64));
-            b.push(track(&format!("t{i}"), i as u64));
+            a.push(entry(&format!("t{i}"), i as u64));
+            b.push(entry(&format!("t{i}"), i as u64));
         }
         a.set_shuffle(true);
         b.set_shuffle(true);
@@ -1762,7 +2266,7 @@ mod tests {
         assert_eq!(pl.current_index(), Some(3));
         assert_eq!(pl.current_position(), position);
         pl.set_shuffle(false);
-        assert_eq!(pl.current_index(), Some(3), "the same track keeps playing");
+        assert_eq!(pl.current_index(), Some(3), "the same entry keeps playing");
         assert_eq!(
             pl.current_position(),
             Some(3),
@@ -1785,13 +2289,13 @@ mod tests {
         pl.advance();
         pl.advance();
         assert_eq!(pl.current_index(), Some(1));
-        pl.insert(0, track("early", 1)).unwrap();
+        pl.insert(0, entry("early", 1)).unwrap();
         assert_eq!(pl.play_order(), &[1, 2, 3, 0]);
-        assert_eq!(pl.current_index(), Some(2), "cursor follows its track");
-        assert_eq!(pl.current().unwrap().title(), "t1");
+        assert_eq!(pl.current_index(), Some(2), "cursor follows its entry");
+        assert_eq!(pl.current().unwrap().label(), "t1");
         assert_eq!(pl.get(4), None);
         assert_eq!(
-            pl.insert(9, track("nope", 1)),
+            pl.insert(9, entry("nope", 1)),
             Err(Error::IndexOutOfBounds { index: 9, len: 4 })
         );
     }
@@ -1799,7 +2303,7 @@ mod tests {
     #[test]
     fn insert_at_end_appends() {
         let mut pl = playlist(2);
-        let at = pl.insert(2, track("tail", 1)).unwrap();
+        let at = pl.insert(2, entry("tail", 1)).unwrap();
         assert_eq!(at, 2);
         assert_eq!(pl.play_order(), &[0, 1, 2]);
     }
@@ -1813,7 +2317,7 @@ mod tests {
         assert_eq!(pl.current_index(), Some(1));
         assert_eq!(pl.current().unwrap().id(), third);
         assert_eq!(pl.play_order(), &[0, 1, 2]);
-        assert_eq!(pl.tracks().len(), 3);
+        assert_eq!(pl.entries().len(), 3);
     }
 
     #[test]
@@ -1847,7 +2351,7 @@ mod tests {
         let id = pl.get(1).unwrap().id();
         let (index, removed) = pl.remove_id(id).unwrap();
         assert_eq!(index, 1);
-        assert_eq!(removed.title(), "t1");
+        assert_eq!(removed.label(), "t1");
         assert_eq!(pl.remove_id(id), None);
         pl.clear();
         assert!(pl.is_empty() && pl.play_order().is_empty());
@@ -1860,11 +2364,11 @@ mod tests {
         for _ in 0..4 {
             pl.advance();
         }
-        let dropped = pl.retain(|t| t.title() != "t0");
+        let dropped = pl.retain(|t| t.label() != "t0");
         assert_eq!(dropped, 1);
         assert_eq!(pl.len(), 5);
-        assert_eq!(pl.tracks()[0].title(), "t1");
-        assert_eq!(pl.current().unwrap().title(), "t4");
+        assert_eq!(pl.entries()[0].label(), "t1");
+        assert_eq!(pl.current().unwrap().label(), "t4");
         pl.retain(|_| true);
         assert_eq!(pl.len(), 5);
     }
@@ -1886,8 +2390,8 @@ mod tests {
     fn swap_and_move_and_sort() {
         let mut pl = playlist(3);
         pl.swap(0, 2).unwrap();
-        assert_eq!(pl.tracks()[0].title(), "t2");
-        assert_eq!(pl.tracks()[2].title(), "t0");
+        assert_eq!(pl.entries()[0].label(), "t2");
+        assert_eq!(pl.entries()[2].label(), "t0");
         assert_eq!(pl.position_of(2), Some(0));
         assert_eq!(
             pl.swap(0, 9),
@@ -1896,17 +2400,17 @@ mod tests {
 
         let mut pl = playlist(4);
         pl.jump_to(0).unwrap();
-        pl.move_track(0, 3).unwrap();
-        assert_eq!(pl.tracks()[3].title(), "t0");
-        assert_eq!(pl.current_index(), Some(3), "follows the moved track");
+        pl.move_entry(0, 3).unwrap();
+        assert_eq!(pl.entries()[3].label(), "t0");
+        assert_eq!(pl.current_index(), Some(3), "follows the moved entry");
         assert_eq!(pl.play_order(), &[3, 0, 1, 2]);
-        assert_eq!(pl.move_track(0, 0), Ok(()));
+        assert_eq!(pl.move_entry(0, 0), Ok(()));
 
         let mut pl = playlist(3);
-        pl.move_track(2, 0).unwrap();
-        pl.sort_by(|a, b| a.title().cmp(b.title()));
+        pl.move_entry(2, 0).unwrap();
+        pl.sort_by(|a, b| a.label().cmp(b.label()));
         assert_eq!(
-            pl.tracks().iter().map(|t| t.title()).collect::<Vec<_>>(),
+            pl.entries().iter().map(|t| t.label()).collect::<Vec<_>>(),
             ["t0", "t1", "t2"]
         );
     }
@@ -1919,44 +2423,56 @@ mod tests {
         assert_eq!(pl.reorder(&[0, 0, 2]), Err(Error::BadLayout { len: 3 }));
         assert_eq!(pl.reorder(&[0, 1, 9]), Err(Error::BadLayout { len: 3 }));
         pl.reorder(&[2, 0, 1]).unwrap();
-        assert_eq!(pl.tracks()[0].title(), "t2");
-        assert_eq!(pl.current().unwrap().title(), "t0");
+        assert_eq!(pl.entries()[0].label(), "t2");
+        assert_eq!(pl.current().unwrap().label(), "t0");
         assert_eq!(pl.current_index(), Some(1));
         assert_eq!(pl.position_of(1), Some(0), "entry 1 now plays first");
     }
 
     #[test]
-    fn search_ranks_and_finds() {
-        let mut pl = Playlist::from_tracks([
-            Track::new("one.mp3")
-                .with_title("Midnight City")
-                .with_artist("M83")
+    fn search_ranks_metadata_it_does_not_understand() {
+        let mut pl = Playlist::from_entries([
+            Entry::new("one.flac")
+                .with_label("Midnight City")
+                .with_tag("artist", "M83")
                 .with_duration(Duration::from_secs(200)),
-            Track::new("two.mp3")
-                .with_title("City Lights")
-                .with_artist("Nobody"),
-            Track::new("three.mp3")
-                .with_title("Other")
-                .with_album("Midnight Album"),
+            Entry::new("two.flac")
+                .with_label("City Lights")
+                .with_tag("artist", "Nobody"),
+            Entry::new("three.flac")
+                .with_label("Other")
+                .with_tag("album", "Midnight Album"),
         ]);
         assert_eq!(pl.search("midnight"), vec![0, 2]);
         assert_eq!(pl.search("city"), vec![1, 0], "prefix beats substring");
-        assert_eq!(pl.search("midnight album"), vec![2], "album text matches");
+        assert_eq!(pl.search("midnight album"), vec![2], "opaque tag value");
         assert_eq!(pl.search("M83"), vec![0]);
+        assert_eq!(pl.search("album"), vec![2], "tag keys are searchable too");
+        assert_eq!(pl.search("no such thing"), vec![]);
         assert_eq!(pl.search(""), (0..3).collect::<Vec<_>>());
-        assert_eq!(pl.find(|t| t.album().is_some()), Some(2));
-        assert_eq!(pl.artists(), ["M83", "Nobody"]);
+        assert_eq!(pl.find(|t| t.tag("album").is_some()), Some(2));
+        assert_eq!(
+            pl.facet("artist"),
+            vec![("M83".into(), 1), ("Nobody".into(), 1)]
+        );
+        assert_eq!(pl.facet("missing"), vec![]);
+        assert_eq!(pl.untagged(), vec![]);
+        assert_eq!(
+            pl.get(1).unwrap().meta().unwrap().to_string(),
+            "label=City Lights artist=Nobody"
+        );
         pl.set_repeat(Repeat::One);
         assert_eq!(pl.repeat(), Repeat::One);
     }
 
     #[test]
     fn durations_are_partial_when_metadata_is_missing() {
-        let mut pl = Playlist::from_tracks([
-            track("a", 2),
-            Track::new("b.mp3").with_duration(Duration::from_secs(90)),
-            Track::new("c.mp3"),
+        let mut pl = Playlist::from_entries([
+            entry("a", 2),
+            Entry::new("b.flac").with_duration(Duration::from_secs(90)),
+            Entry::new("c.flac"),
         ]);
+        assert_eq!(pl.untagged(), vec![2], "no sidecar at all");
         let (known, unknown) = pl.duration_known();
         assert_eq!(known, Duration::from_secs(210));
         assert_eq!(unknown, 1);
@@ -1979,7 +2495,7 @@ mod tests {
         assert_eq!(pl.repeat(), Repeat::All);
         assert!(!pl.set_mode(PlayMode::SHUFFLE_ALL), "already in that mode");
         assert_eq!(
-            pl.current().map(|t| t.title()),
+            pl.current().map(|t| t.label()),
             Some("t0"),
             "mode changes keep the cursor"
         );
@@ -2015,9 +2531,9 @@ mod tests {
             Err(Error::IndexOutOfBounds { index: 99, len: 4 })
         );
         assert_eq!(
-            pl.jump_to_id(TrackId::from_raw(9_999)),
+            pl.jump_to_id(EntryId::from_raw(9_999)),
             Err(Error::NotFound {
-                id: TrackId::from_raw(9_999)
+                id: EntryId::from_raw(9_999)
             })
         );
         assert!(matches!(
@@ -2071,22 +2587,26 @@ mod tests {
     fn display_marks_the_cursor_and_sizes_columns() {
         let mut pl = Playlist::named("late night");
         pl.push(
-            Track::new("a.mp3")
-                .with_title("A Long Enough Title")
-                .with_artist("Someone")
+            Entry::new("a.flac")
+                .with_label("A Long Enough Title")
+                .with_tag("artist", "Someone")
                 .with_duration(Duration::from_secs(3715)),
         );
-        pl.push(Track::new("b.mp3").with_title("Short"));
+        pl.push(Entry::new("b.flac").with_label("Short"));
         pl.advance();
         pl.advance();
         let text = pl.to_string();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(
             lines[0],
-            "late night \u{b7} 2 tracks \u{b7} in order \u{b7} 1:01:55 +1?"
+            "late night \u{b7} 2 entries \u{b7} in order \u{b7} 1:01:55 +1?"
         );
-        assert!(lines[1].starts_with("  1. "), "{:?}", lines[1]);
-        assert!(lines[2].starts_with("> 2. "), "{:?}", lines[2]);
+        assert!(
+            lines[1].starts_with("  1. A Long Enough Title"),
+            "{:?}",
+            lines[1]
+        );
+        assert!(lines[2].starts_with("> 2. Short"), "{:?}", lines[2]);
         assert!(lines[2].ends_with("--:--"), "{:?}", lines[2]);
         let columns: Vec<usize> = lines[1..3].iter().map(|l| l.chars().count()).collect();
         assert_eq!(columns[0], columns[1], "rows align: {columns:?}");
@@ -2098,20 +2618,20 @@ mod tests {
         let empty = Playlist::named("nothing");
         assert_eq!(
             empty.to_string(),
-            "nothing \u{b7} 0 tracks \u{b7} in order\n(empty)\n"
+            "nothing \u{b7} 0 entries \u{b7} in order\n(empty)\n"
         );
     }
 
     #[test]
     fn iterators_and_extending() {
-        let mut pl: Playlist = (0..3).map(|i| track(&format!("t{i}"), i as u64)).collect();
-        pl.extend([track("t3", 4), track("t4", 5)]);
+        let mut pl: Playlist = (0..3).map(|i| entry(&format!("t{i}"), i as u64)).collect();
+        pl.extend([entry("t3", 4), entry("t4", 5)]);
         assert_eq!(pl.len(), 5);
         assert_eq!(pl.iter().count(), 5);
         assert_eq!(pl.iter_playback().count(), 5);
-        assert_eq!(pl.iter_playback().next().unwrap().title(), "t0");
+        assert_eq!(pl.iter_playback().next().unwrap().label(), "t0");
         assert_eq!((&pl).into_iter().count(), 5);
-        let owned: Vec<Track> = pl.clone().into_iter().collect();
+        let owned: Vec<Entry> = pl.clone().into_iter().collect();
         assert_eq!(owned.len(), 5);
         assert_eq!(ids(&pl), owned.iter().map(|t| t.id()).collect::<Vec<_>>());
     }
@@ -2121,10 +2641,10 @@ mod tests {
         let mut pl = playlist(3);
         let id = pl.get(1).unwrap().id();
         assert!(
-            !pl.iter().any(Track::is_open_ended),
+            !pl.iter().any(Entry::is_open_ended),
             "the helper gives every entry a length"
         );
-        assert_eq!(TrackId::from_raw(id.as_raw()), id);
+        assert_eq!(EntryId::from_raw(id.as_raw()), id);
 
         pl.jump_to(1).unwrap();
         let (position, index) = (pl.current_position().unwrap(), pl.current_index().unwrap());
@@ -2134,17 +2654,22 @@ mod tests {
 
         // Late metadata lands without disturbing the cursor or the play order.
         let order = pl.play_order().to_vec();
-        pl.get_mut(index).unwrap().set_artist("Someone");
-        for t in pl.tracks_mut() {
+        pl.get_mut(index).unwrap().set_tag("artist", "Someone");
+        for t in pl.entries_mut() {
             if t.duration().is_none() {
                 t.set_duration(Duration::from_secs(60));
             }
         }
-        assert_eq!(pl.get(1).unwrap().artist(), Some("Someone"));
+        assert_eq!(pl.get(1).unwrap().tag("artist"), Some("Someone"));
         assert_eq!(pl.duration_total(), Some(Duration::from_secs(360)));
         assert_eq!(pl.play_order(), order);
         assert_eq!(pl.current_index(), Some(index));
-        assert_eq!(pl.get(1).unwrap().display_line(), "Someone \u{2014} t1");
+        assert_eq!(
+            pl.get(1).unwrap().label(),
+            "t1",
+            "tags never rename an entry"
+        );
+        assert_eq!(pl.search("someone"), vec![1]);
         assert_eq!(
             pl.get(1).unwrap().relevance("T1"),
             Some(0),
@@ -2161,13 +2686,169 @@ mod tests {
     }
 
     #[test]
+    fn scripts_and_audio_are_the_same_kind_of_row() {
+        let mut pl = Playlist::named("errands");
+        pl.push(
+            Entry::address("music/a.flac")
+                .with_label("A")
+                .with_duration(Duration::from_secs(10)),
+        );
+        let reminder = Entry::speak("Buy milk.\nThen take the ferry.")
+            .with_label("Errands")
+            .with_tag("voice", "nova");
+        let id = reminder.id();
+        pl.push(reminder);
+
+        // Pending, not broken: no address yet, and that is a normal state.
+        assert_eq!(pl.needs_synthesis(), vec![1]);
+        assert!(pl.has_pending());
+        assert_eq!(pl.get(1).unwrap().uri(), None);
+        assert!(pl.get(1).unwrap().text().unwrap().starts_with("Buy milk"));
+        assert!(pl.get(1).unwrap().is_open_ended());
+        assert!(!pl.get(0).unwrap().needs_synthesis());
+
+        // Search reaches into the script and into opaque tags.
+        assert_eq!(pl.search("milk"), vec![1]);
+        assert_eq!(pl.search("ferry"), vec![1]);
+        assert_eq!(
+            pl.get(1).unwrap().relevance("nova"),
+            Some(4),
+            "exact tag value"
+        );
+        assert_eq!(
+            pl.get(1).unwrap().relevance("nov"),
+            Some(5),
+            "tag substring"
+        );
+
+        // Navigation is indifferent to what a row is.
+        assert!(matches!(
+            pl.advance(),
+            Nav::Moved {
+                position: 0,
+                index: 0
+            }
+        ));
+        assert!(matches!(
+            pl.advance(),
+            Nav::Moved {
+                position: 1,
+                index: 1
+            }
+        ));
+        assert_eq!(pl.advance(), Nav::Ended);
+
+        // Resolution keeps identity, index, play order, cursor, tags and script.
+        let order = pl.play_order().to_vec();
+        assert!(pl.get_mut(1).unwrap().resolved_at("/tmp/bo/milk.wav"));
+        assert_eq!(pl.index_of(id), Some(1));
+        assert_eq!(pl.play_order(), order);
+        assert_eq!(pl.current().unwrap().uri(), Some("/tmp/bo/milk.wav"));
+        assert_eq!(
+            pl.current().unwrap().text(),
+            Some("Buy milk.\nThen take the ferry."),
+            "the script survives, so it can be re-voiced later"
+        );
+        assert!(pl.current().unwrap().is_speech());
+        assert_eq!(pl.current().unwrap().tag("voice"), Some("nova"));
+        assert!(
+            !pl.get_mut(1).unwrap().resolved_at("/tmp/bo/milk.wav"),
+            "a duplicate delivery is a no-op a worker can detect"
+        );
+        assert!(!pl.has_pending());
+        assert_eq!(pl.untagged(), vec![]);
+    }
+
+    #[test]
+    fn labels_fall_back_to_the_opening_line_of_a_script() {
+        let spoken = Entry::speak(
+            "  The quick brown fox jumps over the lazy dog, and keeps going.\nsecond line",
+        );
+        assert_eq!(
+            spoken.label(),
+            "The quick brown fox jumps over the lazy dog, and",
+            "truncated on a byte-safe boundary"
+        );
+        assert_eq!(Entry::speak("   ").label(), "untitled");
+        assert_eq!(
+            Entry::speak("你好世界，今天天气不错").label(),
+            "你好世界，今天天气不错"
+        );
+        let wide = Entry::speak("🎧 ".repeat(40));
+        assert!(
+            wide.label().chars().all(|c| c == '\u{1f3a7}' || c == ' '),
+            "no split char: {:?}",
+            wide.label()
+        );
+
+        assert_eq!(
+            Entry::new("dir/sub/x.mp3").source().payload(),
+            "dir/sub/x.mp3"
+        );
+        assert_eq!(Entry::new("dir/sub/x.mp3").label(), "x");
+        assert!(!Entry::new("dir/sub/x.mp3").needs_synthesis());
+        assert_eq!(Source::from("a").to_string(), "a");
+        assert_eq!(Source::speech("hello").to_string(), "speak \"hello\"");
+
+        let mut script = Source::speech("Buy milk.");
+        assert_eq!(script.uri(), None);
+        assert!(script.needs_synthesis());
+        assert!(script.set_rendered("/x.wav"));
+        assert_eq!(script.uri(), Some("/x.wav"));
+        assert!(!script.needs_synthesis());
+        assert!(
+            !script.set_rendered("/x.wav"),
+            "duplicate delivery is a no-op"
+        );
+        assert_eq!(script.as_text(), Some("Buy milk."));
+        assert_eq!(script.as_address(), None, "the script owns the path now");
+        assert_eq!(script.to_string(), "speak \"Buy milk.\" -> /x.wav");
+        script.set_text("Buy Oat milk.");
+        assert_eq!(
+            script.uri(),
+            Some("/x.wav"),
+            "edited text invalidates nothing here"
+        );
+
+        let mut recording = Source::address("/a.flac");
+        assert!(
+            !recording.set_rendered("/b.flac"),
+            "recordings are never resolved"
+        );
+        assert_eq!(recording.as_address(), Some("/a.flac"));
+        recording.set_text("ignored");
+        assert_eq!(recording.payload(), "/a.flac");
+    }
+
+    #[test]
+    fn listing_mixes_audio_and_speech() {
+        let mut pl = Playlist::named("day");
+        pl.push(
+            Entry::address("a.flac")
+                .with_label("Song")
+                .with_duration(Duration::from_secs(30)),
+        );
+        pl.push(Entry::speak("Remember the milk.").with_label("Reminder"));
+        let text = pl.to_string();
+        assert!(text.contains("2 entries"), "{text}");
+        assert!(
+            text.starts_with("day \u{b7} 2 entries \u{b7} in order \u{b7} 00:30 +1?\n"),
+            "{text}"
+        );
+        assert!(text.contains("Reminder"), "{text}");
+        assert!(text.ends_with("--:--\n"), "{text}");
+        assert_eq!(pl.duration_total(), None, "one row has no length yet");
+        assert_eq!(pl.get(1).unwrap().to_string(), "Reminder [--:--]");
+    }
+
+    #[test]
     fn random_operations_preserve_invariants() {
         // Fuzz-ish: interleave edits and navigation, then check nothing is lost.
         let mut pl = Playlist::seeded("fuzz", 1234);
-        let mut expected: Vec<TrackId> = Vec::new();
+        let mut expected: Vec<EntryId> = Vec::new();
         for i in 0..40 {
-            pl.push(track(&format!("t{i}"), i as u64));
-            expected.push(pl.tracks().last().unwrap().id());
+            pl.push(entry(&format!("t{i}"), i as u64));
+            expected.push(pl.entries().last().unwrap().id());
         }
         for round in 0..300u64 {
             let r = mix(round ^ pl.shuffle_seed());
@@ -2180,8 +2861,8 @@ mod tests {
                 }
                 2 => {
                     let at = (r as usize) % (pl.len() + 1);
-                    let id = TrackId::next();
-                    let t = Track::new(format!("x{id}.mp3")).with_id(id);
+                    let id = EntryId::next();
+                    let t = Entry::new(format!("x{id}.mp3")).with_id(id);
                     if pl.insert(at, t).is_ok() {
                         expected.insert(at, id);
                     }
@@ -2208,7 +2889,7 @@ mod tests {
                         let b = (r as usize / 5) % pl.len();
                         let moved = expected.remove(a);
                         expected.insert(b, moved);
-                        let _ = pl.move_track(a, b);
+                        let _ = pl.move_entry(a, b);
                     }
                 }
                 _ => {
@@ -2228,12 +2909,14 @@ mod tests {
         pl.debug_check();
         assert!(pl.back().played(), "history survives the edits");
         assert!(!pl.is_empty());
-        assert_eq!(
-            pl.search("t").len(),
-            pl.tracks()
-                .iter()
-                .filter(|t| t.title().starts_with('t'))
-                .count()
+        // Search contract holds after arbitrary edits: every hit really matches,
+        // and an empty query is the whole list.
+        let hits = pl.search("t");
+        assert!(
+            hits.iter()
+                .all(|&i| pl.get(i).unwrap().relevance("t").is_some())
         );
+        assert_eq!(pl.search(""), (0..pl.len()).collect::<Vec<_>>());
+        assert_eq!(pl.search("no such thing at all"), vec![]);
     }
 }
