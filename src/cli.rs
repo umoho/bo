@@ -25,6 +25,10 @@
 //!   track is created and its index printed, so later puts can name it. With
 //!   `[track]` the track is used, created on demand (up to that index).
 //! * `play` — start playback from the current playhead.
+//! * `pause` / `resume` — hold and continue, keeping the position.
+//! * `stop` — stop and rewind; ends the daemon's session (cleanup as usual).
+//! * `seek <t>` — move the playhead; a running transport re-plans.
+//! * `ls` — dump the whole arrangement.
 //!
 //! # Clip specs
 //!
@@ -46,6 +50,7 @@
 //! contains one never finishes — the daemon plays until told to stop. Slice
 //! what you place (`uri:from-to`) to keep arranging.
 
+use std::fmt::Write as _;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
@@ -90,6 +95,19 @@ enum Command {
     },
     /// Start playback from the current playhead.
     Play,
+    /// Show the whole arrangement.
+    Ls,
+    /// Pause the transport, keeping the position.
+    Pause,
+    /// Resume after a pause.
+    Resume,
+    /// Stop and rewind; ends the daemon's session.
+    Stop,
+    /// Move the playhead to a timecode (SS, MM:SS or HH:MM:SS).
+    Seek {
+        /// Target timecode.
+        at: String,
+    },
     /// Hidden: run the playback daemon (spawned by the client on demand).
     #[command(hide = true)]
     Daemon,
@@ -239,8 +257,64 @@ fn dispatch(a: &mut Arrangement, command: Command) -> Result<String, (i32, Strin
     match command {
         Command::Put { spec, track } => put_command(a, &spec, track),
         Command::Play => play_command(a),
+        Command::Ls => Ok(format_arrangement(a)),
+        Command::Pause => {
+            a.player.pause();
+            Ok(format!("paused at {}\n", format_time(a.player.playhead())))
+        }
+        Command::Resume => {
+            a.player.resume().map_err(|e| fail(e.to_string()))?;
+            Ok(format!("playing from {}\n", format_time(a.player.playhead())))
+        }
+        Command::Stop => {
+            a.player.stop();
+            Ok("stopped\n".to_string())
+        }
+        Command::Seek { at } => {
+            let t = parse_timecode(&at).map_err(usage)?;
+            a.player.seek(t).map_err(|e| fail(e.to_string()))?;
+            Ok(format!("playhead at {}\n", format_time(t)))
+        }
         Command::Daemon => Err(fail("the daemon runs standalone, not over the socket")),
     }
+}
+
+/// The whole arrangement as text: transport line, then one block per track.
+fn format_arrangement(a: &Arrangement) -> String {
+    let p = &a.player;
+    let mut out = format!(
+        "player: {} | playhead {} | volume {:.2}\n",
+        p.state(),
+        format_time(p.playhead()),
+        p.volume()
+    );
+    if p.tracks().is_empty() {
+        out.push_str("no tracks\n");
+        return out;
+    }
+    for (ti, t) in p.tracks().iter().enumerate() {
+        let dur = t.duration().map(format_time).unwrap_or_else(|| "inf".into());
+        let noun = if t.len() == 1 { "clip" } else { "clips" };
+        let head = match t.name() {
+            Some(name) => format!("track {ti} {name:?}  {} {noun}", t.len()),
+            None => format!("track {ti}  {} {noun}", t.len()),
+        };
+        let _ = writeln!(out, "{head}  -> {dur}");
+        for (ci, c) in t.clips().iter().enumerate() {
+            let end = c.end().map(format_time).unwrap_or_else(|| "inf".into());
+            let src_to = c.to.or(c.source.duration).map(format_time).unwrap_or_else(|| "inf".into());
+            let _ = writeln!(
+                out,
+                "  #{ci}  {}  {} -> {}  (src {} -> {})",
+                c.source.uri,
+                format_time(c.at),
+                end,
+                format_time(c.from),
+                src_to
+            );
+        }
+    }
+    out
 }
 
 /// `put <spec> [track]`: place a clip, creating the track when needed.
@@ -298,6 +372,11 @@ fn command_line(command: &Command) -> String {
             None => format!("put {spec}"),
         },
         Command::Play => "play".to_string(),
+        Command::Ls => "ls".to_string(),
+        Command::Pause => "pause".to_string(),
+        Command::Resume => "resume".to_string(),
+        Command::Stop => "stop".to_string(),
+        Command::Seek { at } => format!("seek {at}"),
         Command::Daemon => unreachable!("the daemon is spawned, not sent"),
     }
 }
@@ -420,7 +499,8 @@ fn daemon_main(socket: &Path) -> i32 {
     let exit = Arc::new(AtomicBool::new(false));
 
     let serve_state = state.clone();
-    let serve = thread::spawn(move || serve_loop(listener, serve_state));
+    let serve_exit = exit.clone();
+    let serve = thread::spawn(move || serve_loop(listener, serve_state, serve_exit));
     let _ = serve;
 
     // Clock loop: advance the playhead by real elapsed time and watch for
@@ -452,31 +532,39 @@ fn daemon_main(socket: &Path) -> i32 {
 
 /// Accept connections and handle each command on its own thread. The clock
 /// loop owns the transport; handlers only lock it briefly.
-fn serve_loop(listener: UnixListener, state: Arc<Mutex<Arrangement>>) {
+fn serve_loop(listener: UnixListener, state: Arc<Mutex<Arrangement>>, exit: Arc<AtomicBool>) {
     for connection in listener.incoming() {
         let Ok(mut stream) = connection else { continue };
         let state = state.clone();
+        let exit = exit.clone();
         thread::spawn(move || {
             let mut line = String::new();
             let mut reader = BufReader::new(&mut stream);
             let Ok(_) = reader.read_line(&mut line) else { return };
-            let (code, output) = handle_line(&state, line.trim_end());
+            let (code, output, ends_session) = handle_line(&state, line.trim_end());
             let _ = stream.write_all(format!("{code}\n{output}").as_bytes());
+            // The reply is on the wire before the session may end, so the
+            // client never sees a truncated response.
+            if ends_session {
+                exit.store(true, Ordering::Relaxed);
+            }
         });
     }
 }
 
-/// One command over the wire: parse, dispatch, and frame the reply.
-fn handle_line(state: &Mutex<Arrangement>, line: &str) -> (i32, String) {
+/// One command over the wire: parse, dispatch, and frame the reply. The third
+/// value says whether this command ends the daemon's session.
+fn handle_line(state: &Mutex<Arrangement>, line: &str) -> (i32, String, bool) {
     let args: Vec<String> = line.split_whitespace().map(str::to_string).collect();
     let command = match parse_command(&args) {
         Ok(command) => command,
-        Err(e) => return (e.exit_code(), format!("{}\n", e.to_string().trim_end())),
+        Err(e) => return (e.exit_code(), format!("{}\n", e.to_string().trim_end()), false),
     };
+    let ends_session = matches!(command, Command::Stop);
     let mut a = state.lock().unwrap();
     match dispatch(&mut a, command) {
-        Ok(out) => (0, out),
-        Err((code, msg)) => (code, format!("bo: {msg}\n")),
+        Ok(out) => (0, out, ends_session),
+        Err((code, msg)) => (code, format!("bo: {msg}\n"), ends_session),
     }
 }
 
@@ -628,6 +716,70 @@ mod tests {
         let out = run_ok(&mut a, &["play"]);
         assert!(out.contains("playing from 00:00:00.000"), "{out}");
         assert_eq!(a.player.state(), State::Playing);
+    }
+
+    #[test]
+    fn ls_shows_the_arrangement() {
+        let mut a = Arrangement::default();
+        run_ok(&mut a, &["put", "a.wav:00:00:00-00:00:10"]);
+        run_ok(&mut a, &["put", "b.wav@00:00:10:00:00:00-00:00:05", "0"]);
+        let out = run_ok(&mut a, &["ls"]);
+        assert!(out.contains("player: stopped"), "{out}");
+        assert!(out.contains("track 0  2 clips"), "{out}");
+        assert!(out.contains("a.wav") && out.contains("b.wav"), "{out}");
+        let out = run_ok(&mut a, &["ls"]);
+        assert!(out.contains("00:00:10.000 -> 00:00:15.000"), "butt-joined clip: {out}");
+    }
+
+    #[test]
+    fn transport_commands_drive_the_state_machine() {
+        let mut a = Arrangement::default();
+        run_ok(&mut a, &["put", "a.wav:00:00:00-00:00:10"]);
+        run_ok(&mut a, &["play"]);
+        assert_eq!(a.player.state(), State::Playing);
+        run_ok(&mut a, &["pause"]);
+        assert_eq!(a.player.state(), State::Paused);
+        run_ok(&mut a, &["resume"]);
+        assert_eq!(a.player.state(), State::Playing);
+        let out = run_ok(&mut a, &["seek", "00:00:07"]);
+        assert!(out.contains("playhead at 00:00:07.000"), "{out}");
+        assert_eq!(a.player.playhead(), Duration::from_secs(7));
+        run_ok(&mut a, &["stop"]);
+        assert_eq!(a.player.state(), State::Stopped);
+        assert_eq!(a.player.playhead(), Duration::ZERO, "stop rewinds");
+    }
+
+    #[test]
+    fn transport_commands_work_over_the_wire_and_stop_ends_the_session() {
+        let dir = temp_dir();
+        let socket = dir.join("d.sock");
+        let handle = {
+            let socket = socket.clone();
+            thread::spawn(move || daemon_main(&socket))
+        };
+        wait_until("socket", || UnixStream::connect(&socket).is_ok());
+
+        send(&socket, "put a.wav:00:00:00-00:00:10");
+        let reply = send(&socket, "ls");
+        assert!(reply.contains("track 0  1 clip") && reply.contains("a.wav"), "{reply}");
+
+        let reply = send(&socket, "seek 00:00:05");
+        assert!(reply.contains("playhead at 00:00:05.000"), "{reply}");
+        let reply = send(&socket, "pause");
+        assert!(reply.contains("paused at"), "{reply}");
+        let reply = send(&socket, "resume");
+        assert!(reply.contains("playing from"), "{reply}");
+        // A bad timecode is refused with exit 2, session unaffected.
+        let reply = send(&socket, "seek bogus");
+        assert_eq!(reply.lines().next().unwrap(), "2", "{reply}");
+
+        // stop ends the session: reply first, then cleanup.
+        let reply = send(&socket, "stop");
+        assert!(reply.contains("stopped"), "{reply}");
+        wait_until("cleanup", || !socket.exists());
+        assert_eq!(handle.join().unwrap(), 0);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
