@@ -152,8 +152,8 @@ impl Clip {
 pub struct Overlap {
     /// The position the rejected clip wanted.
     pub at: Duration,
-    /// Index of the clip it collided with.
-    pub conflict: usize,
+    /// Id of the clip it collided with.
+    pub conflict: u64,
 }
 
 impl std::fmt::Display for Overlap {
@@ -275,8 +275,9 @@ impl Track {
     /// On collision the clip is handed back untouched, so a refused insert
     /// leaves the track exactly as it was.
     pub fn insert(&mut self, mut clip: Clip) -> Result<u64, (Clip, Overlap)> {
-        if let Some(conflict) = self.clips.iter().position(|c| c.overlaps(&clip)) {
+        if let Some(conflict) = self.clips.iter().find(|c| c.overlaps(&clip)) {
             let at = clip.at;
+            let conflict = conflict.id;
             return Err((clip, Overlap { at, conflict }));
         }
         clip.id = self.next_id;
