@@ -47,7 +47,10 @@
 //!   source in the arrangement; a bare uri is probed locally, no daemon.
 //! * `name <track> <name>` — label a track; names are single tokens in
 //!   scripts.
-//! * `ls` — dump the whole arrangement.
+//! * `ls` — dump the whole arrangement as machine-readable text: a `key: value`
+//!   status block, then one `key=value` line per track and per clip.
+//! * `at <t>` — show the mix at track time `t`: every clip covering that
+//!   moment, one per track.
 //!
 //! # Clip specs
 //!
@@ -129,6 +132,12 @@ enum Command {
     },
     /// Show the whole arrangement.
     Ls,
+    /// Show the mix at track time `t`: every clip covering that moment,
+    /// one per track.
+    At {
+        /// Track timecode.
+        at: String,
+    },
     /// Mix the arrangement to a wav file, offline.
     Render {
         /// Output wav path.
@@ -328,7 +337,9 @@ Arrangement:
   put <spec> [track]       place a clip; without [track] a new track is
                            created and its index printed
   take <track> <clip>      remove a clip — the reverse of put
-  ls                       dump the whole arrangement
+  ls                       dump the arrangement; a key: value status block,
+                           then one key=value line per track and clip
+  at <t>                   show what plays at track time t
   render <file>            mix the arrangement to a wav file
   save <file>              write the arrangement as a script
   load <file>              replace the arrangement from a script
@@ -372,8 +383,8 @@ EXAMPLES
 
 /// Names of the user-facing subcommands: `bo <name> --help` must keep
 /// clap's own per-command help, while `bo --help` shows the grouped [`HELP`].
-const SUBCOMMAND_NAMES: [&str; 17] = [
-    "put", "take", "ls", "render", "save", "load", "check", "probe", "name", "play", "pause",
+const SUBCOMMAND_NAMES: [&str; 18] = [
+    "put", "take", "ls", "at", "render", "save", "load", "check", "probe", "name", "play", "pause",
     "resume", "stop", "seek", "volume", "mute", "unmute",
 ];
 
@@ -502,6 +513,7 @@ fn dispatch(a: &mut Arrangement, command: Command) -> Result<String, (i32, Strin
         Command::Put { spec, track } => put_command(a, &spec, track),
         Command::Play => play_command(a),
         Command::Ls => Ok(format_arrangement(a)),
+        Command::At { at } => at_command(a, &at),
         Command::Pause => {
             a.player.pause();
             Ok(format!("paused at {}\n", format_time(a.player.playhead())))
@@ -607,44 +619,76 @@ fn dispatch(a: &mut Arrangement, command: Command) -> Result<String, (i32, Strin
     }
 }
 
-/// The whole arrangement as text: transport line, then one block per track.
+/// The whole arrangement as machine-readable text: a `key: value` status
+/// block (state, playhead, end, backend, master volume, track count), then
+/// one line per track and per clip of `key=value` tokens. Row labels are
+/// stable (`player`-level keys, `track N:`, `clip N:`), so parsers can grep
+/// by prefix and keys never move position.
 fn format_arrangement(a: &Arrangement) -> String {
     let p = &a.player;
+    let end = p.duration().map(format_time).unwrap_or_else(|| "inf".into());
     let mut out = format!(
-        "player: {} | playhead {} | volume {:.2} | backend {}\n",
+        "state: {}\nplayhead: {}\nend: {end}\nbackend: {}\nvolume: {:.2}\ntracks: {}\n",
         p.state(),
         format_time(p.playhead()),
+        p.backend().name(),
         p.volume(),
-        p.backend().name()
+        p.tracks().len()
     );
-    if p.tracks().is_empty() {
-        out.push_str("no tracks\n");
-        return out;
-    }
     for (ti, t) in p.tracks().iter().enumerate() {
         let dur = t.duration().map(format_time).unwrap_or_else(|| "inf".into());
-        let noun = if t.len() == 1 { "clip" } else { "clips" };
-        let mute = if t.muted() { "  muted" } else { "" };
-        let head = match t.name() {
-            Some(name) => format!("track {ti} {name:?}  volume {:.2}{mute}  {} {noun}", t.volume(), t.len()),
-            None => format!("track {ti}  volume {:.2}{mute}  {} {noun}", t.volume(), t.len()),
+        let mute = if t.muted() { " muted" } else { "" };
+        let name = match t.name() {
+            Some(name) => format!("name={name} "),
+            None => String::new(),
         };
-        let _ = writeln!(out, "{head}  -> {dur}");
+        let _ = writeln!(
+            out,
+            "track {ti}: {name}volume={:.2}{mute} clips={} end={dur}",
+            t.volume(),
+            t.len()
+        );
         for (ci, c) in t.clips().iter().enumerate() {
             let end = c.end().map(format_time).unwrap_or_else(|| "inf".into());
-            let src_to = c.to.or(c.source.duration).map(format_time).unwrap_or_else(|| "inf".into());
+            let src_to = c
+                .to
+                .or(c.source.duration)
+                .map(format_time)
+                .unwrap_or_else(|| "inf".into());
             let _ = writeln!(
                 out,
-                "  #{ci}  {}  {} -> {}  (src {} -> {})",
+                "  clip {ci}: uri={} at={} end={end} src={}-{src_to}",
                 c.source.uri,
                 format_time(c.at),
-                end,
-                format_time(c.from),
-                src_to
+                format_time(c.from)
             );
         }
     }
     out
+}
+
+/// `at <t>`: the mix at track time `t` — every clip covering that moment,
+/// one per track, or a `silent at ...` line when nothing plays there.
+fn at_command(a: &Arrangement, at_arg: &str) -> Result<String, (i32, String)> {
+    let t = parse_timecode(at_arg).map_err(usage)?;
+    let mut out = String::new();
+    for (ti, track) in a.player.tracks().iter().enumerate() {
+        let Some((ci, clip)) = track.clips().iter().enumerate().find(|(_, c)| c.covers(t)) else {
+            continue;
+        };
+        let end = clip.end().map(format_time).unwrap_or_else(|| "inf".into());
+        let _ = writeln!(
+            out,
+            "track {ti}: clip={ci} uri={} at={} end={end}",
+            clip.source.uri,
+            format_time(clip.at)
+        );
+    }
+    if out.is_empty() {
+        Ok(format!("silent at {}\n", format_time(t)))
+    } else {
+        Ok(out)
+    }
 }
 
 /// `put <spec> [track]`: place a clip, creating the track when needed.
@@ -766,6 +810,7 @@ fn command_line(command: &Command) -> String {
         },
         Command::Play => "play".to_string(),
         Command::Ls => "ls".to_string(),
+        Command::At { at } => format!("at {at}"),
         Command::Pause => "pause".to_string(),
         Command::Resume => "resume".to_string(),
         Command::Stop => "stop".to_string(),
@@ -1282,7 +1327,7 @@ mod tests {
         run_ok(&mut a, &["put", "a.wav:00:00:00-00:00:10"]);
         let out = run_ok(&mut a, &["play"]);
         assert!(out.contains("(no audio device: x)"), "{out}");
-        assert!(run_ok(&mut a, &["ls"]).contains("backend silent"), "ls names the backend");
+        assert!(run_ok(&mut a, &["ls"]).contains("backend: silent"), "ls names the backend");
     }
 
     #[test]
@@ -1291,11 +1336,14 @@ mod tests {
         run_ok(&mut a, &["put", "a.wav:00:00:00-00:00:10"]);
         run_ok(&mut a, &["put", "b.wav@00:00:10:00:00:00-00:00:05", "0"]);
         let out = run_ok(&mut a, &["ls"]);
-        assert!(out.contains("player: stopped"), "{out}");
-        assert!(out.contains("track 0  volume 1.00  2 clips"), "{out}");
+        assert!(out.contains("state: stopped"), "{out}");
+        for key in ["playhead:", "end:", "backend:", "volume:", "tracks:"] {
+            assert!(out.contains(key), "missing {key}: {out}");
+        }
+        assert!(out.contains("track 0: volume=1.00 clips=2"), "{out}");
         assert!(out.contains("a.wav") && out.contains("b.wav"), "{out}");
         let out = run_ok(&mut a, &["ls"]);
-        assert!(out.contains("00:00:10.000 -> 00:00:15.000"), "butt-joined clip: {out}");
+        assert!(out.contains("at=00:00:10.000 end=00:00:15.000"), "butt-joined clip: {out}");
     }
 
     #[test]
@@ -1310,7 +1358,26 @@ mod tests {
         let (code, msg) = run_err(&mut a, &["volume", "9", "0.5"]);
         assert_eq!(code, 1);
         assert!(msg.contains("no track 9"), "{msg}");
-        assert!(run_ok(&mut a, &["ls"]).contains("volume 1.00"), "ls shows the gain");
+        assert!(run_ok(&mut a, &["ls"]).contains("volume=1.00"), "ls shows the gain");
+    }
+
+    #[test]
+    fn at_shows_the_clips_covering_a_timecode() {
+        let mut a = Arrangement::default();
+        run_ok(&mut a, &["put", "a.wav:00:00:00-00:00:10"]);
+        run_ok(&mut a, &["put", "b.wav@00:00:10:00:00:00-00:00:05", "0"]);
+        run_ok(&mut a, &["put", "c.wav:00:00:00-00:00:03"]);
+
+        let out = run_ok(&mut a, &["at", "00:00:01.000"]);
+        assert!(out.contains("track 0: clip=0"), "{out}");
+        assert!(out.contains("track 1: clip=0"), "{out}");
+        let out = run_ok(&mut a, &["at", "00:00:12.000"]);
+        assert!(out.contains("track 0: clip=1"), "{out}");
+        assert!(!out.contains("track 1"), "{out}");
+        let out = run_ok(&mut a, &["at", "00:00:20.000"]);
+        assert!(out.contains("silent at 00:00:20.000"), "{out}");
+        let (code, _) = run_err(&mut a, &["at", "bogus"]);
+        assert_eq!(code, 2);
     }
 
     #[test]
@@ -1384,7 +1451,7 @@ mod tests {
 
         send(&socket, "put a.wav:00:00:00-00:00:10");
         let reply = send(&socket, "ls");
-        assert!(reply.contains("track 0  volume 1.00  1 clip") && reply.contains("a.wav"), "{reply}");
+        assert!(reply.contains("track 0: volume=1.00 clips=1") && reply.contains("a.wav"), "{reply}");
 
         let reply = send(&socket, "volume 0 0.5");
         assert!(reply.contains("track 0 volume 0.50"), "{reply}");
@@ -1461,7 +1528,7 @@ mod tests {
         run_ok(&mut a, &["put", "a.wav:00:00:00-00:00:10"]);
         let out = run_ok(&mut a, &["name", "0", "bed"]);
         assert!(out.contains("track 0 named \"bed\""), "{out}");
-        assert!(run_ok(&mut a, &["ls"]).contains("track 0 \"bed\""), "ls shows the label");
+        assert!(run_ok(&mut a, &["ls"]).contains("track 0: name=bed"), "ls shows the label");
         let (code, msg) = run_err(&mut a, &["name", "9", "x"]);
         assert_eq!(code, 1);
         assert!(msg.contains("no track 9"), "{msg}");

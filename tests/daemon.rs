@@ -103,7 +103,7 @@ fn client_spawns_a_daemon_and_it_cleans_up_when_done() {
 
     // The second command sees the same arrangement over the wire.
     let out = bo(&sp, &["ls"]);
-    assert!(out.contains("track 0  volume 1.00  2 clips"), "{out}");
+    assert!(out.contains("track 0: volume=1.00 clips=2"), "{out}");
     let out = bo(&sp, &["volume", "0", "0.25"]);
     assert!(out.contains("track 0 volume 0.25"), "{out}");
 
@@ -213,7 +213,30 @@ fn play_on_an_empty_arrangement_is_refused_and_the_daemon_survives() {
 
     // The daemon is still alive: the session did not vanish.
     let out = bo(&sp, &["ls"]);
-    assert!(out.contains("player: stopped"), "{out}");
+    assert!(out.contains("state: stopped"), "{out}");
+
+    let out = bo(&sp, &["stop"]);
+    assert!(out.contains("stopped"), "{out}");
+    wait_for_socket_gone(&socket);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn at_reports_the_mix_at_a_timecode_over_the_wire() {
+    let dir = temp_dir();
+    let socket = dir.join("d.sock");
+    let sp = socket.to_string_lossy().into_owned();
+
+    let out = bo(&sp, &["put", "a.wav:00:00:00-00:00:10"]);
+    assert!(out.contains("ok: track 0"), "{out}");
+    let out = bo(&sp, &["put", "b.wav@00:00:05:00:00:00-00:00:03", "1"]);
+    assert!(out.contains("ok: track 1"), "{out}");
+
+    let out = bo(&sp, &["at", "00:00:06.000"]);
+    assert!(out.contains("track 0: clip=0"), "{out}");
+    assert!(out.contains("track 1: clip=0"), "{out}");
+    let out = bo(&sp, &["at", "00:00:20.000"]);
+    assert!(out.contains("silent at"), "{out}");
 
     let out = bo(&sp, &["stop"]);
     assert!(out.contains("stopped"), "{out}");
