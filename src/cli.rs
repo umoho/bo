@@ -578,11 +578,19 @@ fn dispatch(a: &mut Arrangement, command: Command) -> Result<Output, (i32, Strin
         Command::Load { file } => {
             let text = std::fs::read_to_string(&file)
                 .map_err(|e| fail(format!("cannot read {file}: {e}")))?;
-            // Load into a fresh arrangement so a failing script leaves the
-            // current one untouched; transport resets with the swap.
-            let mut fresh = Arrangement::default();
-            run_script(&mut fresh, &text, &file).map_err(fail)?;
-            *a = fresh;
+            // Stage the script in a silent arrangement so a failing script
+            // leaves the current one untouched; then commit only the
+            // arrangement data (tracks, master) into the live player. The
+            // audio backend must survive a load — swapping the whole
+            // arrangement once replaced the daemon's backend with a bare
+            // silent one, so the next play was silently inaudible.
+            let mut staged = Arrangement::default();
+            run_script(&mut staged, &text, &file).map_err(fail)?;
+            let volume = staged.player.volume();
+            let tracks: Vec<Track> = staged.player.tracks().to_vec();
+            a.player.reset();
+            a.player.set_volume(volume);
+            a.player.tracks_mut().extend(tracks);
             Ok(Output::Loaded { file })
         }
         Command::Reset => reset_command(a),
@@ -1951,6 +1959,33 @@ mod tests {
         assert!(msg.contains("refused"), "{msg}");
         assert_eq!(b.player.tracks()[0].clips().len(), 1, "failed load left the arrangement alone");
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_keeps_the_live_audio_backend() {
+        // Loading used to swap the whole arrangement in, replacing the
+        // daemon's audio backend with a bare silent one — the next play
+        // reported "backend silent" and made no sound. The backend's note
+        // is the marker: a real daemon carries it (or rodio itself).
+        let mut a = Arrangement::with_backend(AnyBackend::Silent(
+            Silent::default(),
+            Some("no audio device: x".to_string()),
+        ));
+        run_ok(&mut a, &["put", "a.wav:00:00:00-00:00:10"]);
+        let dir = temp_dir();
+        let script = dir.join("p.bo");
+        let path = script.to_string_lossy().into_owned();
+        std::fs::write(&script, "set master 0.5\n").unwrap();
+        run_ok(&mut a, &["load", &path]);
+        assert_eq!(
+            a.player.backend().note(),
+            Some("no audio device: x"),
+            "the live backend survives a load"
+        );
+        assert_eq!(a.player.volume(), 0.5, "master came across");
+        assert_eq!(a.player.tracks().len(), 0, "the old arrangement was replaced");
+        assert_eq!(a.player.state(), State::Stopped, "transport resets with the load");
         std::fs::remove_dir_all(&dir).ok();
     }
 
