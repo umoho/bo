@@ -1,4 +1,4 @@
-//! The agent-facing CLI: a client for a playback daemon.
+//! The agent-facing CLI: the command surface of an audio editor and mixer.
 //!
 //! The arrangement and the transport live in a long-running daemon, not in
 //! files. Every command reaches the daemon over a Unix socket,
@@ -11,7 +11,7 @@
 //! bo put / play / ...        bo daemon (spawned on demand)
 //!   connect to socket  ───►   owns: arrangement + transport + clock
 //!   send one command line     replies with exit code + output
-//!   print reply, exit         exits when the program is done
+//!   print reply, exit         exits when playback is done
 //! ```
 //!
 //! The socket lives at `$TMPDIR/bo/daemon.sock` unless `--socket <path>` says
@@ -53,7 +53,7 @@
 //! * `save <file>` / `load <file>` — write the arrangement as a script of
 //!   commands, or replace it from one (transport resets with the swap).
 //! * `reset` — drop every track and stop the transport: the daemon is back
-//!   to its fresh state, ready for a run-sheet to rebuild it.
+//!   to its fresh state, ready for a session script to rebuild it.
 //! * `check` — verify every distinct source is readable.
 //! * `probe [uri]` — measure the length of a source, or of every distinct
 //!   source in the arrangement; a bare uri is probed locally, no daemon.
@@ -103,7 +103,7 @@ mod reply;
 
 use reply::{AtLine, Ls, LsClip, LsTrack, Output, PlacedClip, ProbeResult, SetResult, Tc};
 
-/// bo — arrange and play a radio program.
+/// bo — edit and mix audio, one command at a time.
 #[derive(Debug, Parser)]
 #[command(
     name = "bo",
@@ -160,7 +160,7 @@ enum Command {
         /// Output wav path.
         file: String,
         /// Range to render: `from-to`, `from-`, or nothing for the whole
-        /// program.
+        /// arrangement.
         range: Option<String>,
     },
     /// Write the arrangement as a script of commands.
@@ -210,7 +210,7 @@ enum Command {
     /// Show the grouped help.
     #[command(hide = true)]
     Help,
-    /// Hidden: run the playback daemon (spawned by the client on demand).
+    /// Hidden: run the session daemon (spawned by the client on demand).
     #[command(hide = true)]
     Daemon,
 }
@@ -335,7 +335,7 @@ fn default_socket() -> PathBuf {
 /// so grouping (Arrangement / Mix / Transport) and the examples live here.
 /// Keep in sync with [`Command`] when the surface changes.
 const HELP: &str = "\
-bo — arrange and play a radio program
+bo — edit and mix audio, one command at a time
 
 USAGE
   bo [--socket PATH] <command> [args...]
@@ -784,7 +784,7 @@ fn put_command(
 /// `play`: refuse an arrangement with nothing to play, then start playback
 /// from the current playhead. The session line tells the caller what is
 /// about to play; the daemon's clock loop advances the playhead and exits
-/// when the program is done.
+/// when playback is done.
 fn play_command(a: &mut Arrangement) -> Result<Output, (i32, String)> {
     // An empty arrangement (or one whose clips are all zero-length) would
     // finish instantly: refuse before touching the transport, so the daemon
@@ -822,7 +822,7 @@ fn apply_command(a: &mut Arrangement) -> Result<Output, (i32, String)> {
 }
 
 /// `reset`: drop every track and stop the transport — the daemon is back to
-/// its fresh state, ready for a run-sheet to rebuild the arrangement.
+/// its fresh state, ready for a session script to rebuild the arrangement.
 fn reset_command(a: &mut Arrangement) -> Result<Output, (i32, String)> {
     let tracks = a.player.tracks().len();
     a.player.reset();
@@ -918,7 +918,7 @@ fn probe_arrangement(a: &Arrangement) -> Result<Output, (i32, String)> {
 }
 
 /// Parse a render range: `from-to`, `from-` (to the end), or empty for the
-/// whole program.
+/// whole arrangement.
 fn parse_range(s: &str) -> Result<(Duration, Option<Duration>), String> {
     let s = s.trim();
     if s.is_empty() {
@@ -1165,7 +1165,7 @@ fn connect_or_spawn(socket: &Path) -> Result<UnixStream, String> {
 // ---------------------------------------------------------------------------
 
 /// The daemon: bind the socket, serve commands, advance the clock, and exit
-/// (cleaning up the socket) when the program finishes or is stopped.
+/// (cleaning up the socket) when playback finishes or is stopped.
 fn daemon_main(socket: &Path) -> i32 {
     daemon_main_with(socket, AnyBackend::for_daemon())
 }
@@ -2050,7 +2050,7 @@ mod tests {
         let reply = send(&socket, "nope");
         assert_eq!(reply.lines().next().unwrap(), "2", "{reply}");
 
-        // A 0.4s program: play it, and the daemon cleans up on completion.
+        // A 0.4s arrangement: play it, and the daemon cleans up on completion.
         let reply = send(&socket, "play");
         assert!(reply.contains("playing from"), "{reply}");
         wait_until("cleanup", || !socket.exists());

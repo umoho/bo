@@ -1,4 +1,10 @@
-//! `bo` — a player whose arrangement is data.
+//! `bo` — an audio editor and mixer for agents.
+//!
+//! One command per action, from a shell or driven by an agent: build a
+//! session out of stacked tracks, each holding clips that slice an audio
+//! source; tune the mix; then audition it live or render it offline. Not a
+//! DAW yet — but this data model (`Source` → `Clip` → `Track` over a
+//! timeline) is the spine a CLI DAW would grow from.
 //!
 //! Two modules so far:
 //!

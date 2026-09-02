@@ -2,7 +2,9 @@
 name = "bo"
 version = "0.1.0"
 edition = "2024"
-description = "Arrange and play a radio program with commands — a player whose arrangement is data"
+description = "Audio editing and mixing for agents — one command per edit, audition or render; the spine of a future CLI DAW"
+keywords = ["audio", "daw", "cli", "agent", "mixer"]
+categories = ["command-line-interface", "multimedia::audio"]
 license = "BSD-3-Clause"
 repository = "https://github.com/umoho/bo"
 

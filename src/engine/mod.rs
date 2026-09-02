@@ -359,7 +359,7 @@ impl<B: Backend> Player<B> {
     ///
     /// The playhead is compared against the arrangement's known length; an
     /// arrangement containing an open-ended clip has no knowable length and
-    /// never finishes. Long-running callers use this to decide when a program
+    /// never finishes. Long-running callers use this to decide when playback
     /// is done.
     #[must_use]
     pub fn is_finished(&self) -> bool {

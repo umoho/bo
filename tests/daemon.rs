@@ -1,6 +1,6 @@
 //! End-to-end tests for the client ↔ daemon lifecycle, using the real `bo`
 //! binary: the first command auto-spawns a daemon, later invocations reach
-//! the same arrangement, and the daemon cleans up its socket when the program
+//! the same arrangement, and the daemon cleans up its socket when playback
 //! finishes.
 
 use std::path::{Path, PathBuf};
@@ -107,7 +107,7 @@ fn client_spawns_a_daemon_and_it_cleans_up_when_done() {
     let out = bo(&sp, &["set", "track.0.volume", "0.25"]);
     assert!(out.contains("track 0 volume 0.25"), "{out}");
 
-    // Play the 0.4s program: the daemon exits and removes its socket.
+    // Play the 0.4s arrangement: the daemon exits and removes its socket.
     let out = bo(&sp, &["play"]);
     assert!(out.contains("playing from"), "{out}");
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -288,14 +288,14 @@ fn at_reports_the_mix_at_a_timecode_over_the_wire() {
 }
 
 #[test]
-fn reset_clears_the_arrangement_for_a_run_sheet_replay() {
+fn reset_clears_the_arrangement_for_a_script_replay() {
     let dir = temp_dir();
     let socket = dir.join("d.sock");
     let sp = socket.to_string_lossy().into_owned();
     let prog = dir.join("prog.bo");
     let ps = prog.to_string_lossy().into_owned();
 
-    // Build a two-track program and save it as the run-sheet.
+    // Build a two-track mix and save it as a session script.
     let out = bo(&sp, &["put", "a.wav:00:00:00-00:00:10"]);
     assert!(out.contains("ok: track 0"), "{out}");
     let out = bo(&sp, &["put", "b.wav:00:00:00-00:00:05"]);
