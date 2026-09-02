@@ -595,10 +595,10 @@ mod tests {
         assert!((duration.as_secs_f64() - 10.0).abs() < 0.05);
         assert!((m.peak_db - (-6.02)).abs() < 0.05, "peak {}", m.peak_db);
         assert!((m.rms_db - (-9.03)).abs() < 0.05, "rms {}", m.rms_db);
-        // ffmpeg ebur128 reads a 440 Hz tone at −6.02 dBFS as −9.7 LUFS
-        // (K-weighting shelves above 1 kHz, so a 440 Hz tone sits ~0.7 LU
-        // below its RMS); calibrated against ffmpeg.
-        assert!((m.integrated_lufs.unwrap() - (-9.7)).abs() < 0.3, "lufs {:?}", m.integrated_lufs);
+        // ffmpeg ebur128 reads a 440 Hz stereo tone at −6.02 dBFS as
+        // −6.7 LUFS (channel-summed, K-weighting shelves above 1 kHz);
+        // calibrated against ffmpeg on amplitude-verified files.
+        assert!((m.integrated_lufs.unwrap() - (-6.7)).abs() < 0.3, "lufs {:?}", m.integrated_lufs);
         assert!(!dir.join("none.wav").exists());
 
         // Measure while writing: same numbers, plus a real file.

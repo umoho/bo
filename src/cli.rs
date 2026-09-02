@@ -48,8 +48,11 @@
 //!   volume and mute land on the next `play` or `apply`).
 //! * `take <track> <clip>` — remove a clip; the clip is addressed by its
 //!   stable id or an `@timecode` (the clip covering that moment).
-//! * `render <file> [from-to]` — mix the arrangement to a wav file,
-//!   offline; a range renders only that span.
+//! * `render [file] [from-to]` — mix the arrangement to a wav file,
+//!   offline; a range renders only that span. With `--measure` the reply
+//!   also reports the mix's peak/RMS/true peak and EBU R128 loudness,
+//!   folded from the exact stream the file writer consumes; omit the file
+//!   to measure the whole arrangement without writing.
 //! * `save <file>` / `load <file>` — write the arrangement as a script of
 //!   commands, or replace it from one (transport resets with the swap).
 //! * `reset` — drop every track and stop the transport: the daemon is back
@@ -93,7 +96,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use bo::engine::rodio::{check_sources, probe, probe_sources, render_to_file, Rodio};
+use bo::engine::rodio::{check_sources, probe, probe_sources, render_and_measure, render_to_file, Rodio};
 use bo::engine::{Backend, BackendError, Player, Silent, State};
 use bo::track::{Clip, Source, Track};
 use clap::error::ErrorKind;
@@ -156,12 +159,17 @@ enum Command {
         at: String,
     },
     /// Mix the arrangement to a wav file, offline; optionally only a range.
+    /// With `--measure`, also report peak/RMS/LUFS; omit the file to
+    /// measure the whole arrangement without writing.
     Render {
-        /// Output wav path.
-        file: String,
+        /// Output wav path; may be omitted with `--measure`.
+        file: Option<String>,
         /// Range to render: `from-to`, `from-`, or nothing for the whole
         /// arrangement.
         range: Option<String>,
+        /// Report peak/RMS/true peak and EBU R128 loudness of the mix.
+        #[arg(long)]
+        measure: bool,
     },
     /// Write the arrangement as a script of commands.
     Save {
@@ -351,8 +359,10 @@ Arrangement:
   ls                       dump the arrangement; a key: value status block,
                            then one key=value line per track and clip
   at <t>                   show what plays at track time t
-  render <file> [from-to]  mix the arrangement to a wav file; a range
+  render [file] [from-to]  mix the arrangement to a wav file; a range
                            renders only that span (from- to the end)
+                           --measure reports peak/RMS/true peak and EBU
+                           R128 loudness; omit the file to measure only
   save <file>              write the arrangement as a script
   load <file>              replace the arrangement from a script
   reset                    drop every track and stop; back to a fresh
@@ -569,14 +579,74 @@ fn dispatch(a: &mut Arrangement, command: Command) -> Result<Output, (i32, Strin
         Command::Apply => apply_command(a),
         Command::Set { var, value } => set_command(a, &var, &value),
         Command::Take { track, clip } => take_command(a, track, &clip),
-        Command::Render { file, range } => {
+        Command::Render {
+            file,
+            range,
+            measure,
+        } => {
             let (from, to) = match range {
                 Some(r) => parse_range(&r).map_err(usage)?,
                 None => (Duration::ZERO, None),
             };
-            let duration = render_to_file(a.player.tracks(), &file, from, to, a.player.volume())
-                .map_err(|e| fail(format!("render failed: {e}")))?;
-            Ok(Output::Rendered { file, duration })
+            match (file, measure) {
+                // A bare measure of the whole arrangement.
+                (None, true) => {
+                    if a.player.duration() == Some(Duration::ZERO) {
+                        return Err(fail("no clips: nothing to measure"));
+                    }
+                    let (duration, stats) =
+                        render_and_measure(a.player.tracks(), None, from, to, a.player.volume())
+                            .map_err(|e| fail(format!("render failed: {e}")))?;
+                    Ok(Output::Rendered {
+                        file: None,
+                        duration,
+                        stats: Some(stats),
+                    })
+                }
+                (Some(file), measure) => {
+                    // With --measure, a bare timecode in the file slot is
+                    // almost certainly a mistyped range.
+                    if measure
+                        && file.contains('-')
+                        && parse_range(&file).is_ok()
+                    {
+                        return Err(usage(format!(
+                            "{file:?} looks like a range; `render --measure` measures the whole \
+                             arrangement — to measure a range, write it: `render out.wav {file} \
+                             --measure`"
+                        )));
+                    }
+                    let (duration, stats) = if measure {
+                        render_and_measure(
+                            a.player.tracks(),
+                            Some(std::path::Path::new(&file)),
+                            from,
+                            to,
+                            a.player.volume(),
+                        )
+                        .map(|(d, m)| (d, Some(m)))
+                        .map_err(|e| fail(format!("render failed: {e}")))?
+                    } else {
+                        let d = render_to_file(
+                            a.player.tracks(),
+                            &file,
+                            from,
+                            to,
+                            a.player.volume(),
+                        )
+                        .map_err(|e| fail(format!("render failed: {e}")))?;
+                        (d, None)
+                    };
+                    Ok(Output::Rendered {
+                        file: Some(file),
+                        duration,
+                        stats,
+                    })
+                }
+                (None, false) => Err(usage(
+                    "render needs a wav path, or --measure to measure without writing",
+                )),
+            }
         }
         Command::Save { file } => {
             std::fs::write(&file, serialize(a))
@@ -999,10 +1069,23 @@ fn command_line(command: &Command) -> String {
         Command::Apply => "apply".to_string(),
         Command::Set { var, value } => format!("set {} {}", quote_arg(var), quote_arg(value)),
         Command::Take { track, clip } => format!("take {track} {}", quote_arg(clip)),
-        Command::Render { file, range } => match range {
-            Some(r) => format!("render {} {}", quote_arg(file), quote_arg(r)),
-            None => format!("render {}", quote_arg(file)),
-        },
+        Command::Render {
+            file,
+            range,
+            measure,
+        } => {
+            let mut line = String::from("render");
+            if let Some(f) = file {
+                let _ = write!(line, " {}", quote_arg(f));
+            }
+            if let Some(r) = range {
+                let _ = write!(line, " {}", quote_arg(r));
+            }
+            if *measure {
+                line.push_str(" --measure");
+            }
+            line
+        }
         Command::Save { file } => format!("save {}", quote_arg(file)),
         Command::Load { file } => format!("load {}", quote_arg(file)),
         Command::Reset => "reset".to_string(),
@@ -2029,6 +2112,77 @@ mod tests {
         assert_eq!(a.player.tracks().len(), 0, "the old arrangement was replaced");
         assert_eq!(a.player.state(), State::Stopped, "transport resets with the load");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn render_measure_only_reports_levels_without_writing() {
+        let dir = temp_dir();
+        let src = dir.join("a.wav");
+        write_test_wav(&src, 1.0, 0.5);
+        let spec = format!("{}:00:00:00-00:00:01", src.to_string_lossy());
+        let mut a = Arrangement::default();
+        run_ok(&mut a, &["put", &spec]);
+
+        let render = parse_command(&["render".to_string(), "--measure".to_string()]).unwrap();
+        let reply = dispatch(&mut a, render).unwrap().to_string();
+        assert!(reply.starts_with("measure: 00:00:01.000"), "{reply}");
+        assert!(reply.contains("peak: -6.0 dBFS"), "{reply}");
+        assert!(reply.contains("rms: -9.0 dBFS"), "{reply}");
+        assert!(reply.contains("true_peak:"), "{reply}");
+        assert!(reply.contains("loudest_1s:"), "{reply}");
+        assert!(reply.contains("note: span under 3s"), "under 3 s, no LUFS: {reply}");
+        assert!(!reply.contains("integrated:"), "no LUFS under 3 s: {reply}");
+        // Nothing was written.
+        assert!(!dir.join("out.wav").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn render_with_measure_writes_and_reports() {
+        let dir = temp_dir();
+        let src = dir.join("a.wav");
+        write_test_wav(&src, 0.5, 0.5);
+        let spec = format!("{}:00:00:00-00:00:00.500", src.to_string_lossy());
+        let out = dir.join("out.wav");
+        let out_s = out.to_string_lossy().into_owned();
+        let mut a = Arrangement::default();
+        run_ok(&mut a, &["put", &spec]);
+        let render = parse_command(&[
+            "render".to_string(),
+            out_s.clone(),
+            "--measure".to_string(),
+        ])
+        .unwrap();
+        let reply = dispatch(&mut a, render).unwrap().to_string();
+        assert!(reply.starts_with("rendered"), "{reply}");
+        assert!(reply.contains("rms:"), "{reply}");
+        assert!(out.exists(), "the file was still written");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn measure_only_refuses_an_empty_arrangement() {
+        let mut a = Arrangement::default();
+        let render = parse_command(&["render".to_string(), "--measure".to_string()]).unwrap();
+        let (code, msg) = dispatch(&mut a, render).unwrap_err();
+        assert_eq!(code, 1);
+        assert!(msg.contains("no clips: nothing to measure"), "{msg}");
+    }
+
+    #[test]
+    fn render_without_file_or_measure_is_usage() {
+        let mut a = Arrangement::default();
+        let render = parse_command(&["render".to_string()]).unwrap();
+        let (code, msg) = dispatch(&mut a, render).unwrap_err();
+        assert_eq!(code, 2);
+        assert!(msg.contains("--measure"), "{msg}");
+        // A bare range in the file slot is caught with guidance.
+        run_ok(&mut a, &["put", "a.wav:00:00:00-00:00:10"]);
+        let render = parse_command(&["render".to_string(), "0-3".to_string(), "--measure".to_string()])
+            .unwrap();
+        let (code, msg) = dispatch(&mut a, render).unwrap_err();
+        assert_eq!(code, 2);
+        assert!(msg.contains("looks like a range"), "{msg}");
     }
 
     #[test]

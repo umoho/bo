@@ -3,15 +3,16 @@
 //!
 //! Per-channel K-weighting (a high-shelf followed by the RLB high-pass,
 //! biquads derived from the published analog constants), then 400 ms blocks
-//! whose mean-square loudness is the *mean over channels* of each channel's
-//! per-sample mean square — the convention ffmpeg's ebur128 reports
-//! (dual-mono content reads the same as the mono original). From the block
-//! series: momentary max (400 ms), a short-term series (3 s windows, 400 ms
-//! hops, exact via prefix sums) for the short-term max and LRA (10th/95th
-//! percentiles), and the integrated value with the −70 LUFS absolute gate
-//! and the −10 LU relative gate of R128.
+//! whose loudness sums the per-channel mean squares (BS.1770-4 channel
+//! weights), so a tone on both channels reads 3.01 LU above the mono
+//! original — ffmpeg's ebur128 agrees. From the block series: momentary max
+//! (400 ms), a short-term series (3 s windows, 400 ms hops, exact via
+//! prefix sums) for the short-term max and LRA (10th/95th percentiles), and
+//! the integrated value with the −70 LUFS absolute gate and the −10 LU
+//! relative gate of R128.
 //!
-//! Calibrated against ffmpeg ebur128 on 1 kHz sines and pink noise; tests
+//! Calibrated against ffmpeg ebur128 on amplitude-verified tones: a
+//! full-scale 1 kHz stereo tone reads 0.0 LUFS, 440 Hz reads −0.7; tests
 //! pin the anchors.
 
 /// One block's worth of K-weighted energy, per channel.
@@ -155,9 +156,10 @@ impl R128 {
     }
 
     fn block_loudness(&self, frames: u64, sum_sq: f64) -> Option<f64> {
-        // Mean over channels of per-sample mean square, in LUFS: the −0.691
-        // calibration offset of BS.1770 plus the K-weighted power.
-        let power = sum_sq / (frames as f64 * self.channels as f64);
+        // Per-sample mean square summed over channels (BS.1770-4 weights),
+        // in LUFS with the −0.691 calibration offset. A full-scale 1 kHz
+        // stereo tone reads 0.0 LUFS; 440 Hz reads −0.7 (ffmpeg ebur128).
+        let power = sum_sq / frames as f64;
         if power <= 0.0 {
             None
         } else {
@@ -256,7 +258,7 @@ impl R128 {
     }
 
     fn loudness_of(&self, frames: u64, sum_sq: f64) -> Option<f64> {
-        let power = sum_sq / (frames as f64 * self.channels as f64);
+        let power = sum_sq / frames as f64;
         if power > 0.0 {
             Some(-0.691 + 10.0 * power.log10())
         } else {
@@ -338,13 +340,19 @@ mod tests {
 
     #[test]
     fn one_khz_sines_match_ffmpeg_ebur128() {
-        // ffmpeg ebur128 anchors (measured): 0 dBFS -> -3.0, -20 dBFS -> -23.0.
+        // ffmpeg ebur128 anchors (measured on amplitude-verified files): a
+        // full-scale 1 kHz stereo tone reads 0.0 LUFS, −20 dBFS reads −20.0.
         let m = r128_of(&stereo_sine(10.0, 1000.0, 1.0, 44100), 2, 44100);
         let i = m.integrated().unwrap();
-        assert!((i - (-3.0)).abs() < 0.3, "0 dBFS 1k integrated {i}");
+        assert!((i - 0.0).abs() < 0.2, "0 dBFS 1k integrated {i}");
         let m = r128_of(&stereo_sine(10.0, 1000.0, 0.1, 44100), 2, 44100);
         let i = m.integrated().unwrap();
-        assert!((i - (-23.0)).abs() < 0.3, "-20 dBFS 1k integrated {i}");
+        assert!((i - (-20.0)).abs() < 0.2, "-20 dBFS 1k integrated {i}");
+        // 440 Hz sits ~0.7 LU below 1 kHz under K-weighting (ffmpeg reads a
+        // full-scale 440 Hz tone at −0.7 LUFS).
+        let m = r128_of(&stereo_sine(10.0, 440.0, 1.0, 44100), 2, 44100);
+        let i = m.integrated().unwrap();
+        assert!((i - (-0.7)).abs() < 0.2, "0 dBFS 440 Hz integrated {i}");
         // Short-term and momentary agree on a constant tone; LRA ~ 0.
         assert!((m.momentary_max().unwrap() - i).abs() < 0.1);
         assert!((m.short_term_max().unwrap() - i).abs() < 0.1);
@@ -352,14 +360,15 @@ mod tests {
     }
 
     #[test]
-    fn mono_and_duplicated_stereo_read_the_same() {
-        let dup = r128_of(&stereo_sine(10.0, 1000.0, 0.5, 44100), 2, 44100);
-        // The mono feed is the same sine, single channel.
+    fn duplicated_stereo_is_three_db_louder_than_mono() {
+        // BS.1770 sums channel energy: the same tone on both channels reads
+        // 3.01 LU louder than mono.
         let s = stereo_sine(10.0, 1000.0, 0.5, 44100);
         let mono_s: Vec<f32> = s.iter().step_by(2).copied().collect();
         let mono = r128_of(&mono_s, 1, 44100);
-        let (a, b) = (mono.integrated().unwrap(), dup.integrated().unwrap());
-        assert!((a - b).abs() < 0.05, "mono {a} vs dup {b}");
+        let dup = r128_of(&s, 2, 44100);
+        let d = dup.integrated().unwrap() - mono.integrated().unwrap();
+        assert!((d - 3.01).abs() < 0.05, "stereo/mono gap {d}");
     }
 
     #[test]

@@ -135,8 +135,9 @@ pub(crate) enum Output {
         uri: String,
     },
     Rendered {
-        file: String,
+        file: Option<String>,
         duration: Duration,
+        stats: Option<bo::engine::measure::Measurement>,
     },
     Saved {
         file: String,
@@ -223,8 +224,41 @@ impl fmt::Display for Output {
             Self::Removed { track, id, uri } => {
                 writeln!(f, "removed track {track} clip #{id} {uri}")
             }
-            Self::Rendered { file, duration } => {
-                writeln!(f, "rendered {file} ({})", Tc(*duration))
+            Self::Rendered {
+                file,
+                duration,
+                stats,
+            } => {
+                match file {
+                    Some(file) => writeln!(f, "rendered {file} ({})", Tc(*duration))?,
+                    None => writeln!(f, "measure: {}", Tc(*duration))?,
+                }
+                if let Some(m) = stats {
+                    let db = |v: f32| format!("{v:.1} dBFS");
+                    writeln!(f, "peak: {}", db(m.peak_db))?;
+                    writeln!(f, "true_peak: {}", db(m.true_peak_db))?;
+                    writeln!(f, "rms: {}", db(m.rms_db))?;
+                    let mut lufs_line = |name: &str, v: Option<f32>, unit: &str| match v {
+                        Some(v) => writeln!(f, "{name}: {v:.1} {unit}"),
+                        None => Ok(()),
+                    };
+                    lufs_line("integrated", m.integrated_lufs, "LUFS")?;
+                    lufs_line("momentary_max", m.momentary_max_lufs, "LUFS")?;
+                    lufs_line("short_term_max", m.short_term_max_lufs, "LUFS")?;
+                    lufs_line("lra", m.lra, "LU")?;
+                    if let Some(t) = m.loudest_1s {
+                        writeln!(f, "loudest_1s: {}", Tc(t))?;
+                    }
+                    if let Some(t) = m.quietest_1s {
+                        writeln!(f, "quietest_1s: {}", Tc(t))?;
+                    }
+                    if m.integrated_lufs.is_none()
+                        && m.span < std::time::Duration::from_secs(3)
+                    {
+                        writeln!(f, "note: span under 3s, too short for LUFS")?;
+                    }
+                }
+                Ok(())
             }
             Self::Saved { file } => writeln!(f, "saved {file}"),
             Self::Loaded { file } => writeln!(f, "loaded {file}"),
