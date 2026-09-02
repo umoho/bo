@@ -566,7 +566,7 @@ fn dispatch(a: &mut Arrangement, command: Command) -> Result<Output, (i32, Strin
                 Some(r) => parse_range(&r).map_err(usage)?,
                 None => (Duration::ZERO, None),
             };
-            let duration = render_to_file(a.player.tracks(), &file, from, to)
+            let duration = render_to_file(a.player.tracks(), &file, from, to, a.player.volume())
                 .map_err(|e| fail(format!("render failed: {e}")))?;
             Ok(Output::Rendered { file, duration })
         }

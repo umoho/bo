@@ -146,10 +146,12 @@ fn build_mix(
 /// Mix the arrangement down to a wav file, offline — no device needed.
 ///
 /// The same [`Timeline`] as playback, but each track becomes a finite,
-/// sequentially chained source at the track's gain on a 44.1 kHz stereo
-/// mixer, and the mix is pulled until every source is done. Renders from
-/// `from` (entering the current clip mid-way); an optional `to` cuts the
-/// plan short. Returns the rendered duration.
+/// sequentially chained source at `track.gain() × master` on a 44.1 kHz
+/// stereo mixer, and the mix is pulled until every source is done. Renders
+/// from `from` (entering the current clip mid-way); an optional `to` cuts
+/// the plan short. `master` scales every track exactly as realtime playback
+/// does, so a rendered file sounds like the session. Returns the rendered
+/// duration.
 ///
 /// Unlike playback this does not use `Player` queues: those stay alive with
 /// silence when empty (right for a device, infinite for a render).
@@ -158,6 +160,7 @@ pub fn render_to_file(
     path: impl AsRef<std::path::Path>,
     from: Duration,
     to: Option<Duration>,
+    master: f32,
 ) -> Result<Duration, String> {
     let mut timeline = Timeline::plan(tracks, from, probe)?;
     if let Some(to) = to {
@@ -166,7 +169,7 @@ pub fn render_to_file(
     }
     let (input, source) = mixer::mixer(nz!(2), nz!(44100));
     for track in timeline.tracks() {
-        let gain = if track.muted() { 0.0 } else { track.gain() };
+        let gain = if track.muted() { 0.0 } else { track.gain() * master };
         let mut pending: Vec<Box<dyn Source + Send>> = Vec::new();
         for clip in track.clips() {
             pending.push(Box::new(make_source(clip)?));
@@ -184,18 +187,22 @@ pub fn render_to_file(
 /// streamed, so there is nothing to pause or resume.
 pub struct Renderer {
     path: std::path::PathBuf,
+    master: f32,
 }
 
 impl Renderer {
-    /// Render to `path` (overwritten if it exists).
+    /// Render to `path` (overwritten if it exists), at full master gain.
     pub fn new(path: impl Into<std::path::PathBuf>) -> Self {
-        Self { path: path.into() }
+        Self {
+            path: path.into(),
+            master: 1.0,
+        }
     }
 }
 
 impl Backend for Renderer {
     fn play(&mut self, tracks: &[Track], at: Duration) -> Result<(), BackendError> {
-        render_to_file(tracks, &self.path, at, None)
+        render_to_file(tracks, &self.path, at, None, self.master)
             .map_err(|e| BackendError::new("render", e))?;
         Ok(())
     }
@@ -206,7 +213,9 @@ impl Backend for Renderer {
 
     fn stop(&mut self) {}
 
-    fn set_volume(&mut self, _volume: f32) {}
+    fn set_volume(&mut self, volume: f32) {
+        self.master = volume;
+    }
 }
 
 /// Scales every sample by a fixed factor — a track's gain in the mix.
@@ -354,7 +363,7 @@ mod tests {
         voice.set_volume(0.5);
 
         let out = dir.join("out.wav");
-        let duration = render_to_file(&[bed, voice], &out, Duration::ZERO, None).unwrap();
+        let duration = render_to_file(&[bed, voice], &out, Duration::ZERO, None, 1.0).unwrap();
         assert_eq!(duration, Duration::from_millis(1500), "end of the last clip");
 
         let decoder = Decoder::new(BufReader::new(File::open(&out).unwrap())).unwrap();
@@ -404,17 +413,45 @@ mod tests {
         silent.set_muted(true);
 
         let out = dir.join("out.wav");
-        render_to_file(&[loud.clone(), silent.clone()], &out, Duration::ZERO, None).unwrap();
+        render_to_file(&[loud.clone(), silent.clone()], &out, Duration::ZERO, None, 1.0).unwrap();
         let decoder = Decoder::new(BufReader::new(File::open(&out).unwrap())).unwrap();
         let (peak, samples) = decoder.fold((0.0f32, 0u64), |(peak, n), s| (peak.max(s.abs()), n + 1));
         assert!(samples > 1000, "rendered a real mix, not a stub");
         assert!(peak > 0.1, "the loud track is audible, peak {peak}");
 
         let out = dir.join("out-muted.wav");
-        render_to_file(&[silent], &out, Duration::ZERO, None).unwrap();
+        render_to_file(&[silent], &out, Duration::ZERO, None, 1.0).unwrap();
         let decoder = Decoder::new(BufReader::new(File::open(&out).unwrap())).unwrap();
         let (peak, _) = decoder.fold((0.0f32, 0u64), |(peak, n), s| (peak.max(s.abs()), n + 1));
         assert!(peak < 1e-6, "a muted track contributes nothing, peak {peak}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn render_applies_the_master_gain() {
+        // Regression: master used to be playback-only; a render ignored it,
+        // so `set master 0.25` and `set master 1.0` produced identical files.
+        let dir = std::env::temp_dir().join(format!("bo-render-master-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.wav");
+        write_wav(&a, 0.5, 440.0, 0.5);
+        let mut track = Track::named("bed");
+        track.insert(clip_at(a.to_str().unwrap(), 0, 1)).unwrap();
+
+        let full = dir.join("full.wav");
+        let quarter = dir.join("quarter.wav");
+        render_to_file(&[track.clone()], &full, Duration::ZERO, None, 1.0).unwrap();
+        render_to_file(&[track], &quarter, Duration::ZERO, None, 0.25).unwrap();
+
+        let peak = |path: &std::path::Path| {
+            let decoder = Decoder::new(BufReader::new(File::open(path).unwrap())).unwrap();
+            decoder.fold((0.0f32, 0u64), |(peak, n), s| (peak.max(s.abs()), n + 1)).0
+        };
+        let ratio = peak(&quarter) / peak(&full);
+        assert!(
+            (ratio - 0.25).abs() < 0.02,
+            "master scales the mix: quarter/full peak ratio {ratio}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
