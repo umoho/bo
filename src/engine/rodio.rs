@@ -304,11 +304,12 @@ mod tests {
 
     /// A mono 16-bit PCM wav with a sine at `amp` amplitude.
     fn write_wav(path: &std::path::Path, seconds: f32, freq: f32, amp: f32) {
-        write_wav_full(path, seconds, freq, amp, 44_100, 1)
+        write_wav_full(path, seconds, freq, amp, 44_100, 1, 16)
     }
 
-    /// A 16-bit PCM wav at `rate` Hz with `channels` interleaved channels,
-    /// a sine at `freq` and `amp` amplitude on every channel.
+    /// A PCM wav at `rate` Hz with `channels` interleaved channels and
+    /// `bits` per sample (16 or 24; 32 = IEEE float), a sine at `freq` and
+    /// `amp` amplitude on every channel.
     fn write_wav_full(
         path: &std::path::Path,
         seconds: f32,
@@ -316,17 +317,27 @@ mod tests {
         amp: f32,
         rate: u32,
         channels: u16,
+        bits: u16,
     ) {
         let frames = (rate as f32 * seconds) as usize;
-        let mut data = Vec::with_capacity(frames * channels as usize * 2);
+        let bytes = u32::from(bits) / 8;
+        let fmt_tag: u16 = if bits == 32 { 3 } else { 1 };
+        let mut data = Vec::with_capacity(frames * channels as usize * bytes as usize);
         for i in 0..frames {
-            let v = (amp * (2.0 * std::f32::consts::PI * freq * i as f32 / rate as f32).sin()
-                * 32767.0) as i16;
+            let v = amp * (2.0 * std::f32::consts::PI * freq * i as f32 / rate as f32).sin();
             for _ in 0..channels {
-                data.extend_from_slice(&v.to_le_bytes());
+                match bits {
+                    16 => data.extend_from_slice(&((v * 32767.0) as i16).to_le_bytes()),
+                    24 => {
+                        let s = (v * 8_388_607.0) as i32;
+                        data.extend_from_slice(&s.to_le_bytes()[..3]);
+                    }
+                    32 => data.extend_from_slice(&v.to_le_bytes()),
+                    _ => unreachable!(),
+                }
             }
         }
-        let block_align = channels * 2;
+        let block_align = channels * bytes as u16;
         let byte_rate = rate * u32::from(block_align);
         let mut wav = Vec::new();
         wav.extend_from_slice(b"RIFF");
@@ -334,12 +345,12 @@ mod tests {
         wav.extend_from_slice(b"WAVE");
         wav.extend_from_slice(b"fmt ");
         wav.extend_from_slice(&16u32.to_le_bytes());
-        wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        wav.extend_from_slice(&fmt_tag.to_le_bytes());
         wav.extend_from_slice(&channels.to_le_bytes());
         wav.extend_from_slice(&rate.to_le_bytes());
         wav.extend_from_slice(&byte_rate.to_le_bytes());
         wav.extend_from_slice(&block_align.to_le_bytes());
-        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(&bits.to_le_bytes());
         wav.extend_from_slice(b"data");
         wav.extend_from_slice(&(data.len() as u32).to_le_bytes());
         wav.extend_from_slice(&data);
@@ -475,17 +486,23 @@ mod tests {
     fn render_duration_matches_probe_at_any_sample_rate() {
         // Reported: a 48 kHz source probed at 1.0 s rendered ~0.5 s with no
         // warning anywhere (probe, check, render all silent). Probe and
-        // render must agree whatever the source rate or channel count; the
-        // offline mixer resamples everything to 44.1 kHz stereo.
+        // render must agree whatever the source rate, channel count or bit
+        // depth; the offline mixer resamples everything to 44.1 kHz stereo.
         let dir = std::env::temp_dir().join(format!("bo-render-rate-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        for (rate, channels) in [(44_100u32, 1u16), (48_000, 1), (48_000, 2)] {
-            let a = dir.join(format!("a-{rate}-{channels}.wav"));
-            write_wav_full(&a, 1.0, 440.0, 0.5, rate, channels);
+        for (rate, channels, bits) in [
+            (44_100u32, 1u16, 16u16),
+            (48_000, 1, 16),
+            (48_000, 2, 16),
+            (48_000, 2, 24),
+            (48_000, 2, 32), // IEEE float
+        ] {
+            let a = dir.join(format!("a-{rate}-{channels}-{bits}.wav"));
+            write_wav_full(&a, 1.0, 440.0, 0.5, rate, channels, bits);
             let probed = probe(a.to_str().unwrap()).unwrap();
             assert!(
                 (probed.as_secs_f64() - 1.0).abs() < 0.05,
-                "{rate} Hz {channels}ch probed {probed:?}"
+                "{rate} Hz {channels}ch {bits}bit probed {probed:?}"
             );
             let mut track = Track::named("a");
             track.insert(Clip::new(Arc::new(Source {
@@ -493,13 +510,13 @@ mod tests {
                 duration: Some(probed),
             })))
             .unwrap();
-            let out = dir.join(format!("out-{rate}-{channels}.wav"));
+            let out = dir.join(format!("out-{rate}-{channels}-{bits}.wav"));
             render_to_file(&[track], &out, Duration::ZERO, None, 1.0).unwrap();
             let decoder = Decoder::new(BufReader::new(File::open(&out).unwrap())).unwrap();
             let total = decoder.total_duration().unwrap();
             assert!(
                 (total.as_secs_f64() - 1.0).abs() < 0.05,
-                "{rate} Hz {channels}ch rendered {total:?}, expected ~1.0 s"
+                "{rate} Hz {channels}ch {bits}bit rendered {total:?}, expected ~1.0 s"
             );
         }
         std::fs::remove_dir_all(&dir).ok();
