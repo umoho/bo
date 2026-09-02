@@ -99,6 +99,10 @@ use bo::track::{Clip, Source, Track};
 use clap::error::ErrorKind;
 use clap::{Parser, Subcommand};
 
+mod reply;
+
+use reply::{AtLine, Ls, LsClip, LsTrack, Output, PlacedClip, ProbeResult, SetResult, Tc};
+
 /// bo — arrange and play a radio program.
 #[derive(Debug, Parser)]
 #[command(
@@ -440,14 +444,9 @@ fn parse_timecode(s: &str) -> Result<Duration, String> {
     Ok(Duration::from_secs_f64(total))
 }
 
-/// Format a duration as `HH:MM:SS.fff`. Exact integer math, no floats.
+/// Format a duration as `HH:MM:SS.fff` (delegates to [`reply::Tc`]).
 fn format_time(d: Duration) -> String {
-    let total_ms = d.as_secs().saturating_mul(1000) + u64::from(d.subsec_millis());
-    let ms = total_ms % 1000;
-    let s = (total_ms / 1000) % 60;
-    let m = (total_ms / 60_000) % 60;
-    let h = total_ms / 3_600_000;
-    format!("{h:02}:{m:02}:{s:02}.{ms:03}")
+    Tc(d).to_string()
 }
 
 /// Parse a clip spec into its pieces. See the module docs for the grammar.
@@ -536,28 +535,28 @@ fn parse_command(args: &[String]) -> Result<Command, clap::Error> {
 }
 
 /// Run a parsed subcommand against the arrangement.
-fn dispatch(a: &mut Arrangement, command: Command) -> Result<String, (i32, String)> {
+fn dispatch(a: &mut Arrangement, command: Command) -> Result<Output, (i32, String)> {
     match command {
         Command::Put { spec, track, repeat } => put_command(a, &spec, track, repeat),
         Command::Play => play_command(a),
-        Command::Ls => Ok(format_arrangement(a)),
+        Command::Ls => Ok(Output::Ls(arrangement_view(a))),
         Command::At { at } => at_command(a, &at),
         Command::Pause => {
             a.player.pause();
-            Ok(format!("paused at {}\n", format_time(a.player.playhead())))
+            Ok(Output::Paused { at: a.player.playhead() })
         }
         Command::Resume => {
             a.player.resume().map_err(|e| fail(e.to_string()))?;
-            Ok(format!("playing from {}\n", format_time(a.player.playhead())))
+            Ok(Output::Resumed { at: a.player.playhead() })
         }
         Command::Stop => {
             a.player.stop();
-            Ok("stopped\n".to_string())
+            Ok(Output::Stopped)
         }
         Command::Seek { at } => {
             let t = parse_timecode(&at).map_err(usage)?;
             a.player.seek(t).map_err(|e| fail(e.to_string()))?;
-            Ok(format!("playhead at {}\n", format_time(t)))
+            Ok(Output::Seeked { at: t })
         }
         Command::Apply => apply_command(a),
         Command::Set { var, value } => set_command(a, &var, &value),
@@ -569,12 +568,12 @@ fn dispatch(a: &mut Arrangement, command: Command) -> Result<String, (i32, Strin
             };
             let duration = render_to_file(a.player.tracks(), &file, from, to)
                 .map_err(|e| fail(format!("render failed: {e}")))?;
-            Ok(format!("rendered {file} ({})\n", format_time(duration)))
+            Ok(Output::Rendered { file, duration })
         }
         Command::Save { file } => {
             std::fs::write(&file, serialize(a))
                 .map_err(|e| fail(format!("cannot write {file}: {e}")))?;
-            Ok(format!("saved {file}\n"))
+            Ok(Output::Saved { file })
         }
         Command::Load { file } => {
             let text = std::fs::read_to_string(&file)
@@ -584,21 +583,17 @@ fn dispatch(a: &mut Arrangement, command: Command) -> Result<String, (i32, Strin
             let mut fresh = Arrangement::default();
             run_script(&mut fresh, &text, &file).map_err(fail)?;
             *a = fresh;
-            Ok(format!("loaded {file}\n"))
+            Ok(Output::Loaded { file })
         }
         Command::Reset => reset_command(a),
         Command::Check => {
+            let clips: usize = a.player.tracks().iter().map(Track::len).sum();
             let problems = check_sources(a.player.tracks());
             if problems.is_empty() {
-                let clips: usize = a.player.tracks().iter().map(Track::len).sum();
-                Ok(format!("check: {clips} clips, all sources ok\n"))
+                Ok(Output::Check { clips, problems })
             } else {
-                let noun = if problems.len() == 1 { "problem" } else { "problems" };
-                let mut out = format!("check: {} {noun}\n", problems.len());
-                for problem in &problems {
-                    let _ = writeln!(out, "  - {problem}");
-                }
-                Err((1, out))
+                let out = Output::Check { clips, problems };
+                Err((1, out.to_string()))
             }
         }
         Command::Probe { uri } => match uri {
@@ -607,83 +602,69 @@ fn dispatch(a: &mut Arrangement, command: Command) -> Result<String, (i32, Strin
         },
         // Help is handled locally by the client; this arm keeps a stray
         // "help" line over the socket harmless.
-        Command::Help => Ok(HELP.to_string()),
+        Command::Help => Ok(Output::Text(HELP)),
         Command::Daemon => Err(fail("the daemon runs standalone, not over the socket")),
     }
 }
 
-/// The whole arrangement as machine-readable text: a `key: value` status
-/// block (state, playhead, end, backend, master volume, track count), then
-/// one line per track and per clip of `key=value` tokens. Row labels are
-/// stable (`player`-level keys, `track N:`, `clip N:`), so parsers can grep
-/// by prefix and keys never move position.
-fn format_arrangement(a: &Arrangement) -> String {
+/// The arrangement as data for `ls`: a `key: value` status block (state,
+/// playhead, end, backend, master volume, track count), then one line per
+/// track and per clip of `key=value` tokens. Row labels are stable
+/// (`player`-level keys, `track N:`, `clip N:`), so parsers can grep by
+/// prefix and keys never move position.
+fn arrangement_view(a: &Arrangement) -> Ls {
     let p = &a.player;
-    let end = p.duration().map(format_time).unwrap_or_else(|| "inf".into());
-    let mut out = format!(
-        "state: {}\nplayhead: {}\nend: {end}\nbackend: {}\nvolume: {:.2}\ntracks: {}\n",
-        p.state(),
-        format_time(p.playhead()),
-        p.backend().name(),
-        p.volume(),
-        p.tracks().len()
-    );
-    for (ti, t) in p.tracks().iter().enumerate() {
-        let dur = t.duration().map(format_time).unwrap_or_else(|| "inf".into());
-        let mute = if t.muted() { " muted" } else { "" };
-        let name = match t.name() {
-            Some(name) => format!("name={name} "),
-            None => String::new(),
-        };
-        let _ = writeln!(
-            out,
-            "track {ti}: {name}volume={:.2}{mute} clips={} end={dur}",
-            t.volume(),
-            t.len()
-        );
-        for c in t.clips() {
-            let end = c.end().map(format_time).unwrap_or_else(|| "inf".into());
-            let src_to = c
-                .to
-                .or(c.source.duration)
-                .map(format_time)
-                .unwrap_or_else(|| "inf".into());
-            let _ = writeln!(
-                out,
-                "  clip {}: uri={} at={} end={end} src={}-{src_to}",
-                c.id,
-                c.source.uri,
-                format_time(c.at),
-                format_time(c.from)
-            );
-        }
+    Ls {
+        state: p.state(),
+        playhead: p.playhead(),
+        end: p.duration(),
+        backend: p.backend().name(),
+        volume: p.volume(),
+        tracks: p
+            .tracks()
+            .iter()
+            .map(|t| LsTrack {
+                name: t.name().map(str::to_string),
+                volume: t.volume(),
+                muted: t.muted(),
+                end: t.duration(),
+                clips: t
+                    .clips()
+                    .iter()
+                    .map(|c| LsClip {
+                        id: c.id,
+                        uri: c.source.uri.clone(),
+                        at: c.at,
+                        end: c.end(),
+                        from: c.from,
+                        src_to: c.to.or(c.source.duration),
+                    })
+                    .collect(),
+            })
+            .collect(),
     }
-    out
 }
 
 /// `at <t>`: the mix at track time `t` — every clip covering that moment,
 /// one per track, or a `silent at ...` line when nothing plays there.
-fn at_command(a: &Arrangement, at_arg: &str) -> Result<String, (i32, String)> {
+fn at_command(a: &Arrangement, at_arg: &str) -> Result<Output, (i32, String)> {
     let t = parse_timecode(at_arg).map_err(usage)?;
-    let mut out = String::new();
-    for (ti, track) in a.player.tracks().iter().enumerate() {
-        let Some(clip) = track.clips().iter().find(|c| c.covers(t)) else {
-            continue;
-        };
-        let end = clip.end().map(format_time).unwrap_or_else(|| "inf".into());
-        let _ = writeln!(
-            out,
-            "track {ti}: clip={} uri={} at={} end={end}",
-            clip.id,
-            clip.source.uri,
-            format_time(clip.at)
-        );
-    }
-    if out.is_empty() {
-        Ok(format!("silent at {}\n", format_time(t)))
-    } else {
-        Ok(out)
-    }
+    let active: Vec<AtLine> = a
+        .player
+        .tracks()
+        .iter()
+        .enumerate()
+        .filter_map(|(ti, track)| {
+            track.clips().iter().find(|c| c.covers(t)).map(|c| AtLine {
+                track: ti,
+                id: c.id,
+                uri: c.source.uri.clone(),
+                at: c.at,
+                end: c.end(),
+            })
+        })
+        .collect();
+    Ok(Output::At { at: t, active })
 }
 
 /// `take <track> <clip>`: remove a clip from a track. The clip is addressed
@@ -693,7 +674,7 @@ fn take_command(
     a: &mut Arrangement,
     track_index: usize,
     clip_arg: &str,
-) -> Result<String, (i32, String)> {
+) -> Result<Output, (i32, String)> {
     let t = a
         .player
         .tracks_mut()
@@ -710,10 +691,11 @@ fn take_command(
         )));
     };
     match id.and_then(|id| t.remove(id)) {
-        Some(clip) => Ok(format!(
-            "removed track {track_index} clip #{} {}\n",
-            clip.id, clip.source.uri
-        )),
+        Some(clip) => Ok(Output::Removed {
+            track: track_index,
+            id: clip.id,
+            uri: clip.source.uri.clone(),
+        }),
         None => Err(fail(format!("no clip {track_index}#{clip_arg}"))),
     }
 }
@@ -730,7 +712,7 @@ fn put_command(
     spec_arg: &str,
     want_track: Option<usize>,
     repeat: Option<u32>,
-) -> Result<String, (i32, String)> {
+) -> Result<Output, (i32, String)> {
     let repeat = repeat.unwrap_or(1);
     if repeat == 0 {
         return Err(usage("repeat must be at least 1"));
@@ -776,7 +758,7 @@ fn put_command(
             )));
         }
     }
-    let mut out = String::new();
+    let mut placed_clips = Vec::new();
     for c in clips {
         let id = a.player.tracks_mut()[track_index]
             .insert(c)
@@ -786,22 +768,24 @@ fn put_command(
             .iter()
             .find(|x| x.id == id)
             .expect("the inserted clip is in the track");
-        let open = if placed.duration().is_none() { " (open-ended)" } else { "" };
-        let _ = writeln!(
-            out,
-            "ok: track {track_index} clip #{id} {} @ {}{open}",
-            placed.source.uri,
-            format_time(placed.at)
-        );
+        placed_clips.push(PlacedClip {
+            id,
+            uri: placed.source.uri.clone(),
+            at: placed.at,
+            open_ended: placed.duration().is_none(),
+        });
     }
-    Ok(out)
+    Ok(Output::Put {
+        track: track_index,
+        clips: placed_clips,
+    })
 }
 
 /// `play`: refuse an arrangement with nothing to play, then start playback
 /// from the current playhead. The session line tells the caller what is
 /// about to play; the daemon's clock loop advances the playhead and exits
 /// when the program is done.
-fn play_command(a: &mut Arrangement) -> Result<String, (i32, String)> {
+fn play_command(a: &mut Arrangement) -> Result<Output, (i32, String)> {
     // An empty arrangement (or one whose clips are all zero-length) would
     // finish instantly: refuse before touching the transport, so the daemon
     // neither fakes success nor tears itself down.
@@ -810,55 +794,52 @@ fn play_command(a: &mut Arrangement) -> Result<String, (i32, String)> {
     }
     let tracks = a.player.tracks().iter().filter(|t| !t.is_empty()).count();
     let clips: usize = a.player.tracks().iter().map(Track::len).sum();
-    let end = a.player
-        .duration()
-        .map(format_time)
-        .unwrap_or_else(|| "inf".into());
-    let mut out = format!(
-        "session: {tracks} tracks | {clips} clips | ends {end} | backend {}\n",
-        a.player.backend().name()
-    );
+    let end = a.player.duration();
+    let backend = a.player.backend().name();
     a.player.play().map_err(|e| fail(e.to_string()))?;
-    let _ = writeln!(out, "playing from {}", format_time(a.player.playhead()));
-    if let Some(note) = a.player.backend().note() {
-        let _ = writeln!(out, "({note})");
-    }
-    Ok(out)
+    let playhead = a.player.playhead();
+    let note = a.player.backend().note().map(str::to_string);
+    Ok(Output::Session {
+        tracks,
+        clips,
+        end,
+        backend,
+        playhead,
+        note,
+    })
 }
 
 /// `apply`: rebuild the running transport from the current playhead, so
 /// pending mix changes (volume, mute) take effect now.
-fn apply_command(a: &mut Arrangement) -> Result<String, (i32, String)> {
+fn apply_command(a: &mut Arrangement) -> Result<Output, (i32, String)> {
     if !a.player.is_playing() {
-        return Ok("apply: transport not playing; changes land at next play\n".to_string());
+        return Ok(Output::Applied { rebuilt: None });
     }
     a.player.apply().map_err(|e| fail(e.to_string()))?;
-    Ok(format!(
-        "apply: rebuilt from {}\n",
-        format_time(a.player.playhead())
-    ))
+    Ok(Output::Applied {
+        rebuilt: Some(a.player.playhead()),
+    })
 }
 
 /// `reset`: drop every track and stop the transport — the daemon is back to
 /// its fresh state, ready for a run-sheet to rebuild the arrangement.
-fn reset_command(a: &mut Arrangement) -> Result<String, (i32, String)> {
+fn reset_command(a: &mut Arrangement) -> Result<Output, (i32, String)> {
     let tracks = a.player.tracks().len();
     a.player.reset();
-    let noun = if tracks == 1 { "track" } else { "tracks" };
-    Ok(format!("reset: {tracks} {noun} removed\n"))
+    Ok(Output::Reset { tracks })
 }
 
 /// `set <var> <value>`: set an attribute. `master` is real-time — the backend
 /// is told immediately. `track.N.volume` / `track.N.muted` / `track.N.name`
 /// are arrangement data that land on the next `play` or `apply`.
-fn set_command(a: &mut Arrangement, var: &str, value: &str) -> Result<String, (i32, String)> {
+fn set_command(a: &mut Arrangement, var: &str, value: &str) -> Result<Output, (i32, String)> {
     match var {
         "master" => {
             let v: f32 = value
                 .parse()
                 .map_err(|_| usage(format!("bad gain {value:?}")))?;
             a.player.set_volume(v);
-            Ok(format!("master {:.2}\n", a.player.volume()))
+            Ok(Output::Set(SetResult::Master { v: a.player.volume() }))
         }
         _ => {
             let (index, prop) = var
@@ -879,16 +860,19 @@ fn set_command(a: &mut Arrangement, var: &str, value: &str) -> Result<String, (i
                         .parse()
                         .map_err(|_| usage(format!("bad gain {value:?}")))?;
                     t.set_volume(v);
-                    Ok(format!("track {index} volume {:.2}\n", t.volume()))
+                    Ok(Output::Set(SetResult::TrackVolume { i: index, v: t.volume() }))
                 }
                 "muted" => {
                     let b = parse_bool(value).map_err(usage)?;
                     t.set_muted(b);
-                    Ok(format!("track {index} {}\n", if b { "muted" } else { "unmuted" }))
+                    Ok(Output::Set(SetResult::TrackMuted { i: index, muted: b }))
                 }
                 "name" => {
                     t.set_name(value.to_string());
-                    Ok(format!("track {index} named {value:?}\n"))
+                    Ok(Output::Set(SetResult::TrackName {
+                        i: index,
+                        name: value.to_string(),
+                    }))
                 }
                 _ => Err(usage(format!("unknown property {prop:?} on a track"))),
             }
@@ -907,40 +891,27 @@ fn parse_bool(s: &str) -> Result<bool, String> {
 
 /// `probe <uri>`: measure one source. Used both locally (no daemon) and over
 /// the wire.
-fn probe_uri(uri: &str) -> Result<String, (i32, String)> {
+fn probe_uri(uri: &str) -> Result<Output, (i32, String)> {
     match probe(uri) {
-        Ok(d) => Ok(format!(
-            "probe: {uri} {} {:.2} s\n",
-            format_time(d),
-            d.as_secs_f64()
-        )),
+        Ok(d) => Ok(Output::Probed {
+            uri: uri.to_string(),
+            duration: d,
+        }),
         Err(e) => Err(fail(e)),
     }
 }
 
 /// `probe` with no uri: measure every distinct source in the arrangement.
 /// Lists each source's length; exit 1 if any source cannot be measured.
-fn probe_arrangement(a: &Arrangement) -> Result<String, (i32, String)> {
-    let results = probe_sources(a.player.tracks());
-    if results.is_empty() {
-        return Ok("probe: no sources in the arrangement\n".to_string());
-    }
-    let noun = if results.len() == 1 { "source" } else { "sources" };
-    let mut out = format!("probe: {} {noun}\n", results.len());
-    let mut problems = 0;
-    for (uri, result) in results {
-        match result {
-            Ok(d) => {
-                let _ = writeln!(out, "  {uri} {} {:.2} s", format_time(d), d.as_secs_f64());
-            }
-            Err(e) => {
-                problems += 1;
-                let _ = writeln!(out, "  {uri}: {e}");
-            }
-        }
-    }
-    if problems > 0 {
-        Err((1, out))
+fn probe_arrangement(a: &Arrangement) -> Result<Output, (i32, String)> {
+    let sources: Vec<ProbeResult> = probe_sources(a.player.tracks())
+        .into_iter()
+        .map(|(uri, outcome)| ProbeResult { uri, outcome })
+        .collect();
+    let has_problem = sources.iter().any(|s| s.outcome.is_err());
+    let out = Output::ProbedMany { sources };
+    if has_problem {
+        Err((1, out.to_string()))
     } else {
         Ok(out)
     }
@@ -1317,7 +1288,7 @@ fn handle_line(state: &Mutex<Arrangement>, line: &str) -> (i32, String, bool) {
     let ends_session = matches!(command, Command::Stop);
     let mut a = state.lock().unwrap();
     match dispatch(&mut a, command) {
-        Ok(out) => (0, out, ends_session),
+        Ok(out) => (0, out.to_string(), ends_session),
         Err((code, msg)) => (code, format!("bo: {msg}\n"), ends_session),
     }
 }
@@ -1332,7 +1303,7 @@ mod tests {
     fn run_ok(a: &mut Arrangement, args: &[&str]) -> String {
         let v: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         match parse_command(&v).map_err(|e| (e.exit_code(), String::new())).and_then(|c| dispatch(a, c)) {
-            Ok(out) => out,
+            Ok(out) => out.to_string(),
             Err((code, msg)) => panic!("command {args:?} failed ({code}): {msg}"),
         }
     }
@@ -1896,7 +1867,7 @@ mod tests {
 
         // A 0.25s window from 0.25s: half of the first clip only.
         let render = parse_command(&["render".to_string(), out_s.clone(), "00:00:00.250-00:00:00.500".to_string()]).unwrap();
-        let reply = dispatch(&mut a, render).unwrap();
+        let reply = dispatch(&mut a, render).unwrap().to_string();
         assert!(reply.contains("00:00:00.250"), "rendered span: {reply}");
         let decoder = rodio::Decoder::new(std::io::BufReader::new(std::fs::File::open(&out).unwrap())).unwrap();
         let total = decoder.total_duration().unwrap();
@@ -1917,7 +1888,7 @@ mod tests {
         let put = parse_command(&["put".to_string(), spec]).unwrap();
         dispatch(&mut a, put).unwrap();
         let render = parse_command(&["render".to_string(), out_s.clone()]).unwrap();
-        let reply = dispatch(&mut a, render).unwrap();
+        let reply = dispatch(&mut a, render).unwrap().to_string();
         assert!(reply.contains("rendered") && reply.contains("00:00:00.200"), "{reply}");
         assert!(out.exists() && out.metadata().unwrap().len() > 1000, "a real wav was written");
         std::fs::remove_dir_all(&dir).ok();
