@@ -759,10 +759,25 @@ fn put_command(
     let track = &a.player.tracks()[track_index];
     for (i, c) in clips.iter().enumerate() {
         if let Some(conflict) = track.clips().iter().find(|x| x.overlaps(c)) {
+            // Say where the conflict actually sits and where the clip could
+            // go instead: half-open spans, so a butt-join against an end is
+            // legal and the report says so by listing that end as free.
+            let span = match conflict.end() {
+                Some(end) => format!(
+                    "[{:.3},{:.3})",
+                    conflict.at.as_secs_f64(),
+                    end.as_secs_f64()
+                ),
+                None => format!("[{:.3},inf)", conflict.at.as_secs_f64()),
+            };
+            let hint = match track.next_free_start(c.at, c.duration()) {
+                Some(next) => format!("next free start {:.3}s", next.as_secs_f64()),
+                None => "no free start after this (track blocked)".to_string(),
+            };
             return Err(fail(format!(
-                "refused: copy {i} at {}s collides with clip #{}",
+                "refused: copy {i} at {:.3}s collides with clip #{} {span}; {hint}",
                 c.at.as_secs_f64(),
-                conflict.id
+                conflict.id,
             )));
         }
     }
@@ -1487,6 +1502,25 @@ mod tests {
         assert_eq!(a.player.tracks().len(), 4, "tracks up to the index are created");
         assert_eq!(a.player.tracks()[3].clips().len(), 1);
         assert!(a.player.tracks()[0].is_empty());
+    }
+
+    #[test]
+    fn refused_put_names_the_conflict_span_and_next_free_start() {
+        let mut a = Arrangement::default();
+        run_ok(&mut a, &["put", "a.wav:00:00:00-00:00:10"]);
+        // Landing on the resident clip: the report shows its half-open span
+        // and that a butt-join at its end is the next legal start.
+        let (code, msg) = run_err(&mut a, &["put", "b.wav@00:00:05:00:00:00-00:00:10", "0"]);
+        assert_eq!(code, 1);
+        assert!(msg.contains("clip #0 [0.000,10.000)"), "{msg}");
+        assert!(msg.contains("next free start 10.000s"), "{msg}");
+
+        // An open-ended resident blocks the track for good: say so.
+        run_ok(&mut a, &["put", "live.wav@00:00:15", "0"]);
+        let (code, msg) = run_err(&mut a, &["put", "c.wav@00:00:16:00:00:00-00:00:10", "0"]);
+        assert_eq!(code, 1);
+        assert!(msg.contains("clip #1 [15.000,inf)"), "{msg}");
+        assert!(msg.contains("no free start after this"), "{msg}");
     }
 
     #[test]

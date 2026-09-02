@@ -331,6 +331,44 @@ impl Track {
         self.clips.iter().find(|c| c.covers(t))
     }
 
+    /// The earliest position at or after `at` where a clip of length `len`
+    /// (or an open-ended one, when `len` is `None`) can be placed without
+    /// overlapping any resident clip: the answer a collision report points
+    /// at. `None` when nothing can ever fit — an open-ended resident clip
+    /// occupies the rest of the track.
+    ///
+    /// Spans are half-open, so the answer may butt against a clip's end.
+    #[must_use]
+    pub fn next_free_start(&self, at: Duration, len: Option<Duration>) -> Option<Duration> {
+        let mut pos = at;
+        for clip in &self.clips {
+            let end = match clip.end() {
+                Some(end) => end,
+                // An open-ended resident leaves no room after it starts;
+                // only the gap before it can still hold a finite candidate.
+                None => {
+                    let fits = len.is_some_and(|len| clip.at.saturating_sub(pos) >= len);
+                    return fits.then_some(pos);
+                }
+            };
+            if end <= pos {
+                continue; // entirely behind the candidate
+            }
+            // A finite candidate that fits in the gap before this clip is
+            // the answer. An open-ended candidate never fits in a finite
+            // gap, so it keeps jumping to the tail.
+            if let Some(len) = len
+                && clip.at.saturating_sub(pos) >= len
+            {
+                return Some(pos);
+            }
+            pos = pos.max(end); // jump past this clip
+        }
+        // Past every clip: the tail is free (a finite track's end, or the
+        // last resident's end for an open-ended candidate).
+        Some(pos)
+    }
+
     /// Whether nothing plays at `t` — a gap, or past the end.
     #[must_use]
     pub fn is_silent_at(&self, t: Duration) -> bool {
@@ -464,5 +502,39 @@ mod tests {
         assert!(t.remove(9).is_none());
         t.clear();
         assert!(t.is_empty() && t.is_silent_at(Duration::ZERO));
+    }
+
+    #[test]
+    fn next_free_start_skips_to_the_first_fit() {
+        let mut t = Track::new();
+        t.insert(Clip::new(src("a", Some(secs(10))))).unwrap();
+        t.insert(Clip::new(src("b", Some(secs(5)))).at(secs(10)))
+            .unwrap();
+        t.insert(Clip::new(src("c", Some(secs(2)))).at(secs(20)))
+            .unwrap();
+        // An empty track fits anywhere.
+        assert_eq!(Track::new().next_free_start(secs(3), Some(secs(2))), Some(secs(3)));
+        // Inside a clip: jump past every resident until a gap fits. b sits
+        // at 10..15 right after a, so the first fit past 3 is 15.
+        assert_eq!(t.next_free_start(secs(3), Some(secs(1))), Some(secs(15)));
+        // A clip that fits in the gap between residents (b ends 15, c at 20).
+        assert_eq!(t.next_free_start(secs(12), Some(secs(2))), Some(secs(15)));
+        // A clip too long for that gap jumps to the next one (tail past 22).
+        assert_eq!(t.next_free_start(secs(12), Some(secs(6))), Some(secs(22)));
+        // A start already in a gap stays put; so does a butt-join at its end.
+        assert_eq!(t.next_free_start(secs(15), Some(secs(4))), Some(secs(15)));
+        assert_eq!(t.next_free_start(secs(17), Some(secs(2))), Some(secs(17)));
+        assert_eq!(t.next_free_start(secs(15), Some(secs(5))), Some(secs(15)));
+        // Butt-joining a's end is not free while b occupies 10..15.
+        assert_eq!(t.next_free_start(secs(10), Some(secs(5))), Some(secs(15)));
+        // An open-ended candidate fits only at the tail.
+        assert_eq!(t.next_free_start(secs(3), None), Some(secs(22)));
+        // An open-ended resident blocks everything at or after it.
+        let mut open = Track::new();
+        open.insert(Clip::new(src("live", None)).at(secs(5))).unwrap();
+        assert_eq!(open.next_free_start(Duration::ZERO, Some(secs(3))), Some(secs(0)));
+        assert_eq!(open.next_free_start(secs(4), Some(secs(1))), Some(secs(4)));
+        assert_eq!(open.next_free_start(secs(4), Some(secs(2))), None);
+        assert_eq!(open.next_free_start(secs(6), Some(secs(1))), None);
     }
 }
