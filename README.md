@@ -4,7 +4,7 @@
 
 [English](README.md) | [中文](README.zh-CN.md)
 
-**bo** is a command-driven audio editor, mixer, and player. You describe a session — clips placed on stacked tracks, each clip a slice of an audio source — with `put` commands, tune it with `set`, and hear the result with `play` (through your sound device) or `render` (offline, to a wav file). There is no project file: the session lives in a long-running daemon, reached over a Unix socket, and can be written out as a script (`save`) and rebuilt from it (`load`).
+**bo** is a command-driven audio editor, mixer, and player. You describe a session — clips placed on stacked tracks, each clip a slice of an audio source — with `put` commands, tune it with `set`, and hear the result with `play` (through your sound device) or `render` (offline, to a wav file). There is no project file: your arrangement stays in the running session — later commands keep working on the same one — and can be written out as a script (`save`) and rebuilt from it (`load`).
 
 Each `bo ...` invocation is one action: place a clip, remove one, move the playhead, duck a track, start or stop playback. The daemon is spawned on demand and cleans up after itself, so a session is a conversation, not a project.
 
@@ -16,7 +16,7 @@ What it is **not** — yet — is a DAW: no pan, no effects, no fades or automat
 
 ## Features
 
-- **Arrangement as data** — tracks and clips live in the daemon's memory, not in files. `save`/`load` serialize them as the very commands that built them.
+- **Arrangement as data** — tracks and clips live in the session, not in files. `save`/`load` serialize them as the very commands that built them.
 - **Built for agents** — one command per invocation, machine-readable replies, stable exit codes: 2 for misuse, 1 for a refused operation.
 - **Play it live, or render it offline** — audition from the playhead mid-edit, play a finished arrangement out end to end (rodio), or mix the whole arrangement — or just a range — to a wav file.
 - **Silent fallback** — with no audio device the daemon still runs; set `BO_BACKEND=silent` for deterministic, headless tests and CI.
