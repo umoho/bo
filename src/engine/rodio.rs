@@ -18,8 +18,9 @@ use std::time::Duration;
 use rodio::mixer::{self, Mixer};
 use rodio::math::nz;
 use rodio::source::from_factory;
-use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink, Player, Sample, Source, wav_to_file};
+use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink, Player, Sample, Source};
 
+use crate::engine::measure::{Measurement, Meter};
 use crate::engine::timeline::{ClipPlan, Timeline};
 use crate::engine::{Backend, BackendError};
 use crate::track::Track;
@@ -153,8 +154,9 @@ fn build_mix(
 /// does, so a rendered file sounds like the session. Returns the rendered
 /// duration.
 ///
-/// Unlike playback this does not use `Player` queues: those stay alive with
-/// silence when empty (right for a device, infinite for a render).
+/// The wav is written as 32-bit float (rodio's native sample type), stereo,
+/// 44.1 kHz. Unlike playback this does not use `Player` queues: those stay
+/// alive with silence when empty (right for a device, infinite for a render).
 pub fn render_to_file(
     tracks: &[Track],
     path: impl AsRef<std::path::Path>,
@@ -162,6 +164,34 @@ pub fn render_to_file(
     to: Option<Duration>,
     master: f32,
 ) -> Result<Duration, String> {
+    mix(tracks, Some(path.as_ref()), from, to, master, false).map(|(d, _)| d)
+}
+
+/// Render the mix and measure it in the same pass. With `path` `Some` the
+/// wav is written too; `None` measures only (no file). The measurement
+/// folds the exact sample stream the file writer consumes, so the numbers
+/// and the file can never disagree.
+pub fn render_and_measure(
+    tracks: &[Track],
+    path: Option<&std::path::Path>,
+    from: Duration,
+    to: Option<Duration>,
+    master: f32,
+) -> Result<(Duration, Measurement), String> {
+    mix(tracks, path, from, to, master, true).map(|(d, m)| (d, m.expect("measured")))
+}
+
+/// One mix pass over the shared [`Timeline`]: build the 44.1 kHz stereo
+/// mixer with one gain chain per non-empty track, then pull every sample
+/// through an optional wav writer and an optional [`Meter`].
+fn mix(
+    tracks: &[Track],
+    path: Option<&std::path::Path>,
+    from: Duration,
+    to: Option<Duration>,
+    master: f32,
+    measure: bool,
+) -> Result<(Duration, Option<Measurement>), String> {
     let mut timeline = Timeline::plan(tracks, from, probe)?;
     if let Some(to) = to {
         // `to` is a track timecode; the plan's own timeline starts at `from`.
@@ -178,8 +208,34 @@ pub fn render_to_file(
         let track_source = from_factory(move || pending.next());
         input.add(Gain::new(track_source, gain));
     }
-    wav_to_file(source, path).map_err(|e| format!("cannot write wav: {e}"))?;
-    Ok(timeline.end())
+    let mut meter = measure.then(|| Meter::new(2, 44100));
+    let mut writer = match path {
+        Some(p) => {
+            let spec = hound::WavSpec {
+                channels: 2,
+                sample_rate: 44100,
+                bits_per_sample: 32,
+                sample_format: hound::SampleFormat::Float,
+            };
+            Some(
+                hound::WavWriter::create(p, spec)
+                    .map_err(|e| format!("cannot create {}: {e}", p.display()))?,
+            )
+        }
+        None => None,
+    };
+    for sample in source {
+        if let Some(m) = meter.as_mut() {
+            m.push(sample);
+        }
+        if let Some(w) = writer.as_mut() {
+            w.write_sample(sample).map_err(|e| format!("cannot write wav: {e}"))?;
+        }
+    }
+    if let Some(w) = writer {
+        w.finalize().map_err(|e| format!("cannot write wav: {e}"))?;
+    }
+    Ok((timeline.end(), meter.map(Meter::finish)))
 }
 
 /// An offline [`Backend`]: `play` renders the arrangement to a wav file.
@@ -519,6 +575,44 @@ mod tests {
                 "{rate} Hz {channels}ch {bits}bit rendered {total:?}, expected ~1.0 s"
             );
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn measure_folds_the_mix_without_writing() {
+        // A 10 s 440 Hz sine at amplitude 0.5: peak -6.02 dBFS, RMS -9.03,
+        // integrated loudness near the RMS of a mid-range tone.
+        let dir = std::env::temp_dir().join(format!("bo-measure-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.wav");
+        write_wav_full(&a, 10.0, 440.0, 0.5, 44_100, 2, 16);
+        let mut track = Track::named("a");
+        track.insert(clip_at(a.to_str().unwrap(), 0, 10)).unwrap();
+
+        // Measure only: no file appears.
+        let (duration, m) =
+            render_and_measure(&[track.clone()], None, Duration::ZERO, None, 1.0).unwrap();
+        assert!((duration.as_secs_f64() - 10.0).abs() < 0.05);
+        assert!((m.peak_db - (-6.02)).abs() < 0.05, "peak {}", m.peak_db);
+        assert!((m.rms_db - (-9.03)).abs() < 0.05, "rms {}", m.rms_db);
+        // ffmpeg ebur128 reads a 440 Hz tone at −6.02 dBFS as −9.7 LUFS
+        // (K-weighting shelves above 1 kHz, so a 440 Hz tone sits ~0.7 LU
+        // below its RMS); calibrated against ffmpeg.
+        assert!((m.integrated_lufs.unwrap() - (-9.7)).abs() < 0.3, "lufs {:?}", m.integrated_lufs);
+        assert!(!dir.join("none.wav").exists());
+
+        // Measure while writing: same numbers, plus a real file.
+        let out = dir.join("out.wav");
+        let (_, m2) = render_and_measure(
+            &[track],
+            Some(&out),
+            Duration::ZERO,
+            None,
+            1.0,
+        )
+        .unwrap();
+        assert!((m2.peak_db - m.peak_db).abs() < 1e-6, "file and measure agree");
+        assert!(out.exists());
         std::fs::remove_dir_all(&dir).ok();
     }
 

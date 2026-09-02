@@ -10,5 +10,6 @@ repository = "https://github.com/umoho/bo"
 
 [dependencies]
 clap = { version = "4", features = ["derive", "env", "wrap_help"] }
+hound = "3.5"
 rodio = { version = "0.22.2", features = ["wav_output"] }
 shlex = "2.0.1"

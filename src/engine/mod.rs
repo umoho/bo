@@ -9,6 +9,7 @@
 use std::fmt;
 use std::time::Duration;
 
+pub mod measure;
 pub mod rodio;
 pub mod timeline;
 
