@@ -388,6 +388,14 @@ CLIP SPEC
                            from-to = slice of the source (empty to = end)
   Timecodes: SS, MM:SS or HH:MM:SS, optional .fff fraction.
 
+  A clip with no known end (an unsliced, unprobed source) is open-ended:
+  it occupies its track from its position on, so nothing can follow it
+  there — a later put on the same track is refused even past the source's
+  real length. A session containing one never finishes by itself. Slice
+  what you place (uri:from-to), or probe the source first, to give the
+  clip a length. Spans are half-open: clips may butt-join (one ends exactly
+  where the next starts).
+
 EXAMPLES
   bo put bed.wav:00:00:00-00:00:30
   bo put voice.wav:00:00:00-00:00:30 1
