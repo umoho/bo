@@ -6,7 +6,7 @@
 
 **bo** is a command-driven audio editor, mixer, and player. You describe a session — clips placed on stacked tracks, each clip a slice of an audio source — with `put` commands, tune it with `set`, and hear the result with `play` (through your sound device) or `render` (offline, to a wav file). There is no project file: your arrangement stays in the running session — later commands keep working on the same one — and can be written out as a script (`save`) and rebuilt from it (`load`).
 
-Each `bo ...` invocation is one action: place a clip, remove one, move the playhead, duck a track, start or stop playback. The daemon is spawned on demand and cleans up after itself, so a session is a conversation, not a project.
+Each `bo ...` invocation is one action: place a clip, remove one, move the playhead, tune a track's gain, start or stop playback. The daemon is spawned on demand and cleans up after itself, so a session is a conversation, not a project.
 
 ## What bo is — and isn't
 
