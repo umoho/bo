@@ -13,6 +13,7 @@
 
 use std::fs::File;
 use std::io::BufReader;
+use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;
 
 use rodio::mixer::{self, Mixer};
@@ -184,6 +185,14 @@ pub fn render_and_measure(
 /// One mix pass over the shared [`Timeline`]: build the 44.1 kHz stereo
 /// mixer with one gain chain per non-empty track, then pull every sample
 /// through an optional wav writer and an optional [`Meter`].
+///
+/// The wav is staged in a temporary file next to the target and renamed over
+/// it only after a clean finalize, so a failed render leaves the previous
+/// file (or nothing) untouched instead of a half-written wav. Samples are
+/// consumed in whole stereo frames: an odd trailing sample — one channel's
+/// final ~23µs, possible when a range cuts a stereo source mid-frame — is
+/// dropped, so the writer always finalizes a frame-aligned stream and the
+/// file and the meter can never disagree.
 fn mix(
     tracks: &[Track],
     path: Option<&std::path::Path>,
@@ -208,9 +217,31 @@ fn mix(
         let track_source = from_factory(move || pending.next());
         input.add(Gain::new(track_source, gain));
     }
-    let mut meter = measure.then(|| Meter::new(2, 44100));
-    let mut writer = match path {
+    // Stage the file next to its target so the final rename stays on one
+    // filesystem; `tempfile` also deletes the staging file on any early
+    // return, which is what clears a failed render.
+    let staging: Option<tempfile::NamedTempFile> = match path {
         Some(p) => {
+            let dir = p
+                .parent()
+                .filter(|d| !d.as_os_str().is_empty())
+                .unwrap_or_else(|| std::path::Path::new("."));
+            let tmp = tempfile::Builder::new()
+                .prefix(".bo-render-")
+                .suffix(".tmp")
+                .tempfile_in(dir)
+                .map_err(|e| format!("cannot create a temporary file in {}: {e}", dir.display()))?;
+            // tempfile creates 0600; a rendered wav should follow the usual
+            // umask-default visibility, so pin it to 0644 before the rename.
+            tmp.as_file()
+                .set_permissions(std::fs::Permissions::from_mode(0o644))
+                .map_err(|e| format!("cannot set permissions on a temporary file: {e}"))?;
+            Some(tmp)
+        }
+        None => None,
+    };
+    let mut writer = match staging.as_ref() {
+        Some(tmp) => {
             let spec = hound::WavSpec {
                 channels: 2,
                 sample_rate: 44100,
@@ -218,22 +249,40 @@ fn mix(
                 sample_format: hound::SampleFormat::Float,
             };
             Some(
-                hound::WavWriter::create(p, spec)
-                    .map_err(|e| format!("cannot create {}: {e}", p.display()))?,
+                hound::WavWriter::create(tmp.path(), spec)
+                    .map_err(|e| format!("cannot write wav: {e}"))?,
             )
         }
         None => None,
     };
+    let mut meter = measure.then(|| Meter::new(2, 44100));
+    // Consume whole frames: buffer two interleaved samples, feed both the
+    // meter and the writer, and drop a trailing half-frame so the stream the
+    // file receives is exactly the stream that was measured.
+    let mut frame: [f32; 2] = [0.0; 2];
+    let mut filled = 0usize;
     for sample in source {
-        if let Some(m) = meter.as_mut() {
-            m.push(sample);
-        }
-        if let Some(w) = writer.as_mut() {
-            w.write_sample(sample).map_err(|e| format!("cannot write wav: {e}"))?;
+        frame[filled] = sample;
+        filled += 1;
+        if filled == 2 {
+            if let Some(m) = meter.as_mut() {
+                m.push(frame[0]);
+                m.push(frame[1]);
+            }
+            if let Some(w) = writer.as_mut() {
+                w.write_sample(frame[0]).map_err(|e| format!("cannot write wav: {e}"))?;
+                w.write_sample(frame[1]).map_err(|e| format!("cannot write wav: {e}"))?;
+            }
+            filled = 0;
         }
     }
     if let Some(w) = writer {
         w.finalize().map_err(|e| format!("cannot write wav: {e}"))?;
+    }
+    if let Some(tmp) = staging {
+        let target = path.expect("a staged wav always has a target path");
+        tmp.persist(target)
+            .map_err(|e| format!("cannot write {}: {}", target.display(), e.error))?;
     }
     Ok((timeline.end(), meter.map(Meter::finish)))
 }
@@ -625,6 +674,69 @@ mod tests {
         let d = probe(a.to_str().unwrap()).unwrap();
         assert!((d.as_secs_f64() - 0.5).abs() < 0.05, "probed {d:?}");
         assert!(probe("/nonexistent.wav").is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn render_cuts_stereo_sources_on_whole_frames() {
+        // A stereo source cut at 0.5 s makes rodio's take_duration emit an
+        // odd number of interleaved samples (44103), which hound used to
+        // reject at finalize as "not a multiple of the number of channels".
+        // The writer now consumes whole frames and drops the trailing
+        // half-frame, so any range finalizes cleanly.
+        let dir = std::env::temp_dir().join(format!("bo-render-frame-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.wav");
+        write_wav_full(&a, 1.0, 440.0, 0.5, 44_100, 2, 16);
+
+        let mut track = Track::named("a");
+        track.insert(clip_at(a.to_str().unwrap(), 0, 1)).unwrap();
+        let out = dir.join("out.wav");
+        render_to_file(
+            &[track],
+            &out,
+            Duration::ZERO,
+            Some(Duration::from_millis(500)),
+            1.0,
+        )
+        .unwrap();
+
+        let decoder = Decoder::new(BufReader::new(File::open(&out).unwrap())).unwrap();
+        let total = decoder.total_duration().unwrap();
+        assert!(
+            (total.as_secs_f64() - 0.5).abs() < 0.05,
+            "rendered {total:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn render_overwrites_atomically_and_leaves_no_staging_file() {
+        let dir = std::env::temp_dir().join(format!("bo-render-atomic-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.wav");
+        write_wav(&a, 1.0, 440.0, 0.5);
+
+        let mut track = Track::named("a");
+        track.insert(clip_at(a.to_str().unwrap(), 0, 1)).unwrap();
+        let out = dir.join("out.wav");
+        // First render creates the file; the second renames over it. Neither
+        // may leave a `.bo-render-*` staging file behind.
+        render_to_file(&[track.clone()], &out, Duration::ZERO, None, 1.0).unwrap();
+        render_to_file(&[track], &out, Duration::ZERO, None, 1.0).unwrap();
+
+        let staging: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".bo-render-")
+            })
+            .collect();
+        assert!(staging.is_empty(), "staging files left behind: {staging:?}");
+        let decoder = Decoder::new(BufReader::new(File::open(&out).unwrap())).unwrap();
+        assert!((decoder.total_duration().unwrap().as_secs_f64() - 1.0).abs() < 0.05);
         std::fs::remove_dir_all(&dir).ok();
     }
 }
