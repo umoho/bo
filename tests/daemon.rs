@@ -375,13 +375,55 @@ fn take_addresses_clips_by_timecode_over_the_wire() {
 
     // Delete by timecode: b covers 00:00:12, so it goes — by its stable id.
     let out = bo(&sp, &["take", "0", "@00:00:12"]);
-    assert!(out.contains("removed track 0 clip #1 b.wav"), "{out}");
+    assert!(out.contains("removed track 0 clip #1") && out.contains("b.wav"), "{out}");
 
     // Ids are stable: a is still id 0 even though b is gone.
     let out = bo(&sp, &["take", "0", "0"]);
-    assert!(out.contains("removed track 0 clip #0 a.wav"), "{out}");
+    assert!(out.contains("removed track 0 clip #0") && out.contains("a.wav"), "{out}");
 
     let out = bo(&sp, &["stop"]);
+    assert!(out.contains("stopped"), "{out}");
+    wait_for_socket_gone(&socket);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn relative_paths_resolve_against_the_invocation_cwd() {
+    let dir = temp_dir();
+    let socket = dir.join("d.sock");
+    let sp = socket.to_string_lossy().into_owned();
+
+    // A relative source resolves against this command's cwd, not the
+    // daemon's: the daemon is spawned from the same cwd here, but the client
+    // sends the cwd explicitly so a long-lived daemon never leaks its own.
+    let run_in = |args: &[&str]| -> String {
+        let out = Command::new(env!("CARGO_BIN_EXE_bo"))
+            .env("BO_BACKEND", "silent")
+            .current_dir(&dir)
+            .arg("--socket")
+            .arg(&sp)
+            .args(args)
+            .output()
+            .expect("bo runs");
+        assert!(
+            out.status.success(),
+            "bo {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    let out = run_in(&["put", "a.wav,00:00:00-00:00:10"]);
+    assert!(out.contains("ok: track 0 clip #0"), "{out}");
+
+    let out = run_in(&["ls"]);
+    // current_dir() returns the canonical path (macOS: /private/var/...), so
+    // compare against the canonicalized dir, not the symlinky temp_dir().
+    let resolved = std::fs::canonicalize(&dir).unwrap();
+    let expected = format!("uri={}/a.wav", resolved.to_string_lossy());
+    assert!(out.contains(&expected), "ls should show the absolute uri: {out}");
+
+    let out = run_in(&["stop"]);
     assert!(out.contains("stopped"), "{out}");
     wait_for_socket_gone(&socket);
     std::fs::remove_dir_all(&dir).ok();

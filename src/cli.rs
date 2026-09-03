@@ -460,6 +460,28 @@ fn format_time(d: Duration) -> String {
     Tc(d).to_string()
 }
 
+/// The client's working directory, as a string; empty when it cannot be read.
+fn current_cwd() -> String {
+    std::env::current_dir()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// Resolve a path against `cwd`: absolute paths and scheme-bearing URIs
+/// (`http://…`) are left alone, and so is anything when `cwd` is empty. Every
+/// relative local path in a command resolves against the cwd of the `bo`
+/// invocation that issued it, never the daemon's.
+fn absolutize(path: &str, cwd: &str) -> String {
+    let p = std::path::Path::new(path);
+    if p.is_absolute() || path.contains("://") || cwd.is_empty() {
+        return path.to_string();
+    }
+    std::path::Path::new(cwd)
+        .join(p)
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// Parse a clip spec into its pieces: `uri[,from-to]`. `,` marks the slice;
 /// `:` is reserved for timecodes. Position is not part of the spec — it lives
 /// in the placement argument (`track[@pos]`).
@@ -562,9 +584,9 @@ fn parse_command(args: &[String]) -> Result<Command, clap::Error> {
 }
 
 /// Run a parsed subcommand against the arrangement.
-fn dispatch(a: &mut Arrangement, command: Command) -> Result<Output, (i32, String)> {
+fn dispatch(a: &mut Arrangement, command: Command, cwd: &str) -> Result<Output, (i32, String)> {
     match command {
-        Command::Put { spec, placement, repeat } => put_command(a, &spec, placement.as_deref(), repeat),
+        Command::Put { spec, placement, repeat } => put_command(a, &spec, placement.as_deref(), repeat, cwd),
         Command::Play => play_command(a),
         Command::Ls => Ok(Output::Ls(arrangement_view(a))),
         Command::At { at } => at_command(a, &at),
@@ -593,6 +615,7 @@ fn dispatch(a: &mut Arrangement, command: Command) -> Result<Output, (i32, Strin
             range,
             measure,
         } => {
+            let file = file.map(|f| absolutize(&f, cwd));
             let (from, to) = match range {
                 Some(r) => parse_range(&r).map_err(usage)?,
                 None => (Duration::ZERO, None),
@@ -658,11 +681,13 @@ fn dispatch(a: &mut Arrangement, command: Command) -> Result<Output, (i32, Strin
             }
         }
         Command::Save { file } => {
+            let file = absolutize(&file, cwd);
             std::fs::write(&file, serialize(a))
                 .map_err(|e| fail(format!("cannot write {file}: {e}")))?;
             Ok(Output::Saved { file })
         }
         Command::Load { file } => {
+            let file = absolutize(&file, cwd);
             let text = std::fs::read_to_string(&file)
                 .map_err(|e| fail(format!("cannot read {file}: {e}")))?;
             // Stage the script in a silent arrangement so a failing script
@@ -672,7 +697,7 @@ fn dispatch(a: &mut Arrangement, command: Command) -> Result<Output, (i32, Strin
             // arrangement once replaced the daemon's backend with a bare
             // silent one, so the next play was silently inaudible.
             let mut staged = Arrangement::default();
-            run_script(&mut staged, &text, &file).map_err(fail)?;
+            run_script(&mut staged, &text, &file, cwd).map_err(fail)?;
             let volume = staged.player.volume();
             let tracks: Vec<Track> = staged.player.tracks().to_vec();
             a.player.reset();
@@ -693,7 +718,7 @@ fn dispatch(a: &mut Arrangement, command: Command) -> Result<Output, (i32, Strin
         }
         Command::Probe { uri } => match uri {
             None => probe_arrangement(a),
-            Some(uri) => probe_uri(&uri),
+            Some(uri) => probe_uri(&absolutize(&uri, cwd)),
         },
         // Help is handled locally by the client; this arm keeps a stray
         // "help" line over the socket harmless.
@@ -807,12 +832,16 @@ fn put_command(
     spec_arg: &str,
     placement_arg: Option<&str>,
     repeat: Option<u32>,
+    cwd: &str,
 ) -> Result<Output, (i32, String)> {
     let repeat = repeat.unwrap_or(1);
     if repeat == 0 {
         return Err(usage("repeat must be at least 1"));
     }
-    let spec = parse_spec(spec_arg).map_err(usage)?;
+    let mut spec = parse_spec(spec_arg).map_err(usage)?;
+    // Resolve the source against this command's cwd: the daemon is an
+    // implementation detail and must not affect where relative paths land.
+    spec.uri = absolutize(&spec.uri, cwd);
     // A clip with no out-point plays to the source's end; resolve that end
     // now by probing, so every clip has a known finite length. Unmeasurable
     // sources are refused here instead of becoming a clip that blocks the
@@ -1149,7 +1178,7 @@ fn serialize(a: &Arrangement) -> String {
 /// Stops at the first failing line and reports `src:line: message`; what ran
 /// before the failure stays applied. `load` runs into a fresh arrangement,
 /// so a failing script leaves the live one untouched.
-fn run_script(a: &mut Arrangement, text: &str, src: &str) -> Result<(), String> {
+fn run_script(a: &mut Arrangement, text: &str, src: &str, cwd: &str) -> Result<(), String> {
     for (n, line) in text.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -1158,7 +1187,7 @@ fn run_script(a: &mut Arrangement, text: &str, src: &str) -> Result<(), String> 
         let args = tokenize(line).map_err(|e| format!("{src}:{}: {e}", n + 1))?;
         let command = parse_command(&args)
             .map_err(|code| format!("{src}:{}: parse failed (exit {code})", n + 1))?;
-        dispatch(a, command).map_err(|(_, msg)| format!("{src}:{}: {msg}", n + 1))?;
+        dispatch(a, command, cwd).map_err(|(_, msg)| format!("{src}:{}: {msg}", n + 1))?;
     }
     Ok(())
 }
@@ -1188,14 +1217,18 @@ pub fn run(args: Vec<String>) -> i32 {
             return e.exit_code();
         }
     };
-    let socket = cli.socket.unwrap_or_else(default_socket);
+    let cwd = current_cwd();
+    let socket = match cli.socket {
+        Some(s) => std::path::PathBuf::from(absolutize(&s.to_string_lossy(), &cwd)),
+        None => default_socket(),
+    };
     match cli.command {
         Command::Help => {
             println!("{HELP}");
             0
         }
         Command::Daemon => daemon_main(&socket),
-        Command::Probe { uri: Some(uri) } => probe_client(&uri),
+        Command::Probe { uri: Some(uri) } => probe_client(&absolutize(&uri, &cwd)),
         command => client_main(&socket, &command),
     }
 }
@@ -1226,7 +1259,8 @@ fn client_main(socket: &Path, command: &Command) -> i32 {
         }
     };
     let line = command_line(command);
-    if let Err(e) = stream.write_all(format!("{line}\n").as_bytes()) {
+    let cwd = current_cwd();
+    if let Err(e) = stream.write_all(format!("{cwd}\n{line}\n").as_bytes()) {
         eprintln!("bo: cannot reach the daemon: {e}");
         return 1;
     }
@@ -1385,10 +1419,13 @@ fn serve_loop(
         let exit = exit.clone();
         let idle = idle.clone();
         thread::spawn(move || {
-            let mut line = String::new();
             let mut reader = BufReader::new(&mut stream);
+            let mut cwd = String::new();
+            let Ok(_) = reader.read_line(&mut cwd) else { return };
+            let mut line = String::new();
             let Ok(_) = reader.read_line(&mut line) else { return };
-            let (code, output, ends_session) = handle_line(&state, line.trim_end());
+            let cwd = cwd.trim_end().to_string();
+            let (code, output, ends_session) = handle_line(&state, line.trim_end(), &cwd);
             *idle.lock().unwrap() = Instant::now();
             let _ = stream.write_all(format!("{code}\n{output}").as_bytes());
             // The reply is on the wire before the session may end, so the
@@ -1402,7 +1439,7 @@ fn serve_loop(
 
 /// One command over the wire: parse, dispatch, and frame the reply. The third
 /// value says whether this command ends the daemon's session.
-fn handle_line(state: &Mutex<Arrangement>, line: &str) -> (i32, String, bool) {
+fn handle_line(state: &Mutex<Arrangement>, line: &str, cwd: &str) -> (i32, String, bool) {
     let args = match tokenize(line) {
         Ok(args) => args,
         Err(e) => return (2, format!("bo: {e}\n"), false),
@@ -1413,7 +1450,7 @@ fn handle_line(state: &Mutex<Arrangement>, line: &str) -> (i32, String, bool) {
     };
     let ends_session = matches!(command, Command::Stop);
     let mut a = state.lock().unwrap();
-    match dispatch(&mut a, command) {
+    match dispatch(&mut a, command, cwd) {
         Ok(out) => (0, out.to_string(), ends_session),
         Err((code, msg)) => (code, format!("bo: {msg}\n"), ends_session),
     }
@@ -1428,7 +1465,7 @@ mod tests {
 
     fn run_ok(a: &mut Arrangement, args: &[&str]) -> String {
         let v: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-        match parse_command(&v).map_err(|e| (e.exit_code(), String::new())).and_then(|c| dispatch(a, c)) {
+        match parse_command(&v).map_err(|e| (e.exit_code(), String::new())).and_then(|c| dispatch(a, c, "")) {
             Ok(out) => out.to_string(),
             Err((code, msg)) => panic!("command {args:?} failed ({code}): {msg}"),
         }
@@ -1438,7 +1475,7 @@ mod tests {
         let v: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         parse_command(&v)
             .map_err(|e| (e.exit_code(), String::new()))
-            .and_then(|c| dispatch(a, c))
+            .and_then(|c| dispatch(a, c, ""))
             .unwrap_err()
     }
 
@@ -1484,7 +1521,7 @@ mod tests {
 
     fn send(socket: &Path, line: &str) -> String {
         let mut stream = UnixStream::connect(socket).unwrap();
-        stream.write_all(format!("{line}\n").as_bytes()).unwrap();
+        stream.write_all(format!("\n{line}\n").as_bytes()).unwrap();
         let mut reply = String::new();
         stream.read_to_string(&mut reply).unwrap();
         reply
@@ -1588,6 +1625,23 @@ mod tests {
         assert_eq!(parse_placement("").unwrap(), (None, None));
         assert!(parse_placement("abc").is_err());
         assert!(parse_placement("0@bogus").is_err());
+    }
+
+    #[test]
+    fn relative_paths_resolve_against_the_command_cwd() {
+        assert_eq!(absolutize("a.wav", "/srv"), "/srv/a.wav");
+        assert_eq!(absolutize("/abs/a.wav", "/srv"), "/abs/a.wav");
+        assert_eq!(absolutize("http://x/y.mp3", "/srv"), "http://x/y.mp3");
+        // An empty cwd leaves relative paths relative (used by unit tests).
+        assert_eq!(absolutize("a.wav", ""), "a.wav");
+
+        // dispatch threads the cwd through to put, so the stored uri is
+        // absolute regardless of the daemon's own cwd.
+        let mut a = Arrangement::default();
+        let args: Vec<String> = ["put".into(), "a.wav,0-1".into()].to_vec();
+        let cmd = parse_command(&args).unwrap();
+        dispatch(&mut a, cmd, "/srv").unwrap();
+        assert_eq!(a.player.tracks()[0].clips()[0].source.uri, "/srv/a.wav");
     }
 
     #[test]
@@ -2006,13 +2060,13 @@ mod tests {
         let mut a = Arrangement::default();
         // Two butt-joined clips: 0..0.5s and 0.5..1.0s.
         let put = parse_command(&["put".to_string(), spec.clone()]).unwrap();
-        dispatch(&mut a, put).unwrap();
+        dispatch(&mut a, put, "").unwrap();
         let put2 = parse_command(&["put".to_string(), format!("{},00:00:00-00:00:00.500", src.to_string_lossy()), "@00:00:00.500".to_string()]).unwrap();
-        dispatch(&mut a, put2).unwrap();
+        dispatch(&mut a, put2, "").unwrap();
 
         // A 0.25s window from 0.25s: half of the first clip only.
         let render = parse_command(&["render".to_string(), out_s.clone(), "00:00:00.250-00:00:00.500".to_string()]).unwrap();
-        let reply = dispatch(&mut a, render).unwrap().to_string();
+        let reply = dispatch(&mut a, render, "").unwrap().to_string();
         assert!(reply.contains("00:00:00.250"), "rendered span: {reply}");
         let decoder = rodio::Decoder::new(std::io::BufReader::new(std::fs::File::open(&out).unwrap())).unwrap();
         let total = decoder.total_duration().unwrap();
@@ -2031,9 +2085,9 @@ mod tests {
 
         let mut a = Arrangement::default();
         let put = parse_command(&["put".to_string(), spec]).unwrap();
-        dispatch(&mut a, put).unwrap();
+        dispatch(&mut a, put, "").unwrap();
         let render = parse_command(&["render".to_string(), out_s.clone()]).unwrap();
-        let reply = dispatch(&mut a, render).unwrap().to_string();
+        let reply = dispatch(&mut a, render, "").unwrap().to_string();
         assert!(reply.contains("rendered") && reply.contains("00:00:00.200"), "{reply}");
         assert!(out.exists() && out.metadata().unwrap().len() > 1000, "a real wav was written");
         std::fs::remove_dir_all(&dir).ok();
@@ -2067,7 +2121,7 @@ mod tests {
         assert!(script.contains("set track.1.muted true"), "{script}");
         assert!(script.contains("set master 0.78"), "master is saved: {script}");
         let mut fresh = Arrangement::default();
-        run_script(&mut fresh, &script, "test").unwrap();
+        run_script(&mut fresh, &script, "test", "").unwrap();
         assert_eq!(serialize(&fresh), script, "the script rebuilds the same arrangement");
     }
 
@@ -2136,7 +2190,7 @@ mod tests {
         run_ok(&mut a, &["put", &spec]);
 
         let render = parse_command(&["render".to_string(), "--measure".to_string()]).unwrap();
-        let reply = dispatch(&mut a, render).unwrap().to_string();
+        let reply = dispatch(&mut a, render, "").unwrap().to_string();
         assert!(reply.starts_with("measure: 00:00:01.000"), "{reply}");
         assert!(reply.contains("peak: -6.0 dBFS"), "{reply}");
         assert!(reply.contains("rms: -9.0 dBFS"), "{reply}");
@@ -2165,7 +2219,7 @@ mod tests {
             "--measure".to_string(),
         ])
         .unwrap();
-        let reply = dispatch(&mut a, render).unwrap().to_string();
+        let reply = dispatch(&mut a, render, "").unwrap().to_string();
         assert!(reply.starts_with("rendered"), "{reply}");
         assert!(reply.contains("rms:"), "{reply}");
         assert!(out.exists(), "the file was still written");
@@ -2176,7 +2230,7 @@ mod tests {
     fn measure_only_refuses_an_empty_arrangement() {
         let mut a = Arrangement::default();
         let render = parse_command(&["render".to_string(), "--measure".to_string()]).unwrap();
-        let (code, msg) = dispatch(&mut a, render).unwrap_err();
+        let (code, msg) = dispatch(&mut a, render, "").unwrap_err();
         assert_eq!(code, 1);
         assert!(msg.contains("no clips: nothing to measure"), "{msg}");
     }
@@ -2185,14 +2239,14 @@ mod tests {
     fn render_without_file_or_measure_is_usage() {
         let mut a = Arrangement::default();
         let render = parse_command(&["render".to_string()]).unwrap();
-        let (code, msg) = dispatch(&mut a, render).unwrap_err();
+        let (code, msg) = dispatch(&mut a, render, "").unwrap_err();
         assert_eq!(code, 2);
         assert!(msg.contains("--measure"), "{msg}");
         // A bare range in the file slot is caught with guidance.
         run_ok(&mut a, &["put", "a.wav,00:00:00-00:00:10"]);
         let render = parse_command(&["render".to_string(), "0-3".to_string(), "--measure".to_string()])
             .unwrap();
-        let (code, msg) = dispatch(&mut a, render).unwrap_err();
+        let (code, msg) = dispatch(&mut a, render, "").unwrap_err();
         assert_eq!(code, 2);
         assert!(msg.contains("looks like a range"), "{msg}");
     }
@@ -2215,7 +2269,7 @@ mod tests {
         let spec = format!("{},00:00:00-00:00:00.200", src.to_string_lossy());
         let mut a = Arrangement::default();
         let put = parse_command(&["put".to_string(), spec]).unwrap();
-        dispatch(&mut a, put).unwrap();
+        dispatch(&mut a, put, "").unwrap();
         let out = run_ok(&mut a, &["check"]);
         assert!(out.contains("all sources ok"), "{out}");
         std::fs::remove_dir_all(&dir).ok();
