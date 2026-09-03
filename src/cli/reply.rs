@@ -41,7 +41,8 @@ pub(crate) struct PlacedClip {
     pub(crate) id: u64,
     pub(crate) uri: String,
     pub(crate) at: Duration,
-    pub(crate) open_ended: bool,
+    pub(crate) from: Duration,
+    pub(crate) to: Duration,
 }
 
 /// The four shapes of `set`.
@@ -67,7 +68,7 @@ pub(crate) struct AtLine {
     pub(crate) id: u64,
     pub(crate) uri: String,
     pub(crate) at: Duration,
-    pub(crate) end: Option<Duration>,
+    pub(crate) end: Duration,
 }
 
 /// The `ls` report.
@@ -75,7 +76,7 @@ pub(crate) struct AtLine {
 pub(crate) struct Ls {
     pub(crate) state: State,
     pub(crate) playhead: Duration,
-    pub(crate) end: Option<Duration>,
+    pub(crate) end: Duration,
     pub(crate) backend: &'static str,
     pub(crate) volume: f32,
     pub(crate) tracks: Vec<LsTrack>,
@@ -86,7 +87,7 @@ pub(crate) struct LsTrack {
     pub(crate) name: Option<String>,
     pub(crate) volume: f32,
     pub(crate) muted: bool,
-    pub(crate) end: Option<Duration>,
+    pub(crate) end: Duration,
     pub(crate) clips: Vec<LsClip>,
 }
 
@@ -95,9 +96,9 @@ pub(crate) struct LsClip {
     pub(crate) id: u64,
     pub(crate) uri: String,
     pub(crate) at: Duration,
-    pub(crate) end: Option<Duration>,
+    pub(crate) end: Duration,
     pub(crate) from: Duration,
-    pub(crate) src_to: Option<Duration>,
+    pub(crate) src_to: Duration,
 }
 
 /// The data of one command reply.
@@ -110,7 +111,7 @@ pub(crate) enum Output {
     Session {
         tracks: usize,
         clips: usize,
-        end: Option<Duration>,
+        end: Duration,
         backend: &'static str,
         playhead: Duration,
         note: Option<String>,
@@ -173,13 +174,14 @@ impl fmt::Display for Output {
         match self {
             Self::Put { track, clips } => {
                 for c in clips {
-                    let open = if c.open_ended { " (open-ended)" } else { "" };
                     writeln!(
                         f,
-                        "ok: track {track} clip #{} {} @ {}{open}",
+                        "ok: track {track} clip #{} {} @ {} src={}-{}",
                         c.id,
                         c.uri,
-                        Tc(c.at)
+                        Tc(c.at),
+                        Tc(c.from),
+                        Tc(c.to)
                     )?;
                 }
                 Ok(())
@@ -192,12 +194,10 @@ impl fmt::Display for Output {
                 playhead,
                 note,
             } => {
-                let end = end
-                    .map(|d| Tc(d).to_string())
-                    .unwrap_or_else(|| "inf".into());
                 writeln!(
                     f,
-                    "session: {tracks} tracks | {clips} clips | ends {end} | backend {backend}"
+                    "session: {tracks} tracks | {clips} clips | ends {} | backend {backend}",
+                    Tc(*end)
                 )?;
                 writeln!(f, "playing from {}", Tc(*playhead))?;
                 if let Some(note) = note {
@@ -296,24 +296,17 @@ impl fmt::Display for Output {
                 Ok(())
             }
             Self::Ls(ls) => {
-                let end = ls
-                    .end
-                    .map(|d| Tc(d).to_string())
-                    .unwrap_or_else(|| "inf".into());
                 writeln!(
                     f,
-                    "state: {}\nplayhead: {}\nend: {end}\nbackend: {}\nvolume: {}\ntracks: {}",
+                    "state: {}\nplayhead: {}\nend: {}\nbackend: {}\nvolume: {}\ntracks: {}",
                     ls.state,
                     Tc(ls.playhead),
+                    Tc(ls.end),
                     ls.backend,
                     Gain(ls.volume),
                     ls.tracks.len()
                 )?;
                 for (ti, t) in ls.tracks.iter().enumerate() {
-                    let dur = t
-                        .end
-                        .map(|d| Tc(d).to_string())
-                        .unwrap_or_else(|| "inf".into());
                     let mute = if t.muted { " muted" } else { "" };
                     let name = match &t.name {
                         Some(name) => format!("name={name} "),
@@ -321,26 +314,21 @@ impl fmt::Display for Output {
                     };
                     writeln!(
                         f,
-                        "track {ti}: {name}volume={}{mute} clips={} end={dur}",
+                        "track {ti}: {name}volume={}{mute} clips={} end={}",
                         Gain(t.volume),
-                        t.clips.len()
+                        t.clips.len(),
+                        Tc(t.end)
                     )?;
                     for c in &t.clips {
-                        let end = c
-                            .end
-                            .map(|d| Tc(d).to_string())
-                            .unwrap_or_else(|| "inf".into());
-                        let src_to = c
-                            .src_to
-                            .map(|d| Tc(d).to_string())
-                            .unwrap_or_else(|| "inf".into());
                         writeln!(
                             f,
-                            "  clip {}: uri={} at={} end={end} src={}-{src_to}",
+                            "  clip {}: uri={} at={} end={} src={}-{}",
                             c.id,
                             c.uri,
                             Tc(c.at),
-                            Tc(c.from)
+                            Tc(c.end),
+                            Tc(c.from),
+                            Tc(c.src_to)
                         )?;
                     }
                 }
@@ -351,17 +339,14 @@ impl fmt::Display for Output {
                     return writeln!(f, "silent at {}", Tc(*at));
                 }
                 for line in active {
-                    let end = line
-                        .end
-                        .map(|d| Tc(d).to_string())
-                        .unwrap_or_else(|| "inf".into());
                     writeln!(
                         f,
-                        "track {}: clip={} uri={} at={} end={end}",
+                        "track {}: clip={} uri={} at={} end={}",
                         line.track,
                         line.id,
                         line.uri,
-                        Tc(line.at)
+                        Tc(line.at),
+                        Tc(line.end)
                     )?;
                 }
                 Ok(())

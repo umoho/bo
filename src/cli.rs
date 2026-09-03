@@ -29,12 +29,12 @@
 //!
 //! # Commands
 //!
-//! * `put [--repeat n] <spec> [track]` — place a clip, or n butt-joined
-//!   copies of it, on a track; without `[track]` a new track is created and
-//!   its index printed, so later puts can target it. With `[track]` the track
-//!   is used, created on demand (up to that index). A repeated clip must have
-//!   a known end (`uri:from-to`), and the whole batch is refused atomically
-//!   if any copy collides.
+//! * `put [--repeat n] <spec> [where]` — place a clip, or n butt-joined
+//!   copies of it, on a track; `where` is `track[@pos]`, an omitted track
+//!   creates a fresh one and an omitted pos means the playhead. A track is
+//!   created on demand (up to that index). A source with no out-point is
+//!   probed at put time; the whole batch is refused atomically if any copy
+//!   collides.
 //! * `play` — start playback from the current playhead; refused with exit 1
 //!   when the arrangement has nothing to play, and the reply opens with a
 //!   `session:` summary of what is about to play.
@@ -67,23 +67,17 @@
 //!
 //! # Clip specs
 //!
-//! A spec is one compact string, `uri[@at][:from-to]`:
+//! A spec is one compact string, `uri[,from-to]`:
 //!
-//! * `uri` alone — the whole source at track time 0;
-//! * `@at` — place the clip at track time `at` instead;
-//! * `:from-to` — play only `from..to` of the source; `to` may be empty
-//!   (`from-`), meaning "to the end of the source";
-//! * `@at:from-to` — both.
+//! * `uri` alone — the whole source, probed for its length;
+//! * `,from-to` — play only `from..to` of the source; `to` may be empty
+//!   (`from-`), meaning "to the end of the source".
 //!
-//! Timecodes are `SS`, `MM:SS` or `HH:MM:SS`, plus an optional `.fff`
-//! fraction. In `@at:from-to` the `at`/`from` boundary is the rightmost colon
-//! that leaves two valid timecodes, so the serialized form — every field as
-//! `HH:MM:SS.fff` — round-trips exactly.
-//!
-//! A clip with no known end (an unsliced, unprobed source) is open-ended: it
-//! blocks everything after it on the same track, and an arrangement that
-//! contains one never finishes — the daemon plays until told to stop. Slice
-//! what you place (`uri:from-to`) to keep arranging.
+//! Placement is a separate argument, `track[@pos]`: `@` marks the track
+//! position (default the playhead); `,` marks the slice; `:` is reserved for
+//! timecodes (`SS`, `MM:SS` or `HH:MM:SS`, plus an optional `.fff` fraction).
+//! A source with no out-point is probed at put time so every clip has a known
+//! finite length; a source that cannot be measured is refused.
 
 use std::fmt::Write as _;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -129,16 +123,16 @@ struct Cli {
 enum Command {
     /// Place a clip on a track.
     ///
-    /// The spec is `uri[@at][:from-to]`: `at` positions the clip on the track
-    /// (default 0), `from-to` slices the source (an empty `to` plays to the
-    /// source's end). Timecodes are SS, MM:SS or HH:MM:SS with an optional
-    /// .fff fraction. Without a track index a new track is created and its
-    /// index printed; a named track is created on demand.
+    /// The spec is `uri[,from-to]`: `from-to` slices the source (default the
+    /// whole source, resolved by probing). The placement is `track[@pos]`: a
+    /// track index (created on demand) and a position (default the playhead).
+    /// Timecodes are SS, MM:SS or HH:MM:SS with an optional .fff fraction.
     Put {
-        /// uri[@at][:from-to]
+        /// uri[,from-to]
         spec: String,
-        /// Track index; omit to create a fresh track.
-        track: Option<usize>,
+        /// Where to place it: track[@pos] — omit the track for a fresh one,
+        /// omit the pos for the playhead.
+        placement: Option<String>,
         /// Place this many butt-joined copies of the clip.
         #[arg(long)]
         repeat: Option<u32>,
@@ -223,11 +217,10 @@ enum Command {
     Daemon,
 }
 
-/// A clip description before it exists: `uri[@at][:from-to]`.
+/// A clip description before it exists: `uri[,from-to]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Spec {
     uri: String,
-    at: Option<Duration>,
     from: Duration,
     to: Option<Duration>,
 }
@@ -351,8 +344,8 @@ USAGE
 COMMANDS
 
 Arrangement:
-  put <spec> [track]       place a clip; without [track] a new track is
-                           created and its index printed
+  put <spec> [where]       place a clip; where = track[@pos] — omit the track
+                           for a fresh one and the pos for the playhead
                            (--repeat n places n butt-joined copies)
   take <track> <clip>      remove a clip — by its id, or the @timecode it
                            covers
@@ -394,21 +387,21 @@ OPTIONS
   -V, --version            print version
 
 CLIP SPEC
-  uri[@at][:from-to]       at = position on the track (default 0)
-                           from-to = slice of the source (empty to = end)
-  Timecodes: SS, MM:SS or HH:MM:SS, optional .fff fraction.
+  uri[,from-to]            from-to = slice of the source (default: whole,
+                           resolved by probing); `,` marks the slice
+  track[@pos]              track = index (created on demand), pos = where on
+                           the track (default: playhead); `@` marks position
+  Timecodes: SS, MM:SS or HH:MM:SS, optional .fff fraction. `:` is reserved
+  for timecodes.
 
-  A clip with no known end (an unsliced, unprobed source) is open-ended:
-  it occupies its track from its position on, so nothing can follow it
-  there — a later put on the same track is refused even past the source's
-  real length. A session containing one never finishes by itself. Slice
-  what you place (uri:from-to), or probe the source first, to give the
-  clip a length. Spans are half-open: clips may butt-join (one ends exactly
-  where the next starts).
+  A source with no out-point is probed at put time and its whole length is
+  used, so every clip has a known finite end; a source that cannot be
+  measured is refused (run `bo probe <uri>`). Spans are half-open: clips
+  may butt-join (one ends exactly where the next starts).
 
 EXAMPLES
-  bo put bed.wav:00:00:00-00:00:30
-  bo put voice.wav:00:00:00-00:00:30 1
+  bo put bed.wav,00:00:00-00:00:30
+  bo put voice.wav,00:00:00-00:00:30 1@00:00:00
   bo set track.0.volume 0.4  # duck the bed under the voice
   bo apply                 # make the change audible now
   bo play
@@ -467,44 +460,24 @@ fn format_time(d: Duration) -> String {
     Tc(d).to_string()
 }
 
-/// Parse a clip spec into its pieces. See the module docs for the grammar.
+/// Parse a clip spec into its pieces: `uri[,from-to]`. `,` marks the slice;
+/// `:` is reserved for timecodes. Position is not part of the spec — it lives
+/// in the placement argument (`track[@pos]`).
 fn parse_spec(s: &str) -> Result<Spec, String> {
     let s = s.trim();
     let mut spec = Spec {
         uri: String::new(),
-        at: None,
         from: Duration::ZERO,
         to: None,
     };
-    if let Some((uri, placement)) = s.split_once('@') {
-        spec.uri = uri.trim().to_string();
-        let placement = placement.trim();
-        if placement.is_empty() {
-            return Ok(spec); // "uri@" — just the uri
-        }
-        if let Some((lhs, rhs)) = placement.split_once('-') {
-            let (at, from) = split_at_from(lhs)?;
-            spec.at = at;
-            spec.from = from;
-            let rhs = rhs.trim();
-            spec.to = if rhs.is_empty() { None } else { Some(parse_timecode(rhs)?) };
-        } else {
-            spec.at = Some(parse_timecode(placement)?);
-        }
-    } else if let Some((uri, placement)) = s.split_once(':') {
-        // Slice without a position: uri:from[-to]. A ':' that does not begin a
-        // slice (e.g. scheme://) is left alone.
-        let placement = placement.trim();
-        if let Some((from, to)) = placement.split_once('-') {
+    match s.split_once(',') {
+        Some((uri, slice)) => {
             spec.uri = uri.trim().to_string();
-            spec.from = parse_timecode(from)?;
-            let to = to.trim();
-            spec.to = if to.is_empty() { None } else { Some(parse_timecode(to)?) };
-        } else {
-            spec.uri = s.to_string();
+            let (from, to) = parse_slice(slice)?;
+            spec.from = from;
+            spec.to = to;
         }
-    } else {
-        spec.uri = s.to_string();
+        None => spec.uri = s.to_string(),
     }
     if spec.uri.is_empty() {
         return Err("missing uri in clip spec".to_string());
@@ -512,21 +485,57 @@ fn parse_spec(s: &str) -> Result<Spec, String> {
     Ok(spec)
 }
 
-/// The `at`/`from` boundary inside `@at:from-to`: the rightmost colon that
-/// splits `lhs` into two valid timecodes. With none, the whole `lhs` is
-/// `from`.
-fn split_at_from(lhs: &str) -> Result<(Option<Duration>, Duration), String> {
-    let mut best: Option<(Duration, Duration)> = None;
-    for (i, ch) in lhs.char_indices() {
-        if ch == ':'
-            && let (Ok(at), Ok(from)) = (parse_timecode(&lhs[..i]), parse_timecode(&lhs[i + 1..]))
-        {
-            best = Some((at, from));
-        }
+/// Parse the `from-to` part of a slice: `from-to`, or `from-` to the source's
+/// end.
+fn parse_slice(s: &str) -> Result<(Duration, Option<Duration>), String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("missing slice after ','".to_string());
     }
-    match best {
-        Some((at, from)) => Ok((Some(at), from)),
-        None => parse_timecode(lhs).map(|from| (None, from)),
+    match s.split_once('-') {
+        Some((from, to)) => {
+            let from = parse_timecode(from)?;
+            let to = if to.trim().is_empty() {
+                None
+            } else {
+                Some(parse_timecode(to)?)
+            };
+            Ok((from, to))
+        }
+        None => Err(format!("bad slice {s:?}: expected from-to")),
+    }
+}
+
+/// Parse a placement: `track[@pos]`. `track` is a track index (created on
+/// demand); `pos` is a track timecode. Either may be omitted: an omitted
+/// track means a fresh one, an omitted pos means the playhead.
+fn parse_placement(s: &str) -> Result<(Option<usize>, Option<Duration>), String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Ok((None, None));
+    }
+    match s.split_once('@') {
+        Some((track, pos)) => {
+            let track = if track.is_empty() {
+                None
+            } else {
+                Some(
+                    track
+                        .parse::<usize>()
+                        .map_err(|_| format!("bad track {track:?}"))?,
+                )
+            };
+            let pos = if pos.is_empty() {
+                None
+            } else {
+                Some(parse_timecode(pos)?)
+            };
+            Ok((track, pos))
+        }
+        None => {
+            let track = s.parse::<usize>().map_err(|_| format!("bad track {s:?}"))?;
+            Ok((Some(track), None))
+        }
     }
 }
 
@@ -555,7 +564,7 @@ fn parse_command(args: &[String]) -> Result<Command, clap::Error> {
 /// Run a parsed subcommand against the arrangement.
 fn dispatch(a: &mut Arrangement, command: Command) -> Result<Output, (i32, String)> {
     match command {
-        Command::Put { spec, track, repeat } => put_command(a, &spec, track, repeat),
+        Command::Put { spec, placement, repeat } => put_command(a, &spec, placement.as_deref(), repeat),
         Command::Play => play_command(a),
         Command::Ls => Ok(Output::Ls(arrangement_view(a))),
         Command::At { at } => at_command(a, &at),
@@ -591,7 +600,7 @@ fn dispatch(a: &mut Arrangement, command: Command) -> Result<Output, (i32, Strin
             match (file, measure) {
                 // A bare measure of the whole arrangement.
                 (None, true) => {
-                    if a.player.duration() == Some(Duration::ZERO) {
+                    if a.player.duration() == Duration::ZERO {
                         return Err(fail("no clips: nothing to measure"));
                     }
                     let (duration, stats) =
@@ -723,7 +732,7 @@ fn arrangement_view(a: &Arrangement) -> Ls {
                         at: c.at,
                         end: c.end(),
                         from: c.from,
-                        src_to: c.to.or(c.source.duration),
+                        src_to: c.to,
                     })
                     .collect(),
             })
@@ -786,7 +795,7 @@ fn take_command(
     }
 }
 
-/// `put <spec> [track]`: place a clip, creating the track when needed.
+/// `put <spec> [track[@pos]]`: place a clip, creating the track when needed.
 ///
 /// The identifier in the output is the contract: an implicit put creates a
 /// fresh track and prints its index; an explicit one names a track, created on
@@ -796,7 +805,7 @@ fn take_command(
 fn put_command(
     a: &mut Arrangement,
     spec_arg: &str,
-    want_track: Option<usize>,
+    placement_arg: Option<&str>,
     repeat: Option<u32>,
 ) -> Result<Output, (i32, String)> {
     let repeat = repeat.unwrap_or(1);
@@ -804,11 +813,23 @@ fn put_command(
         return Err(usage("repeat must be at least 1"));
     }
     let spec = parse_spec(spec_arg).map_err(usage)?;
-    if repeat > 1 && spec.to.is_none() {
-        return Err(usage(
-            "cannot repeat a clip with no known end (slice it: uri:from-to)",
-        ));
-    }
+    // A clip with no out-point plays to the source's end; resolve that end
+    // now by probing, so every clip has a known finite length. Unmeasurable
+    // sources are refused here instead of becoming a clip that blocks the
+    // track and can never play.
+    let to = match spec.to {
+        Some(to) => to,
+        None => probe(&spec.uri).map_err(|e| {
+            fail(format!(
+                "refused: cannot place {}: {e}; run: bo probe {}",
+                spec.uri, spec.uri
+            ))
+        })?,
+    };
+    let (want_track, want_at) = match placement_arg {
+        Some(p) => parse_placement(p).map_err(usage)?,
+        None => (None, None),
+    };
     let track_index = match want_track {
         Some(i) => {
             while a.player.tracks().len() <= i {
@@ -819,18 +840,14 @@ fn put_command(
         None => a.player.add_track(Track::new()),
     };
     let source = Arc::new(Source::new(spec.uri.clone()));
-    let base_at = spec.at.unwrap_or_default();
-    let slice_len = if repeat > 1 {
-        let len = spec.to.unwrap_or_default() - spec.from;
-        if len == Duration::ZERO {
-            return Err(usage("cannot repeat a zero-length slice"));
-        }
-        len
-    } else {
-        Duration::ZERO
-    };
+    // Placement: an explicit pos wins; otherwise drop at the playhead.
+    let base_at = want_at.unwrap_or_else(|| a.player.playhead());
+    let slice_len = to.saturating_sub(spec.from);
+    if repeat > 1 && slice_len == Duration::ZERO {
+        return Err(usage("cannot repeat a zero-length slice"));
+    }
     let clips: Vec<Clip> = (0..repeat)
-        .map(|i| Clip::sliced(source.clone(), spec.from, spec.to).at(base_at + slice_len * i))
+        .map(|i| Clip::sliced(source.clone(), spec.from, to).at(base_at + slice_len * i))
         .collect();
     // Atomic: verify every copy fits before inserting any, so a collision
     // leaves no trace. The daemon holds the arrangement lock throughout.
@@ -840,18 +857,13 @@ fn put_command(
             // Say where the conflict actually sits and where the clip could
             // go instead: half-open spans, so a butt-join against an end is
             // legal and the report says so by listing that end as free.
-            let span = match conflict.end() {
-                Some(end) => format!(
-                    "[{:.3},{:.3})",
-                    conflict.at.as_secs_f64(),
-                    end.as_secs_f64()
-                ),
-                None => format!("[{:.3},inf)", conflict.at.as_secs_f64()),
-            };
-            let hint = match track.next_free_start(c.at, c.duration()) {
-                Some(next) => format!("next free start {:.3}s", next.as_secs_f64()),
-                None => "no free start after this (track blocked)".to_string(),
-            };
+            let span = format!(
+                "[{:.3},{:.3})",
+                conflict.at.as_secs_f64(),
+                conflict.end().as_secs_f64()
+            );
+            let next = track.next_free_start(c.at, c.duration());
+            let hint = format!("next free start {:.3}s", next.as_secs_f64());
             return Err(fail(format!(
                 "refused: copy {i} at {:.3}s collides with clip #{} {span}; {hint}",
                 c.at.as_secs_f64(),
@@ -873,7 +885,8 @@ fn put_command(
             id,
             uri: placed.source.uri.clone(),
             at: placed.at,
-            open_ended: placed.duration().is_none(),
+            from: placed.from,
+            to: placed.to,
         });
     }
     Ok(Output::Put {
@@ -890,7 +903,7 @@ fn play_command(a: &mut Arrangement) -> Result<Output, (i32, String)> {
     // An empty arrangement (or one whose clips are all zero-length) would
     // finish instantly: refuse before touching the transport, so the daemon
     // neither fakes success nor tears itself down.
-    if a.player.duration() == Some(Duration::ZERO) {
+    if a.player.duration() == Duration::ZERO {
         return Err(fail("no clips: nothing to play"));
     }
     let tracks = a.player.tracks().iter().filter(|t| !t.is_empty()).count();
@@ -1048,14 +1061,14 @@ fn parse_range(s: &str) -> Result<(Duration, Option<Duration>), String> {
 /// names with whitespace survive [`handle_line`]'s tokenizer.
 fn command_line(command: &Command) -> String {
     match command {
-        Command::Put { spec, track, repeat } => {
+        Command::Put { spec, placement, repeat } => {
             let mut line = String::from("put");
             if let Some(n) = repeat {
                 let _ = write!(line, " --repeat {n}");
             }
             let _ = write!(line, " {}", quote_arg(spec));
-            if let Some(t) = track {
-                let _ = write!(line, " {t}");
+            if let Some(p) = placement {
+                let _ = write!(line, " {}", quote_arg(p));
             }
             line
         }
@@ -1111,14 +1124,13 @@ fn serialize(a: &Arrangement) -> String {
             continue; // empty tracks carry nothing worth saving
         }
         for c in t.clips() {
-            let to = c.to.map(format_time).unwrap_or_default();
             let _ = writeln!(
                 out,
-                "put {}@{}:{}-{} {ti}",
+                "put {},{}-{} {ti}@{}",
                 quote_arg(&c.source.uri),
-                format_time(c.at),
                 format_time(c.from),
-                to
+                format_time(c.to),
+                format_time(c.at)
             );
         }
         if let Some(name) = t.name() {
@@ -1490,8 +1502,8 @@ mod tests {
     fn wire_words_parse_with_shell_quoting() {
         assert_eq!(tokenize("put a.wav 0").unwrap(), ["put", "a.wav", "0"]);
         assert_eq!(
-            tokenize("put '/tmp/Bo FM.wav':00:00:00-00:00:10 0").unwrap(),
-            ["put", "/tmp/Bo FM.wav:00:00:00-00:00:10", "0"]
+            tokenize("put '/tmp/Bo FM.wav',00:00:00-00:00:10 0").unwrap(),
+            ["put", "/tmp/Bo FM.wav,00:00:00-00:00:10", "0"]
         );
         assert_eq!(tokenize("set track.3.name \"bed soft\"").unwrap(), ["set", "track.3.name", "bed soft"]);
         assert_eq!(tokenize("put a\\ b.wav").unwrap(), ["put", "a b.wav"]);
@@ -1538,48 +1550,57 @@ mod tests {
     #[test]
     fn clip_specs_parse() {
         let s = parse_spec("a.wav").unwrap();
-        assert_eq!((s.uri.as_str(), s.at, s.from, s.to), ("a.wav", None, Duration::ZERO, None));
-
-        let s = parse_spec("a.wav@00:30").unwrap();
-        assert_eq!((s.uri.as_str(), s.at), ("a.wav", Some(Duration::from_secs(30))));
-
-        let s = parse_spec("a.wav:00:00:30-00:00:45").unwrap();
         assert_eq!(
-            (s.uri.as_str(), s.at, s.from, s.to),
-            ("a.wav", None, Duration::from_secs(30), Some(Duration::from_secs(45)))
+            (s.uri.as_str(), s.from, s.to),
+            ("a.wav", Duration::ZERO, None)
         );
 
-        let s = parse_spec("a.wav@00:01:00:00:00:30-00:00:45").unwrap();
-        assert_eq!(s.at, Some(Duration::from_secs(60)));
-        assert_eq!(s.from, Duration::from_secs(30));
-        assert_eq!(s.to, Some(Duration::from_secs(45)));
+        let s = parse_spec("a.wav,00:00:30-00:00:45").unwrap();
+        assert_eq!(
+            (s.uri.as_str(), s.from, s.to),
+            ("a.wav", Duration::from_secs(30), Some(Duration::from_secs(45)))
+        );
 
-        let s = parse_spec("a.wav@00:01:00:00:00:30-").unwrap();
+        let s = parse_spec("a.wav,00:00:30-").unwrap();
         assert_eq!(s.to, None);
 
-        let s = parse_spec("my-file.wav:00:30-00:45").unwrap();
+        let s = parse_spec("my-file.wav,00:30-00:45").unwrap();
         assert_eq!(s.uri, "my-file.wav");
         assert_eq!(s.from, Duration::from_secs(30));
 
-        let s = parse_spec("a.wav@").unwrap();
-        assert_eq!(s.uri, "a.wav");
-        assert_eq!(s.at, None);
-
         assert!(parse_spec("").is_err());
-        assert!(parse_spec("a.wav@bogus").is_err());
+        assert!(parse_spec("a.wav,bogus").is_err());
+        assert!(parse_spec("a.wav,").is_err());
+    }
+
+    #[test]
+    fn placements_parse() {
+        assert_eq!(parse_placement("0").unwrap(), (Some(0), None));
+        assert_eq!(
+            parse_placement("0@00:00:10").unwrap(),
+            (Some(0), Some(Duration::from_secs(10)))
+        );
+        assert_eq!(
+            parse_placement("@00:00:10").unwrap(),
+            (None, Some(Duration::from_secs(10)))
+        );
+        assert_eq!(parse_placement("0@").unwrap(), (Some(0), None));
+        assert_eq!(parse_placement("").unwrap(), (None, None));
+        assert!(parse_placement("abc").is_err());
+        assert!(parse_placement("0@bogus").is_err());
     }
 
     #[test]
     fn put_creates_tracks_and_returns_identifiers() {
         let mut a = Arrangement::default();
-        let out = run_ok(&mut a, &["put", "a.wav:00:00:00-00:00:10"]);
+        let out = run_ok(&mut a, &["put", "a.wav,00:00:00-00:00:10"]);
         assert!(out.contains("track 0"), "{out}");
-        let out = run_ok(&mut a, &["put", "b.wav:00:00:00-00:00:10"]);
+        let out = run_ok(&mut a, &["put", "b.wav,00:00:00-00:00:10"]);
         assert!(out.contains("track 1"), "each implicit put gets a fresh track: {out}");
         assert_eq!(a.player.tracks().len(), 2);
 
         // The printed identifier names a track for later puts.
-        let out = run_ok(&mut a, &["put", "c.wav@00:00:10:00:00:00-00:00:05", "0"]);
+        let out = run_ok(&mut a, &["put", "c.wav,00:00:00-00:00:05", "0@00:00:10"]);
         assert!(out.contains("track 0"), "{out}");
         let t = &a.player.tracks()[0];
         assert_eq!(t.clips().len(), 2);
@@ -1589,7 +1610,7 @@ mod tests {
     #[test]
     fn a_named_track_is_created_on_demand() {
         let mut a = Arrangement::default();
-        run_ok(&mut a, &["put", "a.wav:00:00:00-00:00:10", "3"]);
+        run_ok(&mut a, &["put", "a.wav,00:00:00-00:00:10", "3"]);
         assert_eq!(a.player.tracks().len(), 4, "tracks up to the index are created");
         assert_eq!(a.player.tracks()[3].clips().len(), 1);
         assert!(a.player.tracks()[0].is_empty());
@@ -1598,37 +1619,28 @@ mod tests {
     #[test]
     fn refused_put_names_the_conflict_span_and_next_free_start() {
         let mut a = Arrangement::default();
-        run_ok(&mut a, &["put", "a.wav:00:00:00-00:00:10"]);
+        run_ok(&mut a, &["put", "a.wav,00:00:00-00:00:10"]);
         // Landing on the resident clip: the report shows its half-open span
         // and that a butt-join at its end is the next legal start.
-        let (code, msg) = run_err(&mut a, &["put", "b.wav@00:00:05:00:00:00-00:00:10", "0"]);
+        let (code, msg) = run_err(&mut a, &["put", "b.wav,00:00:00-00:00:10", "0@00:00:05"]);
         assert_eq!(code, 1);
         assert!(msg.contains("clip #0 [0.000,10.000)"), "{msg}");
         assert!(msg.contains("next free start 10.000s"), "{msg}");
-
-        // An open-ended resident blocks the track for good: say so.
-        run_ok(&mut a, &["put", "live.wav@00:00:15", "0"]);
-        let (code, msg) = run_err(&mut a, &["put", "c.wav@00:00:16:00:00:00-00:00:10", "0"]);
-        assert_eq!(code, 1);
-        assert!(msg.contains("clip #1 [15.000,inf)"), "{msg}");
-        assert!(msg.contains("no free start after this"), "{msg}");
     }
 
     #[test]
-    fn open_ended_put_blocks_the_track_and_is_refused() {
+    fn put_without_a_slice_probes_and_refuses_unmeasurable_sources() {
         let mut a = Arrangement::default();
-        let out = run_ok(&mut a, &["put", "live.wav"]);
-        assert!(out.contains("(open-ended)"), "{out}");
-        let (code, msg) = run_err(&mut a, &["put", "b.wav@00:00:05:00:00:00-00:00:10", "0"]);
+        let (code, msg) = run_err(&mut a, &["put", "live.wav"]);
         assert_eq!(code, 1);
-        assert!(msg.contains("collides"), "{msg}");
-        assert_eq!(a.player.tracks()[0].clips().len(), 1, "a refused insert leaves no trace");
+        assert!(msg.contains("run: bo probe live.wav"), "{msg}");
+        assert_eq!(a.player.tracks().len(), 0, "a refused put leaves no track");
     }
 
     #[test]
     fn play_starts_transport() {
         let mut a = Arrangement::default();
-        run_ok(&mut a, &["put", "a.wav:00:00:00-00:00:10"]);
+        run_ok(&mut a, &["put", "a.wav,00:00:00-00:00:10"]);
         let out = run_ok(&mut a, &["play"]);
         assert!(out.contains("playing from 00:00:00.000"), "{out}");
         assert_eq!(a.player.state(), State::Playing);
@@ -1643,7 +1655,7 @@ mod tests {
         assert_eq!(a.player.state(), State::Stopped, "the transport is untouched");
 
         // An arrangement whose clips are all zero-length is equally empty.
-        run_ok(&mut a, &["put", "a.wav@00:00:00:00:00:00-00:00:00"]);
+        run_ok(&mut a, &["put", "a.wav,00:00:00-00:00:00"]);
         let (code, msg) = run_err(&mut a, &["play"]);
         assert_eq!(code, 1);
         assert!(msg.contains("no clips"), "{msg}");
@@ -1652,9 +1664,9 @@ mod tests {
     #[test]
     fn play_reports_the_session_before_starting() {
         let mut a = Arrangement::default();
-        run_ok(&mut a, &["put", "a.wav:00:00:00-00:00:10"]);
-        run_ok(&mut a, &["put", "b.wav@00:00:10:00:00:00-00:00:05", "0"]);
-        run_ok(&mut a, &["put", "c.wav:00:00:00-00:00:03"]);
+        run_ok(&mut a, &["put", "a.wav,00:00:00-00:00:10"]);
+        run_ok(&mut a, &["put", "b.wav,00:00:00-00:00:05", "0@00:00:10"]);
+        run_ok(&mut a, &["put", "c.wav,00:00:00-00:00:03"]);
         let out = run_ok(&mut a, &["play"]);
         let session = out.lines().next().unwrap();
         assert!(session.contains("session: 2 tracks | 3 clips"), "{out}");
@@ -1672,7 +1684,7 @@ mod tests {
             Silent::default(),
             Some("no audio device: x".to_string()),
         ));
-        run_ok(&mut a, &["put", "a.wav:00:00:00-00:00:10"]);
+        run_ok(&mut a, &["put", "a.wav,00:00:00-00:00:10"]);
         let out = run_ok(&mut a, &["play"]);
         assert!(out.contains("(no audio device: x)"), "{out}");
         assert!(run_ok(&mut a, &["ls"]).contains("backend: silent"), "ls names the backend");
@@ -1681,8 +1693,8 @@ mod tests {
     #[test]
     fn ls_shows_the_arrangement() {
         let mut a = Arrangement::default();
-        run_ok(&mut a, &["put", "a.wav:00:00:00-00:00:10"]);
-        run_ok(&mut a, &["put", "b.wav@00:00:10:00:00:00-00:00:05", "0"]);
+        run_ok(&mut a, &["put", "a.wav,00:00:00-00:00:10"]);
+        run_ok(&mut a, &["put", "b.wav,00:00:00-00:00:05", "0@00:00:10"]);
         let out = run_ok(&mut a, &["ls"]);
         assert!(out.contains("state: stopped"), "{out}");
         for key in ["playhead:", "end:", "backend:", "volume:", "tracks:"] {
@@ -1697,7 +1709,7 @@ mod tests {
     #[test]
     fn set_writes_track_volume_and_master() {
         let mut a = Arrangement::default();
-        run_ok(&mut a, &["put", "a.wav:00:00:00-00:00:10"]);
+        run_ok(&mut a, &["put", "a.wav,00:00:00-00:00:10"]);
         let out = run_ok(&mut a, &["set", "track.0.volume", "0.5"]);
         assert!(out.contains("track 0 volume 0.50"), "{out}");
         assert_eq!(a.player.tracks()[0].volume(), 0.5);
@@ -1721,7 +1733,7 @@ mod tests {
     #[test]
     fn put_repeat_places_butt_joined_copies() {
         let mut a = Arrangement::default();
-        let out = run_ok(&mut a, &["put", "--repeat", "3", "crackle.wav:00:00:00-00:00:12"]);
+        let out = run_ok(&mut a, &["put", "--repeat", "3", "crackle.wav,00:00:00-00:00:12"]);
         assert_eq!(out.matches("ok: track 0 clip #").count(), 3, "{out}");
         let t = &a.player.tracks()[0];
         assert_eq!(t.clips().len(), 3);
@@ -1743,30 +1755,30 @@ mod tests {
     fn put_repeat_is_atomic_and_refuses_bad_input() {
         let mut a = Arrangement::default();
         // a occupies 15s..25s; copy 3 of a 5s slice lands at 15s and collides.
-        run_ok(&mut a, &["put", "a.wav@00:00:15:00:00:00-00:00:10"]);
-        let (code, msg) = run_err(&mut a, &["put", "--repeat", "4", "b.wav:00:00:00-00:00:05", "0"]);
+        run_ok(&mut a, &["put", "a.wav,00:00:00-00:00:10", "@00:00:15"]);
+        let (code, msg) = run_err(&mut a, &["put", "--repeat", "4", "b.wav,00:00:00-00:00:05", "0"]);
         assert_eq!(code, 1);
         assert!(msg.contains("copy 3") && msg.contains("collides"), "{msg}");
         assert_eq!(a.player.tracks()[0].clips().len(), 1, "no trace");
 
-        // Open-ended clips cannot repeat.
+        // A source that cannot be measured is refused.
         let (code, msg) = run_err(&mut a, &["put", "--repeat", "2", "live.wav"]);
-        assert_eq!(code, 2);
-        assert!(msg.contains("no known end"), "{msg}");
+        assert_eq!(code, 1);
+        assert!(msg.contains("run: bo probe live.wav"), "{msg}");
 
         // Zero copies and zero-length slices are nonsense.
-        let (code, _) = run_err(&mut a, &["put", "--repeat", "0", "c.wav:00:00:00-00:00:10"]);
+        let (code, _) = run_err(&mut a, &["put", "--repeat", "0", "c.wav,00:00:00-00:00:10"]);
         assert_eq!(code, 2);
-        let (code, _) = run_err(&mut a, &["put", "--repeat", "2", "c.wav:00:00:00-00:00:00"]);
+        let (code, _) = run_err(&mut a, &["put", "--repeat", "2", "c.wav,00:00:00-00:00:00"]);
         assert_eq!(code, 2);
     }
 
     #[test]
     fn at_shows_the_clips_covering_a_timecode() {
         let mut a = Arrangement::default();
-        run_ok(&mut a, &["put", "a.wav:00:00:00-00:00:10"]);
-        run_ok(&mut a, &["put", "b.wav@00:00:10:00:00:00-00:00:05", "0"]);
-        run_ok(&mut a, &["put", "c.wav:00:00:00-00:00:03"]);
+        run_ok(&mut a, &["put", "a.wav,00:00:00-00:00:10"]);
+        run_ok(&mut a, &["put", "b.wav,00:00:00-00:00:05", "0@00:00:10"]);
+        run_ok(&mut a, &["put", "c.wav,00:00:00-00:00:03"]);
 
         let out = run_ok(&mut a, &["at", "00:00:01.000"]);
         assert!(out.contains("track 0: clip=0"), "{out}");
@@ -1783,7 +1795,7 @@ mod tests {
     #[test]
     fn apply_rebuilds_a_running_transport_only() {
         let mut a = Arrangement::default();
-        run_ok(&mut a, &["put", "a.wav:00:00:00-00:00:10"]);
+        run_ok(&mut a, &["put", "a.wav,00:00:00-00:00:10"]);
         let plays = |a: &Arrangement| -> usize {
             match a.player.backend() {
                 AnyBackend::Silent(s, _) => s
@@ -1817,8 +1829,8 @@ mod tests {
     #[test]
     fn reset_clears_every_track_and_transport() {
         let mut a = Arrangement::default();
-        run_ok(&mut a, &["put", "a.wav:00:00:00-00:00:10"]);
-        run_ok(&mut a, &["put", "b.wav:00:00:00-00:00:05"]);
+        run_ok(&mut a, &["put", "a.wav,00:00:00-00:00:10"]);
+        run_ok(&mut a, &["put", "b.wav,00:00:00-00:00:05"]);
         run_ok(&mut a, &["set", "track.0.name", "bed"]);
         run_ok(&mut a, &["play"]);
         let out = run_ok(&mut a, &["reset"]);
@@ -1831,9 +1843,9 @@ mod tests {
     #[test]
     fn take_addresses_clips_by_id_and_timecode() {
         let mut a = Arrangement::default();
-        run_ok(&mut a, &["put", "a.wav:00:00:00-00:00:10"]);
-        run_ok(&mut a, &["put", "b.wav@00:00:10:00:00:00-00:00:05", "0"]);
-        run_ok(&mut a, &["put", "c.wav:00:00:00-00:00:03"]);
+        run_ok(&mut a, &["put", "a.wav,00:00:00-00:00:10"]);
+        run_ok(&mut a, &["put", "b.wav,00:00:00-00:00:05", "0@00:00:10"]);
+        run_ok(&mut a, &["put", "c.wav,00:00:00-00:00:03"]);
 
         // By timecode: the clip covering 00:00:12 on track 0 is b (id 1).
         let out = run_ok(&mut a, &["take", "0", "@00:00:12"]);
@@ -1856,8 +1868,8 @@ mod tests {
     #[test]
     fn take_removes_a_clip_by_its_identifiers() {
         let mut a = Arrangement::default();
-        run_ok(&mut a, &["put", "a.wav:00:00:00-00:00:10"]);
-        run_ok(&mut a, &["put", "b.wav@00:00:10:00:00:00-00:00:05", "0"]);
+        run_ok(&mut a, &["put", "a.wav,00:00:00-00:00:10"]);
+        run_ok(&mut a, &["put", "b.wav,00:00:00-00:00:05", "0@00:00:10"]);
         let out = run_ok(&mut a, &["take", "0", "0"]);
         assert!(out.contains("removed track 0 clip #0"), "{out}");
         assert_eq!(a.player.tracks()[0].clips().len(), 1);
@@ -1876,7 +1888,7 @@ mod tests {
     #[test]
     fn set_mutes_and_restores_a_track() {
         let mut a = Arrangement::default();
-        run_ok(&mut a, &["put", "a.wav:00:00:00-00:00:10"]);
+        run_ok(&mut a, &["put", "a.wav,00:00:00-00:00:10"]);
         let out = run_ok(&mut a, &["set", "track.0.muted", "true"]);
         assert!(out.contains("track 0 muted"), "{out}");
         assert!(a.player.tracks()[0].muted());
@@ -1899,7 +1911,7 @@ mod tests {
     #[test]
     fn transport_commands_drive_the_state_machine() {
         let mut a = Arrangement::default();
-        run_ok(&mut a, &["put", "a.wav:00:00:00-00:00:10"]);
+        run_ok(&mut a, &["put", "a.wav,00:00:00-00:00:10"]);
         run_ok(&mut a, &["play"]);
         assert_eq!(a.player.state(), State::Playing);
         run_ok(&mut a, &["pause"]);
@@ -1924,7 +1936,7 @@ mod tests {
         };
         wait_until("socket", || UnixStream::connect(&socket).is_ok());
 
-        send(&socket, "put a.wav:00:00:00-00:00:10");
+        send(&socket, "put a.wav,00:00:00-00:00:10");
         let reply = send(&socket, "ls");
         assert!(reply.contains("track 0: volume=1.00 clips=1") && reply.contains("a.wav"), "{reply}");
 
@@ -1944,14 +1956,14 @@ mod tests {
         let sp = script.to_string_lossy().into_owned();
         let reply = send(&socket, &format!("save {sp}"));
         assert!(reply.contains("saved"), "{reply}");
-        send(&socket, "put a.wav:00:00:00-00:00:10");
+        send(&socket, "put a.wav,00:00:00-00:00:10");
         let reply = send(&socket, &format!("load {sp}"));
         assert!(reply.contains("loaded"), "{reply}");
         let reply = send(&socket, "ls");
         assert!(!reply.contains("a.wav"), "load replaced the arrangement: {reply}");
 
         // Refill the empty arrangement, name the track, and check the source.
-        send(&socket, "put a.wav:00:00:00-00:00:10");
+        send(&socket, "put a.wav,00:00:00-00:00:10");
         let reply = send(&socket, "set track.0.name bed");
         assert!(reply.contains("named \"bed\""), "{reply}");
         // a.wav does not exist, so check must report it.
@@ -1987,7 +1999,7 @@ mod tests {
         let dir = temp_dir();
         let src = dir.join("a.wav");
         write_test_wav(&src, 0.5, 0.5);
-        let spec = format!("{}:00:00:00-00:00:00.500", src.to_string_lossy());
+        let spec = format!("{},00:00:00-00:00:00.500", src.to_string_lossy());
         let out = dir.join("out.wav");
         let out_s = out.to_string_lossy().into_owned();
 
@@ -1995,7 +2007,7 @@ mod tests {
         // Two butt-joined clips: 0..0.5s and 0.5..1.0s.
         let put = parse_command(&["put".to_string(), spec.clone()]).unwrap();
         dispatch(&mut a, put).unwrap();
-        let put2 = parse_command(&["put".to_string(), format!("{}@00:00:00.500:00:00:00-00:00:00.500", src.to_string_lossy())]).unwrap();
+        let put2 = parse_command(&["put".to_string(), format!("{},00:00:00-00:00:00.500", src.to_string_lossy()), "@00:00:00.500".to_string()]).unwrap();
         dispatch(&mut a, put2).unwrap();
 
         // A 0.25s window from 0.25s: half of the first clip only.
@@ -2013,7 +2025,7 @@ mod tests {
         let dir = temp_dir();
         let src = dir.join("a.wav");
         write_test_wav(&src, 0.2, 0.5);
-        let spec = format!("{}:00:00:00-00:00:00.200", src.to_string_lossy());
+        let spec = format!("{},00:00:00-00:00:00.200", src.to_string_lossy());
         let out = dir.join("out.wav");
         let out_s = out.to_string_lossy().into_owned();
 
@@ -2030,7 +2042,7 @@ mod tests {
     #[test]
     fn set_names_a_track() {
         let mut a = Arrangement::default();
-        run_ok(&mut a, &["put", "a.wav:00:00:00-00:00:10"]);
+        run_ok(&mut a, &["put", "a.wav,00:00:00-00:00:10"]);
         let out = run_ok(&mut a, &["set", "track.0.name", "bed"]);
         assert!(out.contains("track 0 named \"bed\""), "{out}");
         assert!(run_ok(&mut a, &["ls"]).contains("track 0: name=bed"), "ls shows the label");
@@ -2042,8 +2054,8 @@ mod tests {
     #[test]
     fn serialize_round_trips_names_volume_and_mute() {
         let mut a = Arrangement::default();
-        run_ok(&mut a, &["put", "bed.wav:00:00:05-00:00:25"]);
-        run_ok(&mut a, &["put", "ding.wav@00:00:00:00:00:01-00:00:02", "1"]);
+        run_ok(&mut a, &["put", "bed.wav,00:00:05-00:00:25"]);
+        run_ok(&mut a, &["put", "ding.wav,00:00:01-00:00:02", "1@00:00:00"]);
         run_ok(&mut a, &["set", "track.0.name", "bed"]);
         run_ok(&mut a, &["set", "track.0.volume", "0.5"]);
         run_ok(&mut a, &["set", "track.1.muted", "true"]);
@@ -2065,7 +2077,7 @@ mod tests {
         let file = dir.join("prog.bo");
         let path = file.to_string_lossy().into_owned();
         let mut a = Arrangement::default();
-        run_ok(&mut a, &["put", "a.wav:00:00:00-00:00:10"]);
+        run_ok(&mut a, &["put", "a.wav,00:00:00-00:00:10"]);
         run_ok(&mut a, &["set", "track.0.name", "bed"]);
         run_ok(&mut a, &["set", "track.0.volume", "0.5"]);
         run_ok(&mut a, &["set", "master", "0.78"]);
@@ -2077,7 +2089,7 @@ mod tests {
         assert_eq!(b.player.volume(), 0.78, "master survives the round trip");
 
         // A failing script leaves the live arrangement untouched.
-        std::fs::write(&file, "put a.wav:00:00:00-00:00:10 0\nput b.wav@00:00:05:00:00:00-00:00:10 0\n")
+        std::fs::write(&file, "put a.wav,00:00:00-00:00:10 0\nput b.wav,00:00:00-00:00:10 0@00:00:05\n")
             .unwrap();
         let (code, msg) = run_err(&mut b, &["load", &path]);
         assert_eq!(code, 1);
@@ -2097,7 +2109,7 @@ mod tests {
             Silent::default(),
             Some("no audio device: x".to_string()),
         ));
-        run_ok(&mut a, &["put", "a.wav:00:00:00-00:00:10"]);
+        run_ok(&mut a, &["put", "a.wav,00:00:00-00:00:10"]);
         let dir = temp_dir();
         let script = dir.join("p.bo");
         let path = script.to_string_lossy().into_owned();
@@ -2119,7 +2131,7 @@ mod tests {
         let dir = temp_dir();
         let src = dir.join("a.wav");
         write_test_wav(&src, 1.0, 0.5);
-        let spec = format!("{}:00:00:00-00:00:01", src.to_string_lossy());
+        let spec = format!("{},00:00:00-00:00:01", src.to_string_lossy());
         let mut a = Arrangement::default();
         run_ok(&mut a, &["put", &spec]);
 
@@ -2142,7 +2154,7 @@ mod tests {
         let dir = temp_dir();
         let src = dir.join("a.wav");
         write_test_wav(&src, 0.5, 0.5);
-        let spec = format!("{}:00:00:00-00:00:00.500", src.to_string_lossy());
+        let spec = format!("{},00:00:00-00:00:00.500", src.to_string_lossy());
         let out = dir.join("out.wav");
         let out_s = out.to_string_lossy().into_owned();
         let mut a = Arrangement::default();
@@ -2177,7 +2189,7 @@ mod tests {
         assert_eq!(code, 2);
         assert!(msg.contains("--measure"), "{msg}");
         // A bare range in the file slot is caught with guidance.
-        run_ok(&mut a, &["put", "a.wav:00:00:00-00:00:10"]);
+        run_ok(&mut a, &["put", "a.wav,00:00:00-00:00:10"]);
         let render = parse_command(&["render".to_string(), "0-3".to_string(), "--measure".to_string()])
             .unwrap();
         let (code, msg) = dispatch(&mut a, render).unwrap_err();
@@ -2188,7 +2200,7 @@ mod tests {
     #[test]
     fn check_reports_unreadable_sources() {
         let mut a = Arrangement::default();
-        run_ok(&mut a, &["put", "/nonexistent.wav:00:00:00-00:00:10"]);
+        run_ok(&mut a, &["put", "/nonexistent.wav,00:00:00-00:00:10"]);
         let (code, msg) = run_err(&mut a, &["check"]);
         assert_eq!(code, 1);
         assert!(msg.contains("cannot open /nonexistent.wav"), "{msg}");
@@ -2200,7 +2212,7 @@ mod tests {
         let dir = temp_dir();
         let src = dir.join("a.wav");
         write_test_wav(&src, 0.2, 0.5);
-        let spec = format!("{}:00:00:00-00:00:00.200", src.to_string_lossy());
+        let spec = format!("{},00:00:00-00:00:00.200", src.to_string_lossy());
         let mut a = Arrangement::default();
         let put = parse_command(&["put".to_string(), spec]).unwrap();
         dispatch(&mut a, put).unwrap();
@@ -2227,7 +2239,7 @@ mod tests {
         assert!(out.contains("00:00:00.200"), "{out}");
 
         // A source that cannot be opened is reported, and fails the probe.
-        run_ok(&mut a, &["put", "/nonexistent.wav:00:00:00-00:00:10"]);
+        run_ok(&mut a, &["put", "/nonexistent.wav,00:00:00-00:00:10"]);
         let (code, msg) = run_err(&mut a, &["probe"]);
         assert_eq!(code, 1);
         assert!(msg.contains("2 sources"), "{msg}");
@@ -2258,7 +2270,7 @@ mod tests {
         assert_eq!(parse_full(&["put".into(), "--help".into()]).unwrap_err().exit_code(), 0);
         assert_eq!(parse_full(&["nope".into()]).unwrap_err().exit_code(), 2);
         assert_eq!(parse_full(&["put".into()]).unwrap_err().exit_code(), 2);
-        assert_eq!(parse_full(&["put".into(), "a.wav".into(), "x".into()]).unwrap_err().exit_code(), 2);
+        assert_eq!(parse_full(&["put".into(), "a.wav".into(), "0".into(), "1".into()]).unwrap_err().exit_code(), 2);
     }
 
     #[test]
@@ -2272,9 +2284,9 @@ mod tests {
         };
         wait_until("socket", || UnixStream::connect(&socket).is_ok());
 
-        let reply = send(&socket, "put a.wav:00:00:00-00:00:00.200");
+        let reply = send(&socket, "put a.wav,00:00:00-00:00:00.200");
         assert!(reply.contains("ok: track 0 clip #0"), "{reply}");
-        let reply = send(&socket, "put b.wav@00:00:00.200:00:00:00-00:00:00.200 0");
+        let reply = send(&socket, "put b.wav,00:00:00-00:00:00.200 0@00:00:00.200");
         assert!(reply.contains("ok: track 0 clip #1"), "{reply}");
 
         // A refused command still gets a framed reply and exit code.

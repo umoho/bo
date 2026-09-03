@@ -22,36 +22,18 @@ use std::time::Duration;
 pub struct Source {
     /// Address of the resource: local path, URL, ...
     pub uri: String,
-    /// Known length. `None` means either "not probed yet" or "has no end"
-    /// (live stream); deciding which is the backend's business, not the model's.
-    pub duration: Option<Duration>,
 }
 
 impl Source {
-    /// A source of unknown length.
+    /// An addressable audio resource. Length lives on [`Clip`], not here:
+    /// every clip is a finite, measured slice.
     pub fn new(uri: impl Into<String>) -> Self {
-        Self {
-            uri: uri.into(),
-            duration: None,
-        }
-    }
-
-    /// A source with a known length, e.g. after a probe.
-    #[must_use]
-    pub fn with_duration(mut self, duration: impl Into<Option<Duration>>) -> Self {
-        self.duration = duration.into();
-        self
+        Self { uri: uri.into() }
     }
 
     /// A shareable reference, the form [`Clip`] wants.
     pub fn shared(uri: impl Into<String>) -> Arc<Self> {
         Arc::new(Self::new(uri))
-    }
-
-    /// Whether no end is known for this source.
-    #[must_use]
-    pub fn is_open_ended(&self) -> bool {
-        self.duration.is_none()
     }
 }
 
@@ -72,32 +54,30 @@ pub struct Clip {
     pub at: Duration,
     /// In-point, measured into the source.
     pub from: Duration,
-    /// Out-point, measured into the source. `None` = play to the end of the
-    /// source, which makes the clip's own length unknown if the source's length
-    /// is unknown too.
-    pub to: Option<Duration>,
+    /// Out-point, measured into the source.
+    pub to: Duration,
 }
 
 impl Clip {
-    /// The whole source, parked at the track origin.
-    pub fn new(source: Arc<Source>) -> Self {
+    /// The whole `length`-long source, parked at the track origin.
+    pub fn new(source: Arc<Source>, length: Duration) -> Self {
         Self {
             id: 0,
             source,
             at: Duration::ZERO,
             from: Duration::ZERO,
-            to: None,
+            to: length,
         }
     }
 
     /// The `from .. to` slice of a source, parked at the track origin.
-    pub fn sliced(source: Arc<Source>, from: Duration, to: impl Into<Option<Duration>>) -> Self {
+    pub fn sliced(source: Arc<Source>, from: Duration, to: Duration) -> Self {
         Self {
             id: 0,
             source,
             at: Duration::ZERO,
             from,
-            to: to.into(),
+            to,
         }
     }
 
@@ -110,39 +90,35 @@ impl Clip {
 
     /// Set the out-point.
     #[must_use]
-    pub fn to(mut self, to: impl Into<Option<Duration>>) -> Self {
-        self.to = to.into();
+    pub fn to(mut self, to: Duration) -> Self {
+        self.to = to;
         self
     }
 
-    /// How long this clip occupies. `None` when the out-point is open *and* the
-    /// source has no known length.
+    /// How long this clip occupies.
     #[must_use]
-    pub fn duration(&self) -> Option<Duration> {
-        match self.to {
-            Some(to) => Some(to.saturating_sub(self.from)),
-            None => Some(self.source.duration?.saturating_sub(self.from)),
-        }
+    pub fn duration(&self) -> Duration {
+        self.to.saturating_sub(self.from)
     }
 
     /// Where this clip stops occupying the track.
     #[must_use]
-    pub fn end(&self) -> Option<Duration> {
-        Some(self.at + self.duration()?)
+    pub fn end(&self) -> Duration {
+        self.at + self.duration()
     }
 
     /// Whether track time `t` falls inside this clip. Half-open: `at` is
-    /// included, `end()` is not. An unknown length extends to infinity.
+    /// included, `end()` is not.
     #[must_use]
     pub fn covers(&self, t: Duration) -> bool {
-        t >= self.at && self.end().is_none_or(|end| t < end)
+        t >= self.at && t < self.end()
     }
 
     /// Whether two clips fight over the same track timecode.
     #[must_use]
     pub fn overlaps(&self, other: &Self) -> bool {
         // Only a clip that finishes at or before the other one starts is clear of it.
-        let clear = |a: &Clip, b: &Clip| a.end().is_some_and(|end| end <= b.at);
+        let clear = |a: &Clip, b: &Clip| a.end() <= b.at;
         !(clear(self, other) || clear(other, self))
     }
 }
@@ -290,14 +266,8 @@ impl Track {
     }
 
     /// Append a clip after the current tail.
-    ///
-    /// A track whose tail is unknowable (an open-ended clip on an unprobed
-    /// source) has no "after", so the clip is attempted at position 0 and
-    /// predictably refused.
     pub fn push(&mut self, mut clip: Clip) -> Result<u64, (Clip, Overlap)> {
-        if let Some(tail) = self.duration() {
-            clip.at = tail;
-        }
+        clip.at = self.duration();
         self.insert(clip)
     }
 
@@ -315,14 +285,12 @@ impl Track {
         self.next_id = 0;
     }
 
-    /// The furthest end of any clip; `None` if some clip has no knowable end.
+    /// The furthest end of any clip.
     #[must_use]
-    pub fn duration(&self) -> Option<Duration> {
-        let mut tail = Duration::ZERO;
-        for clip in &self.clips {
-            tail = tail.max(clip.end()?);
-        }
-        Some(tail)
+    pub fn duration(&self) -> Duration {
+        self.clips
+            .iter()
+            .fold(Duration::ZERO, |tail, clip| tail.max(clip.end()))
     }
 
     /// The clip occupying track time `t`, at most one by the invariant.
@@ -332,41 +300,25 @@ impl Track {
     }
 
     /// The earliest position at or after `at` where a clip of length `len`
-    /// (or an open-ended one, when `len` is `None`) can be placed without
-    /// overlapping any resident clip: the answer a collision report points
-    /// at. `None` when nothing can ever fit — an open-ended resident clip
-    /// occupies the rest of the track.
+    /// can be placed without overlapping any resident clip: the answer a
+    /// collision report points at.
     ///
     /// Spans are half-open, so the answer may butt against a clip's end.
     #[must_use]
-    pub fn next_free_start(&self, at: Duration, len: Option<Duration>) -> Option<Duration> {
+    pub fn next_free_start(&self, at: Duration, len: Duration) -> Duration {
         let mut pos = at;
         for clip in &self.clips {
-            let end = match clip.end() {
-                Some(end) => end,
-                // An open-ended resident leaves no room after it starts;
-                // only the gap before it can still hold a finite candidate.
-                None => {
-                    let fits = len.is_some_and(|len| clip.at.saturating_sub(pos) >= len);
-                    return fits.then_some(pos);
-                }
-            };
+            let end = clip.end();
             if end <= pos {
                 continue; // entirely behind the candidate
             }
-            // A finite candidate that fits in the gap before this clip is
-            // the answer. An open-ended candidate never fits in a finite
-            // gap, so it keeps jumping to the tail.
-            if let Some(len) = len
-                && clip.at.saturating_sub(pos) >= len
-            {
-                return Some(pos);
+            if clip.at.saturating_sub(pos) >= len {
+                return pos;
             }
             pos = pos.max(end); // jump past this clip
         }
-        // Past every clip: the tail is free (a finite track's end, or the
-        // last resident's end for an open-ended candidate).
-        Some(pos)
+        // Past every clip: the tail is free.
+        pos
     }
 
     /// Whether nothing plays at `t` — a gap, or past the end.
@@ -384,47 +336,43 @@ mod tests {
         Duration::from_secs(s)
     }
 
-    fn src(label: &str, len: Option<Duration>) -> Arc<Source> {
+    fn src(label: &str) -> Arc<Source> {
         Arc::new(Source {
             uri: format!("{label}.wav"),
-            duration: len,
         })
     }
 
     #[test]
     fn clip_length_comes_from_the_source_slice() {
-        let bed = src("bed", Some(secs(30)));
-        assert_eq!(Clip::new(bed.clone()).duration(), Some(secs(30)));
+        let bed = src("bed");
+        assert_eq!(Clip::new(bed.clone(), secs(30)).duration(), secs(30));
         assert_eq!(
             Clip::sliced(bed.clone(), secs(5), secs(12)).duration(),
-            Some(secs(7))
+            secs(7)
         );
-        // Playing an unprobed source to its end: length unknown.
-        assert_eq!(Clip::new(src("raw", None)).duration(), None);
         // An out-point before the in-point is not an error, just an empty clip.
         assert_eq!(
             Clip::sliced(bed.clone(), secs(9), secs(2)).duration(),
-            Some(Duration::ZERO)
+            Duration::ZERO
         );
-        assert!(Clip::new(bed).covers(Duration::ZERO));
-        assert!(src("raw", None).is_open_ended());
+        assert!(Clip::new(bed, secs(30)).covers(Duration::ZERO));
     }
 
     #[test]
     fn clips_on_one_track_may_not_overlap() {
-        let a = src("a", Some(secs(10)));
-        let b = src("b", Some(secs(4)));
+        let a = src("a");
+        let b = src("b");
         let mut t = Track::named("bed");
         assert_eq!(t.name(), Some("bed"));
-        assert_eq!(t.insert(Clip::new(a.clone())), Ok(0));
+        assert_eq!(t.insert(Clip::new(a.clone(), secs(10))), Ok(0));
         // Butt-joined at 10s: half-open spans, sharing an endpoint is fine.
-        assert_eq!(t.insert(Clip::new(b.clone()).at(secs(10))), Ok(1));
+        assert_eq!(t.insert(Clip::new(b.clone(), secs(4)).at(secs(10))), Ok(1));
         assert_eq!(
             t.clips().iter().map(|c| c.at).collect::<Vec<_>>(),
             [secs(0), secs(10)]
         );
         // Landing on top of a.
-        let (returned, err) = t.insert(Clip::new(a.clone()).at(secs(3))).unwrap_err();
+        let (returned, err) = t.insert(Clip::new(a.clone(), secs(10)).at(secs(3))).unwrap_err();
         assert_eq!(err.conflict, 0);
         assert_eq!(returned.at, secs(3), "the clip is handed back");
         assert_eq!(t.len(), 2, "a refused insert leaves no trace");
@@ -435,27 +383,6 @@ mod tests {
                 .conflict,
             0
         );
-    }
-
-    #[test]
-    fn an_unbounded_clip_grows_forever() {
-        // Unprobed source and no out-point: length unknowable, so it extends to
-        // infinity and blocks everything after it.
-        let mut t = Track::new();
-        t.insert(Clip::new(src("live", None)).at(secs(2))).unwrap();
-        assert_eq!(t.duration(), None);
-        assert_eq!(
-            t.insert(Clip::new(src("other", Some(secs(5)))).at(secs(60)))
-                .unwrap_err()
-                .1
-                .conflict,
-            0
-        );
-        assert!(
-            t.clip_at(secs(9999)).is_some(),
-            "it still covers later time"
-        );
-        assert!(t.clip_at(secs(1)).is_none(), "silent before it starts");
     }
 
     #[test]
@@ -479,23 +406,22 @@ mod tests {
         t.set_volume(-1.0);
         assert_eq!(t.volume(), 0.0);
         // Gain does not touch the timeline.
-        t.insert(Clip::new(src("a", Some(secs(10))))).unwrap();
-        assert_eq!(t.duration(), Some(secs(10)));
+        t.insert(Clip::new(src("a"), secs(10))).unwrap();
+        assert_eq!(t.duration(), secs(10));
     }
 
     #[test]
     fn push_appends_after_the_tail() {
         let mut t = Track::new();
-        assert_eq!(t.duration(), Some(Duration::ZERO));
-        t.push(Clip::new(src("a", Some(secs(10))))).unwrap();
-        t.push(Clip::sliced(src("b", Some(secs(4))), secs(1), secs(3)))
-            .unwrap();
+        assert_eq!(t.duration(), Duration::ZERO);
+        t.push(Clip::new(src("a"), secs(10))).unwrap();
+        t.push(Clip::sliced(src("b"), secs(1), secs(3))).unwrap();
         assert_eq!(
             t.clips()[1].at,
             secs(10),
             "second one starts where first ends"
         );
-        assert_eq!(t.duration(), Some(secs(12)));
+        assert_eq!(t.duration(), secs(12));
         assert_eq!(t.clip_at(secs(11)).unwrap().source.uri, "b.wav");
         assert!(t.remove(0).is_some());
         assert_eq!(t.len(), 1);
@@ -507,34 +433,23 @@ mod tests {
     #[test]
     fn next_free_start_skips_to_the_first_fit() {
         let mut t = Track::new();
-        t.insert(Clip::new(src("a", Some(secs(10))))).unwrap();
-        t.insert(Clip::new(src("b", Some(secs(5)))).at(secs(10)))
-            .unwrap();
-        t.insert(Clip::new(src("c", Some(secs(2)))).at(secs(20)))
-            .unwrap();
+        t.insert(Clip::new(src("a"), secs(10))).unwrap();
+        t.insert(Clip::new(src("b"), secs(5)).at(secs(10))).unwrap();
+        t.insert(Clip::new(src("c"), secs(2)).at(secs(20))).unwrap();
         // An empty track fits anywhere.
-        assert_eq!(Track::new().next_free_start(secs(3), Some(secs(2))), Some(secs(3)));
+        assert_eq!(Track::new().next_free_start(secs(3), secs(2)), secs(3));
         // Inside a clip: jump past every resident until a gap fits. b sits
         // at 10..15 right after a, so the first fit past 3 is 15.
-        assert_eq!(t.next_free_start(secs(3), Some(secs(1))), Some(secs(15)));
+        assert_eq!(t.next_free_start(secs(3), secs(1)), secs(15));
         // A clip that fits in the gap between residents (b ends 15, c at 20).
-        assert_eq!(t.next_free_start(secs(12), Some(secs(2))), Some(secs(15)));
+        assert_eq!(t.next_free_start(secs(12), secs(2)), secs(15));
         // A clip too long for that gap jumps to the next one (tail past 22).
-        assert_eq!(t.next_free_start(secs(12), Some(secs(6))), Some(secs(22)));
+        assert_eq!(t.next_free_start(secs(12), secs(6)), secs(22));
         // A start already in a gap stays put; so does a butt-join at its end.
-        assert_eq!(t.next_free_start(secs(15), Some(secs(4))), Some(secs(15)));
-        assert_eq!(t.next_free_start(secs(17), Some(secs(2))), Some(secs(17)));
-        assert_eq!(t.next_free_start(secs(15), Some(secs(5))), Some(secs(15)));
+        assert_eq!(t.next_free_start(secs(15), secs(4)), secs(15));
+        assert_eq!(t.next_free_start(secs(17), secs(2)), secs(17));
+        assert_eq!(t.next_free_start(secs(15), secs(5)), secs(15));
         // Butt-joining a's end is not free while b occupies 10..15.
-        assert_eq!(t.next_free_start(secs(10), Some(secs(5))), Some(secs(15)));
-        // An open-ended candidate fits only at the tail.
-        assert_eq!(t.next_free_start(secs(3), None), Some(secs(22)));
-        // An open-ended resident blocks everything at or after it.
-        let mut open = Track::new();
-        open.insert(Clip::new(src("live", None)).at(secs(5))).unwrap();
-        assert_eq!(open.next_free_start(Duration::ZERO, Some(secs(3))), Some(secs(0)));
-        assert_eq!(open.next_free_start(secs(4), Some(secs(1))), Some(secs(4)));
-        assert_eq!(open.next_free_start(secs(4), Some(secs(2))), None);
-        assert_eq!(open.next_free_start(secs(6), Some(secs(1))), None);
+        assert_eq!(t.next_free_start(secs(10), secs(5)), secs(15));
     }
 }

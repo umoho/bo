@@ -233,13 +233,12 @@ impl<B: Backend> Player<B> {
         self.backend.set_volume(self.volume);
     }
 
-    /// The whole arrangement's length: the latest end across tracks. `None` when
-    /// some clip has no knowable end.
+    /// The whole arrangement's length: the latest end across tracks.
     #[must_use]
-    pub fn duration(&self) -> Option<Duration> {
-        self.tracks.iter().try_fold(Duration::ZERO, |acc, track| {
-            Some(acc.max(track.duration()?))
-        })
+    pub fn duration(&self) -> Duration {
+        self.tracks
+            .iter()
+            .fold(Duration::ZERO, |acc, track| acc.max(track.duration()))
     }
 
     /// Every clip audible at track time `t`, one per track at most. This *is*
@@ -356,18 +355,13 @@ impl<B: Backend> Player<B> {
         }
     }
 
-    /// Whether playback of a finite arrangement has run to its end.
+    /// Whether playback of the arrangement has run to its end.
     ///
-    /// The playhead is compared against the arrangement's known length; an
-    /// arrangement containing an open-ended clip has no knowable length and
-    /// never finishes. Long-running callers use this to decide when playback
-    /// is done.
+    /// The playhead is compared against the arrangement's known length.
+    /// Long-running callers use this to decide when playback is done.
     #[must_use]
     pub fn is_finished(&self) -> bool {
-        match self.duration() {
-            Some(length) => self.playhead() >= length,
-            None => false,
-        }
+        self.playhead() >= self.duration()
     }
 }
 
@@ -383,10 +377,10 @@ mod tests {
 
     fn track_with(uri: &str, len: u64) -> Track {
         let mut t = Track::named(uri);
-        t.insert(Clip::new(Arc::new(crate::track::Source {
-            uri: uri.into(),
-            duration: Some(secs(len)),
-        })))
+        t.insert(Clip::new(
+            Arc::new(crate::track::Source { uri: uri.into() }),
+            secs(len),
+        ))
         .unwrap();
         t
     }
@@ -489,24 +483,28 @@ mod tests {
     fn stacked_tracks_mix_at_the_same_timecode() {
         let mut p: Player<Silent> = Player::default();
         let mut bed = Track::named("bed");
-        bed.insert(Clip::new(Arc::new(crate::track::Source {
-            uri: "bed.wav".into(),
-            duration: Some(secs(30)),
-        })))
+        bed.insert(Clip::new(
+            Arc::new(crate::track::Source {
+                uri: "bed.wav".into(),
+            }),
+            secs(30),
+        ))
         .unwrap();
         p.add_track(bed);
         let mut ding = Track::named("ding");
         ding.insert(
-            Clip::new(Arc::new(crate::track::Source {
-                uri: "ding.wav".into(),
-                duration: Some(secs(2)),
-            }))
+            Clip::new(
+                Arc::new(crate::track::Source {
+                    uri: "ding.wav".into(),
+                }),
+                secs(2),
+            )
             .at(secs(5)),
         )
         .unwrap();
         p.add_track(ding);
 
-        assert_eq!(p.duration(), Some(secs(30)), "longest track wins");
+        assert_eq!(p.duration(), secs(30), "longest track wins");
         let at_zero: Vec<_> = p.active_clips(Duration::ZERO).map(|(i, _)| i).collect();
         assert_eq!(at_zero, vec![0]);
         let at_five: Vec<_> = p.active_clips(secs(5)).map(|(i, _)| i).collect();
@@ -533,19 +531,6 @@ mod tests {
         assert!(!p.is_finished(), "still inside the arrangement");
         p.advance(secs(2));
         assert!(p.is_finished(), "the playhead passed the end");
-
-        // An open-ended clip makes the length unknowable: never finishes.
-        let mut live: Player<Silent> = Player::default();
-        let mut t = Track::named("live");
-        t.insert(Clip::new(Arc::new(crate::track::Source {
-            uri: "live.wav".into(),
-            duration: None,
-        })))
-        .unwrap();
-        live.add_track(t);
-        live.play().unwrap();
-        live.advance(secs(9999));
-        assert!(!live.is_finished());
     }
 
     #[test]

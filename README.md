@@ -21,7 +21,7 @@ What it is **not** — yet — is a DAW: no pan, no effects, no fades or automat
 - **Play it live, or render it offline** — audition from the playhead mid-edit, play a finished arrangement out end to end (rodio), or mix the whole arrangement — or just a range — to a wav file.
 - **Silent fallback** — with no audio device the daemon still runs; set `BO_BACKEND=silent` for deterministic, headless tests and CI.
 - **Self-cleaning** — the daemon exits and removes its socket when playback finishes, on `stop`, or after `BO_IDLE_TIMEOUT` seconds of silence (default 600, `0` disables).
-- **Slicing, not files** — `uri@at:from-to` places any slice of a source anywhere on the timeline; no trimming, no copies.
+- **Slicing, not files** — `uri,from-to` places any slice of a source anywhere on the timeline; no trimming, no copies.
 
 ## Install
 
@@ -45,10 +45,10 @@ The name `bo` is already taken on crates.io, so `cargo install bo` installs an u
 A two-track session — a voice over a bed of music:
 
 ```console
-$ bo put bed.wav:00:00:00-00:00:30          # 30 s of a bed, on a fresh track
-ok: track 0 clip #0 bed.wav @ 00:00:00.000
-$ bo put voice.wav:00:00:00-00:00:30 1      # voice on track 1
-ok: track 1 clip #0 voice.wav @ 00:00:00.000
+$ bo put bed.wav,00:00:00-00:00:30          # 30 s of a bed, on a fresh track
+ok: track 0 clip #0 bed.wav @ 00:00:00.000 src=00:00:00.000-00:00:30.000
+$ bo put voice.wav,00:00:00-00:00:30 1@00:00:00      # voice on track 1
+ok: track 1 clip #0 voice.wav @ 00:00:00.000 src=00:00:00.000-00:00:30.000
 $ bo play
 session: 2 tracks | 2 clips | ends 00:00:30.000 | backend rodio
 playing from 00:00:00.000

@@ -94,11 +94,11 @@ fn client_spawns_a_daemon_and_it_cleans_up_when_done() {
     let sp = socket.to_string_lossy().into_owned();
 
     // The first command auto-spawns the daemon.
-    let out = bo(&sp, &["put", "a.wav:00:00:00-00:00:00.200"]);
+    let out = bo(&sp, &["put", "a.wav,00:00:00-00:00:00.200"]);
     assert!(out.contains("ok: track 0 clip #0"), "{out}");
 
     // A second invocation reaches the same daemon and its arrangement.
-    let out = bo(&sp, &["put", "b.wav@00:00:00.200:00:00:00-00:00:00.200", "0"]);
+    let out = bo(&sp, &["put", "b.wav,00:00:00-00:00:00.200", "0@00:00:00.200"]);
     assert!(out.contains("ok: track 0 clip #1"), "{out}");
 
     // The second command sees the same arrangement over the wire.
@@ -127,7 +127,7 @@ fn save_and_load_survive_a_daemon_restart() {
     let prog = dir.join("prog.bo");
     let ps = prog.to_string_lossy().into_owned();
 
-    let out = bo(&sp, &["put", "a.wav:00:00:00-00:00:10"]);
+    let out = bo(&sp, &["put", "a.wav,00:00:00-00:00:10"]);
     assert!(out.contains("ok: track 0"), "{out}");
     let out = bo(&sp, &["save", &ps]);
     assert!(out.contains("saved"), "{out}");
@@ -153,7 +153,7 @@ fn stop_ends_the_session() {
     let socket = dir.join("s.sock");
     let sp = socket.to_string_lossy().into_owned();
 
-    let out = bo(&sp, &["put", "a.wav:00:00:00-00:00:10"]);
+    let out = bo(&sp, &["put", "a.wav,00:00:00-00:00:10"]);
     assert!(out.contains("ok: track 0"), "{out}");
     let out = bo(&sp, &["stop"]);
     assert!(out.contains("stopped"), "{out}");
@@ -174,7 +174,7 @@ fn probe_measures_locally_without_a_daemon_and_over_the_wire() {
     let sp = socket.to_string_lossy().into_owned();
     let src = dir.join("a.wav");
     write_test_wav(&src, 0.2, 0.5);
-    let spec = format!("{}:00:00:00-00:00:00.200", src.to_string_lossy());
+    let spec = format!("{},00:00:00-00:00:00.200", src.to_string_lossy());
 
     // A bare uri is probed in the client: no daemon is spawned.
     let out = bo(&sp, &["probe", src.to_str().unwrap()]);
@@ -201,7 +201,7 @@ fn play_on_an_empty_arrangement_is_refused_and_the_daemon_survives() {
     let sp = socket.to_string_lossy().into_owned();
 
     // Spawn a daemon, then empty the arrangement out from under it.
-    let out = bo(&sp, &["put", "a.wav:00:00:00-00:00:10"]);
+    let out = bo(&sp, &["put", "a.wav,00:00:00-00:00:10"]);
     assert!(out.contains("ok: track 0"), "{out}");
     let out = bo(&sp, &["take", "0", "0"]);
     assert!(out.contains("removed"), "{out}");
@@ -228,7 +228,7 @@ fn quoted_arguments_survive_the_wire_and_scripts() {
     let sp = socket.to_string_lossy().into_owned();
     let src = dir.join("Bo FM.wav");
     write_test_wav(&src, 0.2, 0.5);
-    let spec = format!("{}:00:00:00-00:00:00.200", src.to_string_lossy());
+    let spec = format!("{},00:00:00-00:00:00.200", src.to_string_lossy());
 
     // A space-bearing path arrives as one argument over the wire.
     let out = bo(&sp, &["put", &spec]);
@@ -248,7 +248,7 @@ fn quoted_arguments_survive_the_wire_and_scripts() {
     let out = bo(&sp, &["save", &ps]);
     assert!(out.contains("saved"), "{out}");
     let script = std::fs::read_to_string(&prog).unwrap();
-    assert!(script.contains("Bo FM.wav'@"), "quoted in the script: {script}");
+    assert!(script.contains("Bo FM.wav',00:00:00.000-00:00:00.200"), "quoted in the script: {script}");
     let out = bo(&sp, &["stop"]);
     assert!(out.contains("stopped"), "{out}");
     wait_for_socket_gone(&socket);
@@ -270,9 +270,9 @@ fn at_reports_the_mix_at_a_timecode_over_the_wire() {
     let socket = dir.join("d.sock");
     let sp = socket.to_string_lossy().into_owned();
 
-    let out = bo(&sp, &["put", "a.wav:00:00:00-00:00:10"]);
+    let out = bo(&sp, &["put", "a.wav,00:00:00-00:00:10"]);
     assert!(out.contains("ok: track 0"), "{out}");
-    let out = bo(&sp, &["put", "b.wav@00:00:05:00:00:00-00:00:03", "1"]);
+    let out = bo(&sp, &["put", "b.wav,00:00:00-00:00:03", "1@00:00:05"]);
     assert!(out.contains("ok: track 1"), "{out}");
 
     let out = bo(&sp, &["at", "00:00:06.000"]);
@@ -296,9 +296,9 @@ fn reset_clears_the_arrangement_for_a_script_replay() {
     let ps = prog.to_string_lossy().into_owned();
 
     // Build a two-track mix and save it as a session script.
-    let out = bo(&sp, &["put", "a.wav:00:00:00-00:00:10"]);
+    let out = bo(&sp, &["put", "a.wav,00:00:00-00:00:10"]);
     assert!(out.contains("ok: track 0"), "{out}");
-    let out = bo(&sp, &["put", "b.wav:00:00:00-00:00:05"]);
+    let out = bo(&sp, &["put", "b.wav,00:00:00-00:00:05"]);
     assert!(out.contains("ok: track 1"), "{out}");
     let out = bo(&sp, &["save", &ps]);
     assert!(out.contains("saved"), "{out}");
@@ -324,7 +324,7 @@ fn put_repeat_places_butt_joined_copies_over_the_wire() {
     let socket = dir.join("d.sock");
     let sp = socket.to_string_lossy().into_owned();
 
-    let out = bo(&sp, &["put", "--repeat", "3", "crackle.wav:00:00:00-00:00:12"]);
+    let out = bo(&sp, &["put", "--repeat", "3", "crackle.wav,00:00:00-00:00:12"]);
     assert_eq!(out.matches("ok: track 0 clip #").count(), 3, "{out}");
     let out = bo(&sp, &["ls"]);
     assert!(out.contains("clips=3"), "{out}");
@@ -348,7 +348,7 @@ fn idle_timeout_cleans_up_a_quiet_paused_daemon() {
         .env("BO_IDLE_TIMEOUT", "1")
         .arg("--socket")
         .arg(&sp)
-        .args(["put", "a.wav:00:00:00-00:00:10"])
+        .args(["put", "a.wav,00:00:00-00:00:10"])
         .output()
         .expect("bo runs");
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
@@ -368,9 +368,9 @@ fn take_addresses_clips_by_timecode_over_the_wire() {
     let socket = dir.join("d.sock");
     let sp = socket.to_string_lossy().into_owned();
 
-    let out = bo(&sp, &["put", "a.wav:00:00:00-00:00:10"]);
+    let out = bo(&sp, &["put", "a.wav,00:00:00-00:00:10"]);
     assert!(out.contains("ok: track 0 clip #0"), "{out}");
-    let out = bo(&sp, &["put", "b.wav@00:00:10:00:00:00-00:00:05", "0"]);
+    let out = bo(&sp, &["put", "b.wav,00:00:00-00:00:05", "0@00:00:10"]);
     assert!(out.contains("ok: track 0 clip #1"), "{out}");
 
     // Delete by timecode: b covers 00:00:12, so it goes — by its stable id.

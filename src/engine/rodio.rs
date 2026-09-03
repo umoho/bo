@@ -7,9 +7,8 @@
 //! is rebuilt from the tracks on every `play`, which is how the engine's
 //! re-plan-on-seek works in sound.
 //!
-//! Unknown source lengths are resolved here by probing the file: an
-//! open-ended clip plays to the end of its source, exactly as the model
-//! promises.
+//! Every clip already has a known finite length (the put command probes
+//! sources that would otherwise be open-ended), so the mix needs no probing.
 
 use std::fs::File;
 use std::io::BufReader;
@@ -121,7 +120,7 @@ fn build_mix(
     at: Duration,
     master: f32,
 ) -> Result<(Vec<(Player, f32)>, Duration), String> {
-    let timeline = Timeline::plan(tracks, at, probe)?;
+    let timeline = Timeline::plan(tracks, at);
     let mut players = Vec::new();
     for track in timeline.tracks() {
         let gain = if track.muted() { 0.0 } else { track.gain() * master };
@@ -201,7 +200,7 @@ fn mix(
     master: f32,
     measure: bool,
 ) -> Result<(Duration, Option<Measurement>), String> {
-    let mut timeline = Timeline::plan(tracks, from, probe)?;
+    let mut timeline = Timeline::plan(tracks, from);
     if let Some(to) = to {
         // `to` is a track timecode; the plan's own timeline starts at `from`.
         timeline.truncate(to.saturating_sub(from));
@@ -463,10 +462,12 @@ mod tests {
     }
 
     fn clip_at(uri: &str, at: u64, len: u64) -> Clip {
-        Clip::new(Arc::new(Source {
-            uri: uri.to_string(),
-            duration: Some(Duration::from_secs(len)),
-        }))
+        Clip::new(
+            Arc::new(Source {
+                uri: uri.to_string(),
+            }),
+            Duration::from_secs(len),
+        )
         .at(Duration::from_secs(at))
     }
 
@@ -483,10 +484,12 @@ mod tests {
         bed.insert(clip_at(a.to_str().unwrap(), 0, 1)).unwrap();
         // b is a 0.5s file at 1s; the model's length matches the file.
         bed.insert(
-            Clip::new(Arc::new(Source {
-                uri: b.to_str().unwrap().to_string(),
-                duration: Some(Duration::from_millis(500)),
-            }))
+            Clip::new(
+                Arc::new(Source {
+                    uri: b.to_str().unwrap().to_string(),
+                }),
+                Duration::from_millis(500),
+            )
             .at(Duration::from_secs(1)),
         )
         .unwrap();
@@ -610,10 +613,12 @@ mod tests {
                 "{rate} Hz {channels}ch {bits}bit probed {probed:?}"
             );
             let mut track = Track::named("a");
-            track.insert(Clip::new(Arc::new(Source {
-                uri: a.to_str().unwrap().to_string(),
-                duration: Some(probed),
-            })))
+            track.insert(Clip::new(
+                Arc::new(Source {
+                    uri: a.to_str().unwrap().to_string(),
+                }),
+                probed,
+            ))
             .unwrap();
             let out = dir.join(format!("out-{rate}-{channels}-{bits}.wav"));
             render_to_file(&[track], &out, Duration::ZERO, None, 1.0).unwrap();

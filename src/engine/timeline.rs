@@ -3,11 +3,10 @@
 //! and offline render: both sides consume the plan, and neither re-derives
 //! the timing.
 //!
-//! Scheduling rules live here and nowhere else: open-ended clips are resolved
-//! through a probe, clips finished before the playhead are dropped, the clip
-//! covering the playhead is entered mid-way, later clips keep their full
-//! length with a silence gap up to their timecode, and the plan's end is the
-//! arrangement's end.
+//! Scheduling rules live here and nowhere else: clips finished before the
+//! playhead are dropped, the clip covering the playhead is entered mid-way,
+//! later clips keep their full length with a silence gap up to their
+//! timecode, and the plan's end is the arrangement's end.
 
 use std::time::Duration;
 
@@ -47,12 +46,9 @@ pub struct ClipPlan {
 impl Timeline {
     /// Resolve an arrangement into a schedule from playhead `at`.
     ///
-    /// `probe` supplies the total length of a source; it is only called for
-    /// clips whose length is not already known (open-ended clips).
-    pub fn plan<F>(tracks: &[Track], at: Duration, probe: F) -> Result<Self, String>
-    where
-        F: Fn(&str) -> Result<Duration, String>,
-    {
+    /// Every clip already has a known finite length (the put command probes
+    /// sources with no out-point), so planning cannot fail.
+    pub fn plan(tracks: &[Track], at: Duration) -> Self {
         let mut planned_tracks = Vec::new();
         let mut end = Duration::ZERO;
         for track in tracks {
@@ -62,11 +58,7 @@ impl Timeline {
             let mut clips = Vec::new();
             let mut previous_end: Option<Duration> = None;
             for clip in track.clips() {
-                let from = clip.from;
-                let length = match clip.duration() {
-                    Some(len) => len,
-                    None => probe(&clip.source.uri)?.saturating_sub(from),
-                };
+                let length = clip.duration();
                 if length == Duration::ZERO {
                     continue;
                 }
@@ -99,10 +91,10 @@ impl Timeline {
                 clips,
             });
         }
-        Ok(Self {
+        Self {
             tracks: planned_tracks,
             end,
-        })
+        }
     }
 
     /// The per-track plans.
@@ -169,11 +161,8 @@ mod tests {
         Duration::from_secs(s)
     }
 
-    fn src(uri: &str, len: Option<Duration>) -> Arc<Source> {
-        Arc::new(Source {
-            uri: uri.into(),
-            duration: len,
-        })
+    fn src(uri: &str) -> Arc<Source> {
+        Arc::new(Source { uri: uri.into() })
     }
 
     fn track_with(clips: Vec<Clip>) -> Track {
@@ -187,11 +176,11 @@ mod tests {
     #[test]
     fn plan_schedules_clips_with_their_gaps() {
         let t = track_with(vec![
-            Clip::new(src("a.wav", Some(secs(10)))),
-            Clip::new(src("b.wav", Some(secs(5)))).at(secs(10)),
-            Clip::new(src("c.wav", Some(secs(2)))).at(secs(20)),
+            Clip::new(src("a.wav"), secs(10)),
+            Clip::new(src("b.wav"), secs(5)).at(secs(10)),
+            Clip::new(src("c.wav"), secs(2)).at(secs(20)),
         ]);
-        let plan = Timeline::plan(&[t], Duration::ZERO, |_| unreachable!("all lengths known")).unwrap();
+        let plan = Timeline::plan(&[t], Duration::ZERO);
         assert_eq!(plan.end(), secs(22));
         let clips = &plan.tracks()[0].clips();
         assert_eq!(clips.len(), 3);
@@ -205,10 +194,10 @@ mod tests {
     #[test]
     fn plan_enters_the_current_clip_midway_and_drops_finished_ones() {
         let t = track_with(vec![
-            Clip::new(src("a.wav", Some(secs(10)))),
-            Clip::new(src("b.wav", Some(secs(5)))).at(secs(10)),
+            Clip::new(src("a.wav"), secs(10)),
+            Clip::new(src("b.wav"), secs(5)).at(secs(10)),
         ]);
-        let plan = Timeline::plan(&[t], secs(12), |_| unreachable!()).unwrap();
+        let plan = Timeline::plan(&[t], secs(12));
         let clips = &plan.tracks()[0].clips();
         assert_eq!(clips.len(), 1, "a ended before the playhead");
         assert_eq!(clips[0].uri, "b.wav");
@@ -219,29 +208,13 @@ mod tests {
     }
 
     #[test]
-    fn open_ended_clips_resolve_through_the_probe() {
-        let t = track_with(vec![Clip::new(src("live.wav", None))]);
-        let plan = Timeline::plan(&[t], Duration::ZERO, |uri| {
-            assert_eq!(uri, "live.wav");
-            Ok(secs(60))
-        })
-        .unwrap();
-        assert_eq!(plan.tracks()[0].clips()[0].length, secs(60));
-        assert_eq!(plan.end(), secs(60));
-        // A failed probe fails the plan.
-        let t = track_with(vec![Clip::new(src("missing.wav", None))]);
-        let err = Timeline::plan(&[t], Duration::ZERO, |_| Err("cannot probe".into())).unwrap_err();
-        assert_eq!(err, "cannot probe");
-    }
-
-    #[test]
     fn truncate_cuts_a_plan_to_a_range() {
         let t = track_with(vec![
-            Clip::new(src("a.wav", Some(secs(10)))),
-            Clip::new(src("b.wav", Some(secs(5)))).at(secs(10)),
-            Clip::new(src("c.wav", Some(secs(2)))).at(secs(20)),
+            Clip::new(src("a.wav"), secs(10)),
+            Clip::new(src("b.wav"), secs(5)).at(secs(10)),
+            Clip::new(src("c.wav"), secs(2)).at(secs(20)),
         ]);
-        let mut plan = Timeline::plan(&[t], Duration::ZERO, |_| unreachable!()).unwrap();
+        let mut plan = Timeline::plan(&[t], Duration::ZERO);
         plan.truncate(secs(12));
         assert_eq!(plan.end(), secs(12));
         let clips = &plan.tracks()[0].clips();
@@ -250,24 +223,24 @@ mod tests {
         assert_eq!(clips[1].length, secs(2), "b cut at 12s");
         // Starting mid-way, `to` is relative to the plan's start: entered
         // 3s in, keep 4 more seconds (absolute 7s).
-        let mut plan = Timeline::plan(&[track_with(vec![Clip::new(src("a.wav", Some(secs(10))))])], secs(3), |_| unreachable!()).unwrap();
+        let mut plan = Timeline::plan(&[track_with(vec![Clip::new(src("a.wav"), secs(10))])], secs(3));
         plan.truncate(secs(4));
         assert_eq!(plan.tracks()[0].clips()[0].length, secs(4), "entered 3s in, keep 4s");
     }
 
     #[test]
     fn muted_tracks_and_volume_survive_into_the_plan() {
-        let mut bed = track_with(vec![Clip::new(src("a.wav", Some(secs(5))))]);
+        let mut bed = track_with(vec![Clip::new(src("a.wav"), secs(5))]);
         bed.set_volume(0.4);
-        let mut voice = track_with(vec![Clip::new(src("v.wav", Some(secs(5))))]);
+        let mut voice = track_with(vec![Clip::new(src("v.wav"), secs(5))]);
         voice.set_muted(true);
-        let plan = Timeline::plan(&[bed, voice], Duration::ZERO, |_| unreachable!()).unwrap();
+        let plan = Timeline::plan(&[bed, voice], Duration::ZERO);
         assert_eq!(plan.tracks().len(), 2);
         assert_eq!(plan.tracks()[0].gain(), 0.4);
         assert!(!plan.tracks()[0].muted());
         assert!(plan.tracks()[1].muted());
         // Empty tracks are dropped from the plan.
-        let plan = Timeline::plan(&[Track::new()], Duration::ZERO, |_| unreachable!()).unwrap();
+        let plan = Timeline::plan(&[Track::new()], Duration::ZERO);
         assert!(plan.tracks().is_empty());
         assert_eq!(plan.end(), Duration::ZERO);
     }

@@ -21,7 +21,7 @@
 - **实时播放，或离线渲染** —— 编辑途中可从播放头试听一段，成品可从头到尾完整放出（rodio），或把整个编排——乃至其中一段区间——离线混音成 wav。
 - **静默回退** —— 没有音频设备时 daemon 照常工作；设 `BO_BACKEND=silent` 得到确定性的无头测试与 CI。
 - **自动清理** —— 播放结束、`stop`、或非播放状态静默超过 `BO_IDLE_TIMEOUT` 秒（默认 600，`0` 禁用）时，daemon 退出并删除自己的 socket。
-- **切片而非文件** —— `uri@at:from-to` 把源的任意切片放到时间轴的任意位置，无需裁剪、无需拷贝。
+- **切片而非文件** —— `uri,from-to` 把源的任意切片放到时间轴的任意位置，无需裁剪、无需拷贝。
 
 ## 安装
 
@@ -45,10 +45,10 @@ crates.io 上的 `bo` 名字已被占用，`cargo install bo` 装的是另一个
 一个双音轨会话——人声垫在音乐底上：
 
 ```console
-$ bo put bed.wav:00:00:00-00:00:30          # 30 秒垫乐，放到新音轨上
-ok: track 0 clip #0 bed.wav @ 00:00:00.000
-$ bo put voice.wav:00:00:00-00:00:30 1      # 人声放到 1 号音轨
-ok: track 1 clip #0 voice.wav @ 00:00:00.000
+$ bo put bed.wav,00:00:00-00:00:30          # 30 秒垫乐，放到新音轨上
+ok: track 0 clip #0 bed.wav @ 00:00:00.000 src=00:00:00.000-00:00:30.000
+$ bo put voice.wav,00:00:00-00:00:30 1@00:00:00      # 人声放到 1 号音轨
+ok: track 1 clip #0 voice.wav @ 00:00:00.000 src=00:00:00.000-00:00:30.000
 $ bo play
 session: 2 tracks | 2 clips | ends 00:00:30.000 | backend rodio
 playing from 00:00:00.000
