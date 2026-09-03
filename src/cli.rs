@@ -40,7 +40,8 @@
 //!   `session:` summary of what is about to play.
 //! * `pause` / `resume` — hold and continue, keeping the position.
 //! * `stop` — stop and rewind; ends the daemon's session (cleanup as usual).
-//! * `seek <t>` — move the playhead; a running transport re-plans.
+//! * `seek <t>` — move the playhead; a running transport re-plans. Seeking
+//!   past the arrangement's end is refused.
 //! * `apply` — rebuild the running transport from the current playhead, so
 //!   pending mix changes take effect now.
 //! * `set <var> <value>` — set an attribute: `master` (real-time), or
@@ -376,7 +377,7 @@ Transport:
   pause                    hold position
   resume                   continue after a pause
   stop                     stop, rewind, end the session
-  seek <t>                 move the playhead
+  seek <t>                 move the playhead (refused past the end)
   apply                    rebuild the running transport, so pending mix
                            changes take effect now
 
@@ -604,6 +605,13 @@ fn dispatch(a: &mut Arrangement, command: Command, cwd: &str) -> Result<Output, 
         }
         Command::Seek { at } => {
             let t = parse_timecode(&at).map_err(usage)?;
+            if t > a.player.duration() {
+                return Err(fail(format!(
+                    "refused: cannot seek to {} — the arrangement ends at {}",
+                    format_time(t),
+                    format_time(a.player.duration())
+                )));
+            }
             a.player.seek(t).map_err(|e| fail(e.to_string()))?;
             Ok(Output::Seeked { at: t })
         }
@@ -1978,6 +1986,21 @@ mod tests {
         run_ok(&mut a, &["stop"]);
         assert_eq!(a.player.state(), State::Stopped);
         assert_eq!(a.player.playhead(), Duration::ZERO, "stop rewinds");
+    }
+
+    #[test]
+    fn seek_past_the_end_is_refused() {
+        let mut a = Arrangement::default();
+        run_ok(&mut a, &["put", "a.wav,00:00:00-00:00:10"]);
+        let (code, msg) = run_err(&mut a, &["seek", "99"]);
+        assert_eq!(code, 1);
+        assert!(msg.contains("ends at 00:00:10.000"), "{msg}");
+        // The refusal leaves the playhead untouched.
+        assert_eq!(a.player.playhead(), Duration::ZERO);
+
+        // Seeking exactly to the end is allowed: it is the finished position.
+        run_ok(&mut a, &["seek", "00:00:10"]);
+        assert_eq!(a.player.playhead(), Duration::from_secs(10));
     }
 
     #[test]
