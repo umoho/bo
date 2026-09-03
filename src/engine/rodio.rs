@@ -112,7 +112,9 @@ fn make_source(plan: &ClipPlan) -> Result<impl Source + Send + 'static, String> 
     // playhead already is; the fade-out is always at the clip's end.
     let fade = Fade {
         fade_in: plan.fade.fade_in.saturating_sub(plan.into),
+        fade_in_from: plan.fade.fade_in_from,
         fade_out: plan.fade.fade_out,
+        fade_out_to: plan.fade.fade_out_to,
         shape: plan.fade.shape,
     };
     Ok(apply_fade(

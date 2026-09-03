@@ -76,12 +76,16 @@ impl std::str::FromStr for FadeShape {
 }
 
 /// A clip's amplitude envelope: fade in at the start, fade out at the end.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Fade {
-    /// Ramp from silence to full over this long, at the clip's start.
+    /// Ramp up to full over this long, at the clip's start.
     pub fade_in: Duration,
-    /// Ramp from full to silence over this long, at the clip's end.
+    /// The level the fade-in starts from, `0.0 ..= 1.0`; silence by default.
+    pub fade_in_from: f32,
+    /// Ramp down over this long, at the clip's end.
     pub fade_out: Duration,
+    /// The level the fade-out ends at, `0.0 ..= 1.0`; silence by default.
+    pub fade_out_to: f32,
     /// The curve of both ramps.
     pub shape: FadeShape,
 }
@@ -93,27 +97,29 @@ impl Fade {
         self.fade_in.is_zero() && self.fade_out.is_zero()
     }
 
-    /// The envelope's gain at `pos` into a `length`-long span. `fade_in` is
-    /// measured from the span's start, `fade_out` from its end; the two
-    /// multiply where they overlap (a span too short for both).
+    /// The envelope's gain at `pos` into a `length`-long span. The fade-in
+    /// ramps `fade_in_from → 1.0` from the span's start, the fade-out ramps
+    /// `1.0 → fade_out_to` into the span's end; the two multiply where they
+    /// overlap (a span too short for both).
     #[must_use]
     pub fn gain_at(&self, pos: Duration, length: Duration) -> f32 {
-        if self.is_empty() || length.is_zero() {
+        if length.is_zero() {
             return 1.0;
         }
         let mut gain = 1.0;
         let fade_in = self.fade_in.min(length);
         if pos < fade_in {
-            gain *= self
-                .shape
-                .ramp((pos.as_secs_f64() / fade_in.as_secs_f64()) as f32);
+            let x = (pos.as_secs_f64() / fade_in.as_secs_f64()) as f32;
+            let ramp = self.shape.ramp(x);
+            gain *= self.fade_in_from + (1.0 - self.fade_in_from) * ramp;
         }
         if !self.fade_out.is_zero() {
             let fade_out_start = length.saturating_sub(self.fade_out);
             if pos >= fade_out_start {
                 let x = (pos.saturating_sub(fade_out_start).as_secs_f64()
                     / self.fade_out.as_secs_f64()) as f32;
-                gain *= 1.0 - self.shape.ramp(x);
+                let ramp = self.shape.ramp(x);
+                gain *= self.fade_out_to + (1.0 - self.fade_out_to) * (1.0 - ramp);
             }
         }
         gain
@@ -568,7 +574,9 @@ mod tests {
     fn fade_gain_ramps_linearly_at_both_edges() {
         let f = Fade {
             fade_in: secs(2),
+            fade_in_from: 0.0,
             fade_out: secs(2),
+            fade_out_to: 0.0,
             shape: FadeShape::Linear,
         };
         let len = secs(10);
@@ -581,5 +589,23 @@ mod tests {
         // An empty fade is unity everywhere.
         assert_eq!(Fade::default().gain_at(secs(3), len), 1.0);
         assert!(Fade::default().is_empty());
+    }
+
+    #[test]
+    fn fade_from_and_to_levels_hold_at_the_edges() {
+        // Fade in from -10 dB (0.3) to full, fade out from full to 0.3.
+        let f = Fade {
+            fade_in: secs(2),
+            fade_in_from: 0.3,
+            fade_out: secs(2),
+            fade_out_to: 0.3,
+            shape: FadeShape::Linear,
+        };
+        let len = secs(10);
+        assert!((f.gain_at(Duration::ZERO, len) - 0.3).abs() < 1e-6);
+        assert!((f.gain_at(secs(1), len) - 0.65).abs() < 1e-6);
+        assert_eq!(f.gain_at(secs(5), len), 1.0);
+        assert!((f.gain_at(secs(9), len) - 0.65).abs() < 1e-6);
+        assert!((f.gain_at(secs(10), len) - 0.3).abs() < 1e-6);
     }
 }

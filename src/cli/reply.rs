@@ -55,7 +55,9 @@ pub(crate) enum SetResult {
     TrackName { i: usize, name: String },
     ClipGain { track: usize, id: u64, gain: f32 },
     ClipFadeIn { track: usize, id: u64, d: Duration },
+    ClipFadeInFrom { track: usize, id: u64, level: f32 },
     ClipFadeOut { track: usize, id: u64, d: Duration },
+    ClipFadeOutTo { track: usize, id: u64, level: f32 },
     ClipFadeShape { track: usize, id: u64, shape: FadeShape },
 }
 
@@ -106,7 +108,9 @@ pub(crate) struct LsClip {
     pub(crate) src_to: Duration,
     pub(crate) gain: f32,
     pub(crate) fade_in: Duration,
+    pub(crate) fade_in_from: f32,
     pub(crate) fade_out: Duration,
+    pub(crate) fade_out_to: f32,
     pub(crate) fade_shape: FadeShape,
 }
 
@@ -235,8 +239,14 @@ impl fmt::Display for Output {
                 SetResult::ClipFadeIn { track, id, d } => {
                     writeln!(f, "clip {track}#{id} fade_in {}", Tc(*d))
                 }
+                SetResult::ClipFadeInFrom { track, id, level } => {
+                    writeln!(f, "clip {track}#{id} fade_in_from {}", Gain(*level))
+                }
                 SetResult::ClipFadeOut { track, id, d } => {
                     writeln!(f, "clip {track}#{id} fade_out {}", Tc(*d))
+                }
+                SetResult::ClipFadeOutTo { track, id, level } => {
+                    writeln!(f, "clip {track}#{id} fade_out_to {}", Gain(*level))
                 }
                 SetResult::ClipFadeShape { track, id, shape } => {
                     writeln!(f, "clip {track}#{id} fade_shape {shape}")
@@ -356,8 +366,14 @@ impl fmt::Display for Output {
                         if c.fade_in > Duration::ZERO {
                             line.push_str(&format!(" fade_in={}", Tc(c.fade_in)));
                         }
+                        if c.fade_in_from != 0.0 {
+                            line.push_str(&format!(" fade_in_from={}", Gain(c.fade_in_from)));
+                        }
                         if c.fade_out > Duration::ZERO {
                             line.push_str(&format!(" fade_out={}", Tc(c.fade_out)));
+                        }
+                        if c.fade_out_to != 0.0 {
+                            line.push_str(&format!(" fade_out_to={}", Gain(c.fade_out_to)));
                         }
                         if c.fade_shape != FadeShape::Linear {
                             line.push_str(&format!(" fade_shape={}", c.fade_shape));
