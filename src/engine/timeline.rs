@@ -41,6 +41,10 @@ pub struct ClipPlan {
     /// Silence before it starts, measured from the previous clip's end (or
     /// from the playhead for the first clip of a track).
     pub delay: Duration,
+    /// The clip's gain, `0.0 ..= 1.0`.
+    pub gain: f32,
+    /// The clip's fade envelope.
+    pub fade: crate::track::Fade,
 }
 
 impl Timeline {
@@ -78,6 +82,8 @@ impl Timeline {
                     into,
                     length: remaining,
                     delay,
+                    gain: clip.gain,
+                    fade: clip.fade,
                 });
                 previous_end = Some(abs_end);
                 end = end.max(abs_end);

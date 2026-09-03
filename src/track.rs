@@ -37,6 +37,89 @@ impl Source {
     }
 }
 
+/// The shape of a [`Fade`]'s amplitude ramp.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FadeShape {
+    /// A linear ramp.
+    #[default]
+    Linear,
+}
+
+impl FadeShape {
+    /// Map a ramp position `x` in `0..=1` to a gain in `0..=1`.
+    #[must_use]
+    pub fn ramp(self, x: f32) -> f32 {
+        let x = x.clamp(0.0, 1.0);
+        match self {
+            Self::Linear => x,
+        }
+    }
+}
+
+impl std::fmt::Display for FadeShape {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Linear => "linear",
+        })
+    }
+}
+
+impl std::str::FromStr for FadeShape {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s.trim() {
+            "linear" => Ok(Self::Linear),
+            other => Err(format!("bad fade shape {other:?}: linear")),
+        }
+    }
+}
+
+/// A clip's amplitude envelope: fade in at the start, fade out at the end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Fade {
+    /// Ramp from silence to full over this long, at the clip's start.
+    pub fade_in: Duration,
+    /// Ramp from full to silence over this long, at the clip's end.
+    pub fade_out: Duration,
+    /// The curve of both ramps.
+    pub shape: FadeShape,
+}
+
+impl Fade {
+    /// Whether neither edge fades.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.fade_in.is_zero() && self.fade_out.is_zero()
+    }
+
+    /// The envelope's gain at `pos` into a `length`-long span. `fade_in` is
+    /// measured from the span's start, `fade_out` from its end; the two
+    /// multiply where they overlap (a span too short for both).
+    #[must_use]
+    pub fn gain_at(&self, pos: Duration, length: Duration) -> f32 {
+        if self.is_empty() || length.is_zero() {
+            return 1.0;
+        }
+        let mut gain = 1.0;
+        let fade_in = self.fade_in.min(length);
+        if pos < fade_in {
+            gain *= self
+                .shape
+                .ramp((pos.as_secs_f64() / fade_in.as_secs_f64()) as f32);
+        }
+        if !self.fade_out.is_zero() {
+            let fade_out_start = length.saturating_sub(self.fade_out);
+            if pos >= fade_out_start {
+                let x = (pos.saturating_sub(fade_out_start).as_secs_f64()
+                    / self.fade_out.as_secs_f64()) as f32;
+                gain *= 1.0 - self.shape.ramp(x);
+            }
+        }
+        gain
+    }
+}
+
 /// A slice of a source, occupying `at .. at + duration()` on one [`Track`].
 ///
 /// Two pairs of timecodes, deliberately separate: `from`/`to` select *which
@@ -56,6 +139,10 @@ pub struct Clip {
     pub from: Duration,
     /// Out-point, measured into the source.
     pub to: Duration,
+    /// Gain applied to this clip in the mix, `0.0 ..= 1.0`; full by default.
+    pub gain: f32,
+    /// The fade envelope.
+    pub fade: Fade,
 }
 
 impl Clip {
@@ -67,6 +154,8 @@ impl Clip {
             at: Duration::ZERO,
             from: Duration::ZERO,
             to: length,
+            gain: 1.0,
+            fade: Fade::default(),
         }
     }
 
@@ -78,6 +167,8 @@ impl Clip {
             at: Duration::ZERO,
             from,
             to,
+            gain: 1.0,
+            fade: Fade::default(),
         }
     }
 
@@ -92,6 +183,20 @@ impl Clip {
     #[must_use]
     pub fn to(mut self, to: Duration) -> Self {
         self.to = to;
+        self
+    }
+
+    /// Set the clip's gain, clamped to `0.0 ..= 1.0`.
+    #[must_use]
+    pub fn gain(mut self, gain: f32) -> Self {
+        self.gain = gain.clamp(0.0, 1.0);
+        self
+    }
+
+    /// Set the clip's fade envelope.
+    #[must_use]
+    pub fn fade(mut self, fade: Fade) -> Self {
+        self.fade = fade;
         self
     }
 
@@ -299,6 +404,12 @@ impl Track {
         self.clips.iter().find(|c| c.covers(t))
     }
 
+    /// The clip with `id`, mutably.
+    #[must_use]
+    pub fn clip_mut(&mut self, id: u64) -> Option<&mut Clip> {
+        self.clips.iter_mut().find(|c| c.id == id)
+    }
+
     /// The earliest position at or after `at` where a clip of length `len`
     /// can be placed without overlapping any resident clip: the answer a
     /// collision report points at.
@@ -451,5 +562,24 @@ mod tests {
         assert_eq!(t.next_free_start(secs(15), secs(5)), secs(15));
         // Butt-joining a's end is not free while b occupies 10..15.
         assert_eq!(t.next_free_start(secs(10), secs(5)), secs(15));
+    }
+
+    #[test]
+    fn fade_gain_ramps_linearly_at_both_edges() {
+        let f = Fade {
+            fade_in: secs(2),
+            fade_out: secs(2),
+            shape: FadeShape::Linear,
+        };
+        let len = secs(10);
+        assert_eq!(f.gain_at(Duration::ZERO, len), 0.0);
+        assert!((f.gain_at(secs(1), len) - 0.5).abs() < 1e-6);
+        assert_eq!(f.gain_at(secs(2), len), 1.0);
+        assert_eq!(f.gain_at(secs(5), len), 1.0, "mid-clip is unity");
+        assert!((f.gain_at(secs(9), len) - 0.5).abs() < 1e-6);
+        assert!(f.gain_at(secs(10), len).abs() < 1e-6, "the ramp reaches silence");
+        // An empty fade is unity everywhere.
+        assert_eq!(Fade::default().gain_at(secs(3), len), 1.0);
+        assert!(Fade::default().is_empty());
     }
 }

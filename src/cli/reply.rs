@@ -8,6 +8,7 @@ use std::fmt;
 use std::time::Duration;
 
 use bo::engine::State;
+use bo::track::FadeShape;
 
 /// A timecode, rendered as `HH:MM:SS.fff`. Exact integer math, no floats.
 #[derive(Debug)]
@@ -52,6 +53,10 @@ pub(crate) enum SetResult {
     TrackVolume { i: usize, v: f32 },
     TrackMuted { i: usize, muted: bool },
     TrackName { i: usize, name: String },
+    ClipGain { track: usize, id: u64, gain: f32 },
+    ClipFadeIn { track: usize, id: u64, d: Duration },
+    ClipFadeOut { track: usize, id: u64, d: Duration },
+    ClipFadeShape { track: usize, id: u64, shape: FadeShape },
 }
 
 /// One source measured by `probe` without a uri.
@@ -99,6 +104,10 @@ pub(crate) struct LsClip {
     pub(crate) end: Duration,
     pub(crate) from: Duration,
     pub(crate) src_to: Duration,
+    pub(crate) gain: f32,
+    pub(crate) fade_in: Duration,
+    pub(crate) fade_out: Duration,
+    pub(crate) fade_shape: FadeShape,
 }
 
 /// The data of one command reply.
@@ -220,6 +229,18 @@ impl fmt::Display for Output {
                     writeln!(f, "track {i} {}", if *muted { "muted" } else { "unmuted" })
                 }
                 SetResult::TrackName { i, name } => writeln!(f, "track {i} named {name:?}"),
+                SetResult::ClipGain { track, id, gain } => {
+                    writeln!(f, "clip {track}#{id} gain {}", Gain(*gain))
+                }
+                SetResult::ClipFadeIn { track, id, d } => {
+                    writeln!(f, "clip {track}#{id} fade_in {}", Tc(*d))
+                }
+                SetResult::ClipFadeOut { track, id, d } => {
+                    writeln!(f, "clip {track}#{id} fade_out {}", Tc(*d))
+                }
+                SetResult::ClipFadeShape { track, id, shape } => {
+                    writeln!(f, "clip {track}#{id} fade_shape {shape}")
+                }
             },
             Self::Removed { track, id, uri } => {
                 writeln!(f, "removed track {track} clip #{id} {uri}")
@@ -320,8 +341,7 @@ impl fmt::Display for Output {
                         Tc(t.end)
                     )?;
                     for c in &t.clips {
-                        writeln!(
-                            f,
+                        let mut line = format!(
                             "  clip {}: uri={} at={} end={} src={}-{}",
                             c.id,
                             c.uri,
@@ -329,7 +349,20 @@ impl fmt::Display for Output {
                             Tc(c.end),
                             Tc(c.from),
                             Tc(c.src_to)
-                        )?;
+                        );
+                        if c.gain != 1.0 {
+                            line.push_str(&format!(" gain={}", Gain(c.gain)));
+                        }
+                        if c.fade_in > Duration::ZERO {
+                            line.push_str(&format!(" fade_in={}", Tc(c.fade_in)));
+                        }
+                        if c.fade_out > Duration::ZERO {
+                            line.push_str(&format!(" fade_out={}", Tc(c.fade_out)));
+                        }
+                        if c.fade_shape != FadeShape::Linear {
+                            line.push_str(&format!(" fade_shape={}", c.fade_shape));
+                        }
+                        writeln!(f, "{line}")?;
                     }
                 }
                 Ok(())

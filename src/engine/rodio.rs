@@ -23,7 +23,7 @@ use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink, Player, Sample, Source}
 use crate::engine::measure::{Measurement, Meter};
 use crate::engine::timeline::{ClipPlan, Timeline};
 use crate::engine::{Backend, BackendError};
-use crate::track::Track;
+use crate::track::{Fade, Track};
 
 /// A backend that actually makes sound.
 pub struct Rodio {
@@ -108,7 +108,78 @@ fn make_source(plan: &ClipPlan) -> Result<impl Source + Send + 'static, String> 
     let file = File::open(&plan.uri).map_err(|e| format!("cannot open {}: {e}", plan.uri))?;
     let decoder = Decoder::new(BufReader::new(file))
         .map_err(|e| format!("cannot decode {}: {e}", plan.uri))?;
-    Ok(decoder.skip_duration(plan.into).take_duration(plan.length).delay(plan.delay))
+    // The fade-in window is shortened by however far into the clip the
+    // playhead already is; the fade-out is always at the clip's end.
+    let fade = Fade {
+        fade_in: plan.fade.fade_in.saturating_sub(plan.into),
+        fade_out: plan.fade.fade_out,
+        shape: plan.fade.shape,
+    };
+    Ok(apply_fade(
+        decoder.skip_duration(plan.into).take_duration(plan.length),
+        fade,
+        plan.length,
+    )
+    .amplify(plan.gain)
+    .delay(plan.delay))
+}
+
+/// A [`Source`] that applies a [`Fade`] envelope to a finite span: fade in
+/// from the start, fade out into the end. `fade_in` is measured from the
+/// span's start, already shortened by any skipped lead-in.
+struct FadeSource<I> {
+    input: I,
+    fade: Fade,
+    length: Duration,
+    /// Duration of one interleaved sample of `input`.
+    per_sample: Duration,
+    /// Position of the next sample to emit.
+    pos: Duration,
+}
+
+fn apply_fade<I>(input: I, fade: Fade, length: Duration) -> FadeSource<I>
+where
+    I: Source,
+{
+    let per_sample = Duration::from_secs_f64(
+        1.0 / (input.sample_rate().get() as f64 * input.channels().get() as f64),
+    );
+    FadeSource {
+        input,
+        fade,
+        length,
+        per_sample,
+        pos: Duration::ZERO,
+    }
+}
+
+impl<I: Source> Iterator for FadeSource<I> {
+    type Item = Sample;
+
+    fn next(&mut self) -> Option<Sample> {
+        let sample = self.input.next()?;
+        let gain = self.fade.gain_at(self.pos, self.length);
+        self.pos += self.per_sample;
+        Some(sample * gain)
+    }
+}
+
+impl<I: Source> Source for FadeSource<I> {
+    fn current_span_len(&self) -> Option<usize> {
+        self.input.current_span_len()
+    }
+
+    fn channels(&self) -> rodio::ChannelCount {
+        self.input.channels()
+    }
+
+    fn sample_rate(&self) -> rodio::SampleRate {
+        self.input.sample_rate()
+    }
+
+    fn total_duration(&self) -> Option<Duration> {
+        self.input.total_duration()
+    }
 }
 
 /// One player per non-empty track on `mixer`, every clip from the shared

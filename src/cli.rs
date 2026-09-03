@@ -29,7 +29,8 @@
 //!
 //! # Commands
 //!
-//! * `put [--repeat n] <spec> [where]` — place a clip, or n butt-joined
+//! * `put [--repeat n] [--gain g] [--fade-in t] [--fade-out t]
+//!   [--fade-shape s] <spec> [where]` — place a clip, or n butt-joined
 //!   copies of it, on a track; `where` is `track[@pos]`, an omitted track
 //!   creates a fresh one and an omitted pos means the playhead. A track is
 //!   created on demand (up to that index). A source with no out-point is
@@ -45,8 +46,9 @@
 //! * `apply` — rebuild the running transport from the current playhead, so
 //!   pending mix changes take effect now.
 //! * `set <var> <value>` — set an attribute: `master` (real-time), or
-//!   `track.N.volume` / `track.N.muted` / `track.N.name` (arrangement data;
-//!   volume and mute land on the next `play` or `apply`).
+//!   `track.N.volume` / `track.N.muted` / `track.N.name` / `clip.N.N.gain` /
+//!   `clip.N.N.fade_in` / `clip.N.N.fade_out` / `clip.N.N.fade_shape`
+//!   (arrangement data; volume and gain land on the next `play` or `apply`).
 //! * `take <track> <clip>` — remove a clip; the clip is addressed by its
 //!   stable id or an `@timecode` (the clip covering that moment).
 //! * `render [file] [from-to]` — mix the arrangement to a wav file,
@@ -93,7 +95,7 @@ use std::time::{Duration, Instant};
 
 use bo::engine::rodio::{check_sources, probe, probe_sources, render_and_measure, render_to_file, Rodio};
 use bo::engine::{Backend, BackendError, Player, Silent, State};
-use bo::track::{Clip, Source, Track};
+use bo::track::{Clip, Fade, FadeShape, Source, Track};
 use clap::error::ErrorKind;
 use clap::{Parser, Subcommand};
 
@@ -128,6 +130,8 @@ enum Command {
     /// whole source, resolved by probing). The placement is `track[@pos]`: a
     /// track index (created on demand) and a position (default the playhead).
     /// Timecodes are SS, MM:SS or HH:MM:SS with an optional .fff fraction.
+    /// `--gain`, `--fade-in`, `--fade-out` and `--fade-shape` set the clip's
+    /// gain and fade envelope.
     Put {
         /// uri[,from-to]
         spec: String,
@@ -137,6 +141,18 @@ enum Command {
         /// Place this many butt-joined copies of the clip.
         #[arg(long)]
         repeat: Option<u32>,
+        /// Set the clip's gain, 0..=1.
+        #[arg(long)]
+        gain: Option<f32>,
+        /// Fade in over this long, from silence.
+        #[arg(long)]
+        fade_in: Option<String>,
+        /// Fade out over this long, to silence.
+        #[arg(long)]
+        fade_out: Option<String>,
+        /// The fade curve: linear.
+        #[arg(long)]
+        fade_shape: Option<String>,
     },
     /// Remove a clip by its id or the `@timecode` it covers.
     Take {
@@ -348,6 +364,8 @@ Arrangement:
   put <spec> [where]       place a clip; where = track[@pos] — omit the track
                            for a fresh one and the pos for the playhead
                            (--repeat n places n butt-joined copies)
+                           (--gain/--fade-in/--fade-out/--fade-shape set
+                           the clip's gain and fades)
   take <track> <clip>      remove a clip — by its id, or the @timecode it
                            covers
   ls                       dump the arrangement; a key: value status block,
@@ -370,6 +388,10 @@ Mix:
   set track.N.volume <v>   set a track's gain, 0..1 (apply to land)
   set track.N.muted <b>    mute (true) or restore (false) a track
   set track.N.name <name>  label a track
+  set clip.N.N.gain <v>    set a clip's gain, 0..1 (apply to land)
+  set clip.N.N.fade_in <t> set a clip's fade-in
+  set clip.N.N.fade_out <t> set a clip's fade-out
+  set clip.N.N.fade_shape <s>  set a clip's fade curve (linear)
 
 Transport:
   play                     start playback from the current playhead
@@ -587,7 +609,25 @@ fn parse_command(args: &[String]) -> Result<Command, clap::Error> {
 /// Run a parsed subcommand against the arrangement.
 fn dispatch(a: &mut Arrangement, command: Command, cwd: &str) -> Result<Output, (i32, String)> {
     match command {
-        Command::Put { spec, placement, repeat } => put_command(a, &spec, placement.as_deref(), repeat, cwd),
+        Command::Put {
+            spec,
+            placement,
+            repeat,
+            gain,
+            fade_in,
+            fade_out,
+            fade_shape,
+        } => put_command(
+            a,
+            &spec,
+            placement.as_deref(),
+            repeat,
+            gain,
+            fade_in.as_deref(),
+            fade_out.as_deref(),
+            fade_shape.as_deref(),
+            cwd,
+        ),
         Command::Play => play_command(a),
         Command::Ls => Ok(Output::Ls(arrangement_view(a))),
         Command::At { at } => at_command(a, &at),
@@ -766,6 +806,10 @@ fn arrangement_view(a: &Arrangement) -> Ls {
                         end: c.end(),
                         from: c.from,
                         src_to: c.to,
+                        gain: c.gain,
+                        fade_in: c.fade.fade_in,
+                        fade_out: c.fade.fade_out,
+                        fade_shape: c.fade.shape,
                     })
                     .collect(),
             })
@@ -840,6 +884,10 @@ fn put_command(
     spec_arg: &str,
     placement_arg: Option<&str>,
     repeat: Option<u32>,
+    gain: Option<f32>,
+    fade_in: Option<&str>,
+    fade_out: Option<&str>,
+    fade_shape: Option<&str>,
     cwd: &str,
 ) -> Result<Output, (i32, String)> {
     let repeat = repeat.unwrap_or(1);
@@ -850,6 +898,21 @@ fn put_command(
     // Resolve the source against this command's cwd: the daemon is an
     // implementation detail and must not affect where relative paths land.
     spec.uri = absolutize(&spec.uri, cwd);
+    let gain = gain.unwrap_or(1.0);
+    let fade = Fade {
+        fade_in: match fade_in {
+            Some(s) => parse_timecode(s).map_err(usage)?,
+            None => Duration::ZERO,
+        },
+        fade_out: match fade_out {
+            Some(s) => parse_timecode(s).map_err(usage)?,
+            None => Duration::ZERO,
+        },
+        shape: match fade_shape {
+            Some(s) => s.parse::<FadeShape>().map_err(usage)?,
+            None => FadeShape::Linear,
+        },
+    };
     // A clip with no out-point plays to the source's end; resolve that end
     // now by probing, so every clip has a known finite length. Unmeasurable
     // sources are refused here instead of becoming a clip that blocks the
@@ -884,7 +947,12 @@ fn put_command(
         return Err(usage("cannot repeat a zero-length slice"));
     }
     let clips: Vec<Clip> = (0..repeat)
-        .map(|i| Clip::sliced(source.clone(), spec.from, to).at(base_at + slice_len * i))
+        .map(|i| {
+            Clip::sliced(source.clone(), spec.from, to)
+                .at(base_at + slice_len * i)
+                .gain(gain)
+                .fade(fade)
+        })
         .collect();
     // Atomic: verify every copy fits before inserting any, so a collision
     // leaves no trace. The daemon holds the arrangement lock throughout.
@@ -993,6 +1061,9 @@ fn set_command(a: &mut Arrangement, var: &str, value: &str) -> Result<Output, (i
             Ok(Output::Set(SetResult::Master { v: a.player.volume() }))
         }
         _ => {
+            if let Some(rest) = var.strip_prefix("clip.") {
+                return set_clip_command(a, rest, value);
+            }
             let (index, prop) = var
                 .strip_prefix("track.")
                 .and_then(|rest| rest.split_once('.'))
@@ -1028,6 +1099,71 @@ fn set_command(a: &mut Arrangement, var: &str, value: &str) -> Result<Output, (i
                 _ => Err(usage(format!("unknown property {prop:?} on a track"))),
             }
         }
+    }
+}
+
+/// `set clip.<track>.<id>.<prop>`: set a clip attribute (`gain`, `fade_in`,
+/// `fade_out`, `fade_shape`). Arrangement data that lands on the next `play`
+/// or `apply`.
+fn set_clip_command(
+    a: &mut Arrangement,
+    rest: &str,
+    value: &str,
+) -> Result<Output, (i32, String)> {
+    let (track, rest) = rest.split_once('.').ok_or_else(|| {
+        usage(format!(
+            "bad clip var clip.{rest:?}: expected clip.TRACK.ID.PROP"
+        ))
+    })?;
+    let (id, prop) = rest.split_once('.').ok_or_else(|| {
+        usage(format!(
+            "bad clip var clip.{rest:?}: expected clip.TRACK.ID.PROP"
+        ))
+    })?;
+    let track_i: usize = track
+        .parse()
+        .map_err(|_| usage(format!("bad track {track:?}")))?;
+    let id: u64 = id.parse().map_err(|_| usage(format!("bad clip id {id:?}")))?;
+    let t = a
+        .player
+        .tracks_mut()
+        .get_mut(track_i)
+        .ok_or_else(|| fail(format!("no track {track_i}")))?;
+    let c = t
+        .clip_mut(id)
+        .ok_or_else(|| fail(format!("no clip {track_i}#{id}")))?;
+    match prop {
+        "gain" => {
+            let v: f32 = value
+                .parse()
+                .map_err(|_| usage(format!("bad gain {value:?}")))?;
+            c.gain = v.clamp(0.0, 1.0);
+            Ok(Output::Set(SetResult::ClipGain {
+                track: track_i,
+                id,
+                gain: c.gain,
+            }))
+        }
+        "fade_in" => {
+            let d = parse_timecode(value).map_err(usage)?;
+            c.fade.fade_in = d;
+            Ok(Output::Set(SetResult::ClipFadeIn { track: track_i, id, d }))
+        }
+        "fade_out" => {
+            let d = parse_timecode(value).map_err(usage)?;
+            c.fade.fade_out = d;
+            Ok(Output::Set(SetResult::ClipFadeOut { track: track_i, id, d }))
+        }
+        "fade_shape" => {
+            let shape = value.parse::<FadeShape>().map_err(usage)?;
+            c.fade.shape = shape;
+            Ok(Output::Set(SetResult::ClipFadeShape {
+                track: track_i,
+                id,
+                shape,
+            }))
+        }
+        _ => Err(usage(format!("unknown property {prop:?} on a clip"))),
     }
 }
 
@@ -1098,7 +1234,15 @@ fn parse_range(s: &str) -> Result<(Duration, Option<Duration>), String> {
 /// names with whitespace survive [`handle_line`]'s tokenizer.
 fn command_line(command: &Command) -> String {
     match command {
-        Command::Put { spec, placement, repeat } => {
+        Command::Put {
+            spec,
+            placement,
+            repeat,
+            gain,
+            fade_in,
+            fade_out,
+            fade_shape,
+        } => {
             let mut line = String::from("put");
             if let Some(n) = repeat {
                 let _ = write!(line, " --repeat {n}");
@@ -1106,6 +1250,18 @@ fn command_line(command: &Command) -> String {
             let _ = write!(line, " {}", quote_arg(spec));
             if let Some(p) = placement {
                 let _ = write!(line, " {}", quote_arg(p));
+            }
+            if let Some(g) = gain {
+                let _ = write!(line, " --gain {g}");
+            }
+            if let Some(f) = fade_in {
+                let _ = write!(line, " --fade-in {}", quote_arg(f));
+            }
+            if let Some(f) = fade_out {
+                let _ = write!(line, " --fade-out {}", quote_arg(f));
+            }
+            if let Some(s) = fade_shape {
+                let _ = write!(line, " --fade-shape {}", quote_arg(s));
             }
             line
         }
@@ -1161,14 +1317,26 @@ fn serialize(a: &Arrangement) -> String {
             continue; // empty tracks carry nothing worth saving
         }
         for c in t.clips() {
-            let _ = writeln!(
-                out,
+            let mut line = format!(
                 "put {},{}-{} {ti}@{}",
                 quote_arg(&c.source.uri),
                 format_time(c.from),
                 format_time(c.to),
                 format_time(c.at)
             );
+            if c.gain != 1.0 {
+                let _ = write!(line, " --gain {}", c.gain);
+            }
+            if c.fade.fade_in > Duration::ZERO {
+                let _ = write!(line, " --fade-in {}", format_time(c.fade.fade_in));
+            }
+            if c.fade.fade_out > Duration::ZERO {
+                let _ = write!(line, " --fade-out {}", format_time(c.fade.fade_out));
+            }
+            if c.fade.shape != FadeShape::Linear {
+                let _ = write!(line, " --fade-shape {}", c.fade.shape);
+            }
+            let _ = writeln!(out, "{line}");
         }
         if let Some(name) = t.name() {
             let _ = writeln!(out, "set track.{ti}.name {}", quote_arg(name));
@@ -2143,6 +2311,61 @@ mod tests {
         assert!(script.contains("set track.0.volume 0.5"), "{script}");
         assert!(script.contains("set track.1.muted true"), "{script}");
         assert!(script.contains("set master 0.78"), "master is saved: {script}");
+        let mut fresh = Arrangement::default();
+        run_script(&mut fresh, &script, "test", "").unwrap();
+        assert_eq!(serialize(&fresh), script, "the script rebuilds the same arrangement");
+    }
+
+    #[test]
+    fn put_and_set_carry_clip_gain_and_fade() {
+        let mut a = Arrangement::default();
+        let out = run_ok(
+            &mut a,
+            &["put", "a.wav,0-10", "--gain", "0.5", "--fade-in", "0.6", "--fade-out", "3.2"],
+        );
+        assert!(out.contains("track 0 clip #0"), "{out}");
+        let t = &a.player.tracks()[0];
+        assert_eq!(t.clips()[0].gain, 0.5);
+        assert_eq!(t.clips()[0].fade.fade_in, Duration::from_millis(600));
+        assert_eq!(t.clips()[0].fade.fade_out, Duration::from_millis(3200));
+
+        let ls = run_ok(&mut a, &["ls"]);
+        assert!(
+            ls.contains("gain=0.50")
+                && ls.contains("fade_in=00:00:00.600")
+                && ls.contains("fade_out=00:00:03.200"),
+            "{ls}"
+        );
+
+        // set tweaks them after the fact, addressed by clip id.
+        let out = run_ok(&mut a, &["set", "clip.0.0.gain", "0.25"]);
+        assert!(out.contains("clip 0#0 gain 0.25"), "{out}");
+        let out = run_ok(&mut a, &["set", "clip.0.0.fade_in", "1"]);
+        assert!(out.contains("clip 0#0 fade_in 00:00:01.000"), "{out}");
+        assert_eq!(
+            a.player.tracks()[0].clips()[0].fade.fade_in,
+            Duration::from_secs(1)
+        );
+
+        // Unknown shape is a usage error; a missing clip id is refused.
+        let (code, _) = run_err(&mut a, &["set", "clip.0.0.fade_shape", "wavy"]);
+        assert_eq!(code, 2);
+        let (code, msg) = run_err(&mut a, &["set", "clip.0.9.gain", "0.5"]);
+        assert_eq!(code, 1);
+        assert!(msg.contains("no clip 0#9"), "{msg}");
+    }
+
+    #[test]
+    fn serialize_round_trips_clip_gain_and_fade() {
+        let mut a = Arrangement::default();
+        run_ok(
+            &mut a,
+            &["put", "bed.wav,0-10", "--gain", "0.5", "--fade-in", "0.6", "--fade-out", "3.2"],
+        );
+        let script = serialize(&a);
+        assert!(script.contains("--gain 0.5"), "{script}");
+        assert!(script.contains("--fade-in 00:00:00.600"), "{script}");
+        assert!(script.contains("--fade-out 00:00:03.200"), "{script}");
         let mut fresh = Arrangement::default();
         run_script(&mut fresh, &script, "test", "").unwrap();
         assert_eq!(serialize(&fresh), script, "the script rebuilds the same arrangement");
