@@ -71,8 +71,9 @@
 //!   source whose container states no length is decoded to its end and the
 //!   reply marks it `estimated`.
 //! * `ls` — dump the arrangement: an `ok:` reply, a session line
-//!   (`stopped, playhead at …, '…' backend, end=…, master=…`), then one
-//!   track block per track with indented `clip #id …` signature lines.
+//!   (`stopped, playhead at …, '…' backend, end=…, master=…,
+//!   idle-timeout=…s`), then one track block per track with indented
+//!   `clip #id …` signature lines.
 //! * `at <t>` — show the mix at track time `t`: every clip covering that
 //!   moment, one per track.
 //!
@@ -279,6 +280,10 @@ struct Spec {
 #[derive(Debug)]
 struct Arrangement {
     player: Player<AnyBackend>,
+    /// `BO_IDLE_TIMEOUT` seconds, set by the daemon at startup (default
+    /// 600, `0` disables). Reported on `ls` so a quiet session cannot
+    /// silently time out.
+    idle_timeout: u64,
 }
 
 impl Default for Arrangement {
@@ -291,6 +296,7 @@ impl Arrangement {
     fn with_backend(backend: AnyBackend) -> Self {
         Self {
             player: Player::new(backend),
+            idle_timeout: 600,
         }
     }
 }
@@ -884,6 +890,7 @@ fn arrangement_view(a: &Arrangement) -> Ls {
         end: p.duration(),
         backend: p.backend().name(),
         volume: p.volume(),
+        idle_timeout: a.idle_timeout,
         tracks: p
             .tracks()
             .iter()
@@ -1734,6 +1741,7 @@ fn daemon_main_with(socket: &Path, backend: AnyBackend) -> i32 {
     // quiet for `BO_IDLE_TIMEOUT` seconds cleans itself up.
     let idle = Arc::new(Mutex::new(Instant::now()));
     let timeout = idle_timeout();
+    state.lock().unwrap().idle_timeout = timeout.as_secs();
 
     let serve_state = state.clone();
     let serve_exit = exit.clone();
@@ -2243,6 +2251,19 @@ mod tests {
         let out = run_ok(&mut a, &["play"]);
         assert!(out.contains("note: no audio device: x, 'silent' backend"), "{out}");
         assert!(run_ok(&mut a, &["ls"]).contains("'silent' backend"), "ls names the backend");
+    }
+
+    #[test]
+    fn ls_reports_the_idle_timeout() {
+        // The session line says how long a quiet daemon will wait before
+        // cleaning itself up, so a long session cannot silently vanish.
+        let mut a = Arrangement::default();
+        run_ok(&mut a, &["put", "a.wav,00:00:00-00:00:10"]);
+        let out = run_ok(&mut a, &["ls"]);
+        assert!(out.contains("idle-timeout=600s"), "default: {out}");
+        a.idle_timeout = 3;
+        let out = run_ok(&mut a, &["ls"]);
+        assert!(out.contains("idle-timeout=3s"), "from BO_IDLE_TIMEOUT: {out}");
     }
 
     #[test]

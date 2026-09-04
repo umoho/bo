@@ -158,6 +158,10 @@ pub(crate) struct Ls {
     pub(crate) end: Duration,
     pub(crate) backend: &'static str,
     pub(crate) volume: f32,
+    /// `BO_IDLE_TIMEOUT` seconds; a quiet, non-playing daemon exits after
+    /// this long without a command (`0` disables). Shown so a long session
+    /// cannot silently time out.
+    pub(crate) idle_timeout: u64,
     pub(crate) tracks: Vec<LsTrack>,
 }
 
@@ -506,12 +510,13 @@ impl fmt::Display for Output {
                 )?;
                 writeln!(
                     f,
-                    "{}, playhead at {}, '{}' backend, end={}, master={}",
+                    "{}, playhead at {}, '{}' backend, end={}, master={}, idle-timeout={}s",
                     ls.state,
                     Tc(ls.playhead),
                     ls.backend,
                     Tc(ls.end),
-                    Gain(ls.volume)
+                    Gain(ls.volume),
+                    ls.idle_timeout
                 )?;
                 for (ti, t) in ls.tracks.iter().enumerate() {
                     let name = match &t.name {
@@ -618,6 +623,7 @@ pub(crate) fn example_reply(command: &str) -> Option<String> {
             end: s(30),
             backend: "silent",
             volume: 1.0,
+            idle_timeout: 600,
             tracks: vec![
                 LsTrack {
                     name: Some("bed".into()),
