@@ -386,6 +386,18 @@ impl Track {
         self.insert(clip)
     }
 
+    /// Place a clip that already carries a stable id — a clip moved within
+    /// or between tracks keeps its identity. The caller must have verified
+    /// the spot is free and that no resident clip carries the same id;
+    /// nothing is checked here. The id counter is advanced past the planted
+    /// id, so a later `insert` can never collide with it.
+    pub fn insert_keeping_id(&mut self, clip: Clip) {
+        let at = clip.at;
+        self.next_id = self.next_id.max(clip.id + 1);
+        let index = self.clips.partition_point(|c| c.at < at);
+        self.clips.insert(index, clip);
+    }
+
     /// Remove the clip with `id`. Ids are never reused, so a removed id stays
     /// gone.
     #[must_use]
