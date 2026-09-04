@@ -106,7 +106,7 @@ impl Meter {
         if self.n == 0 {
             // A frame boundary: maybe a whole second has passed.
             self.frames += 1;
-            if self.frames % self.rate == 0 {
+            if self.frames.is_multiple_of(self.rate) {
                 self.close_second(self.frames / self.rate - 1);
             }
         }

@@ -361,6 +361,9 @@ impl Track {
     ///
     /// On collision the clip is handed back untouched, so a refused insert
     /// leaves the track exactly as it was.
+    // The error hands the whole clip back with the collision; the error path
+    // is rare and cold, so its size is not worth boxing the public shape.
+    #[allow(clippy::result_large_err)]
     pub fn insert(&mut self, mut clip: Clip) -> Result<u64, (Clip, Overlap)> {
         if let Some(conflict) = self.clips.iter().find(|c| c.overlaps(&clip)) {
             let at = clip.at;
@@ -377,6 +380,7 @@ impl Track {
     }
 
     /// Append a clip after the current tail.
+    #[allow(clippy::result_large_err)]
     pub fn push(&mut self, mut clip: Clip) -> Result<u64, (Clip, Overlap)> {
         clip.at = self.duration();
         self.insert(clip)

@@ -953,6 +953,8 @@ fn take_command(
 /// demand so that repeated puts rebuild the same layout. With `--repeat n`,
 /// places n butt-joined copies as ordinary clips; the whole batch is checked
 /// before any insert, so a collision refuses everything.
+// One argument per put flag; the count is the command surface itself.
+#[allow(clippy::too_many_arguments)]
 fn put_command(
     a: &mut Arrangement,
     spec_arg: &str,

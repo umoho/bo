@@ -142,7 +142,7 @@ impl R128 {
         let weighted = hp.tick(shelf.tick(f64::from(sample)));
         self.block_sq[ch] += weighted * weighted;
         self.in_block += 1;
-        if self.in_block % self.channels as u64 == 0 {
+        if self.in_block.is_multiple_of(self.channels as u64) {
             // A frame boundary.
             self.block_frames += 1;
             if self.block_frames == self.block_len {
@@ -234,9 +234,8 @@ impl R128 {
             // Fractional edges: energy share proportional to covered frames.
             let mut frames = 0u64;
             let mut sum = 0.0f64;
-            for b in lo..hi {
-                let b_frames = self.blocks[b].0;
-                let b_start = pref_f[b];
+            for (block, &b_start) in self.blocks[lo..hi].iter().zip(&pref_f[lo..hi]) {
+                let b_frames = block.0;
                 let b_end = b_start + b_frames;
                 let cov_start = b_start.max(start);
                 let cov_end = b_end.min(start + window_frames);
@@ -244,7 +243,7 @@ impl R128 {
                 if cov == 0 {
                     continue;
                 }
-                let b_sum = self.blocks[b].1;
+                let b_sum = block.1;
                 // Energy over the covered slice ≈ proportional share.
                 sum += b_sum * (cov as f64 / b_frames as f64);
                 frames += cov;

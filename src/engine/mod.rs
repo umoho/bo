@@ -571,6 +571,6 @@ mod tests {
         assert_eq!(p.tracks().len(), 0);
         assert_eq!(p.state(), State::Stopped);
         assert_eq!(p.playhead(), Duration::ZERO);
-        assert!(p.backend().events.iter().any(|e| *e == BackendEvent::Stop));
+        assert!(p.backend().events.contains(&BackendEvent::Stop));
     }
 }
