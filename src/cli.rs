@@ -61,9 +61,15 @@
 //!   commands, or replace it from one (transport resets with the swap).
 //! * `reset` — drop every track and stop the transport: the daemon is back
 //!   to its fresh state, ready for a session script to rebuild it.
-//! * `check` — verify every distinct source is readable.
+//! * `check` — verify every distinct source is readable. An unreadable
+//!   source is a problem (exit 1); a source whose length the container
+//!   cannot state rates at most a note, since no clip depends on a measured
+//!   length — open-ended puts probed theirs when placed, and every clip
+//!   carries a finite out-point.
 //! * `probe [uri]` — measure the length of a source, or of every distinct
-//!   source in the arrangement; a bare uri is probed locally, no daemon.
+//!   source in the arrangement; a bare uri is probed locally, no daemon. A
+//!   source whose container states no length is decoded to its end and the
+//!   reply marks it `≈` (estimated).
 //! * `ls` — dump the arrangement: an `ok:` reply, a session line
 //!   (`stopped, playhead at …, '…' backend, end=…, master=…`), then one
 //!   track block per track with indented `clip #id …` signature lines.
@@ -86,7 +92,9 @@
 //! position (default the playhead); `,` marks the slice; `:` is reserved for
 //! timecodes (`SS`, `MM:SS` or `HH:MM:SS`, plus an optional `.fff` fraction).
 //! A source with no out-point is probed at put time so every clip has a known
-//! finite length; a source that cannot be measured is refused.
+//! finite length — estimated by decoding to the end when the container states
+//! no length (see `probe`); a source that cannot be opened or decoded is
+//! refused.
 //!
 //! In-points are honored exactly: a clip reads the source from `from` — plus
 //! the playhead offset when playback enters it mid-way — the same in live
@@ -103,7 +111,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use bo::engine::rodio::{probe, probe_sources, render_and_measure, render_to_file, Rodio};
+use bo::engine::rodio::{
+    measure, probe, probe_sources, render_and_measure, render_to_file, Rodio, SourceLength,
+};
 use bo::engine::{Backend, BackendError, Player, Silent, State};
 use bo::track::{Clip, Fade, FadeShape, Source, Track};
 use clap::error::ErrorKind;
@@ -208,10 +218,14 @@ enum Command {
     },
     /// Drop every track and stop the transport: back to a fresh session.
     Reset,
-    /// Verify every source in the arrangement is readable.
+    /// Verify every source in the arrangement is readable. Unreadable
+    /// sources are problems; a source whose length the container cannot
+    /// state rates at most a note.
     Check,
     /// Measure the length of a source, or of every distinct source in the
     /// arrangement. A bare uri runs locally — no daemon is spawned.
+    /// Lengths the container cannot state are decoded to their end and
+    /// marked estimated.
     Probe {
         /// Source uri to measure; omit to probe the arrangement's sources.
         uri: Option<String>,
@@ -398,9 +412,11 @@ Arrangement:
   load <file>              replace the arrangement from a script
   reset                    drop every track and stop; back to a fresh
                            session
-  check                    verify every source is readable
-  probe [uri]              measure a source's length; without a uri, every
-                           source in the arrangement
+  check                    verify every source is readable; unreadable
+                           sources are problems (exit 1), sources with no
+                           measurable length rate at most a note
+  probe [uri]              measure a source's length (≈ marks an estimate);
+                           without a uri, every source in the arrangement
 
 Mix:
   set master <v>           set the master gain, 0..1 (real-time)
@@ -451,11 +467,13 @@ CLIP SPEC
   for timecodes.
 
   A source with no out-point is probed at put time and its whole length is
-  used, so every clip has a known finite end; a source that cannot be
-  measured is refused (run `bo probe <uri>`). Spans are half-open: clips
-  may butt-join (one ends exactly where the next starts). In-points are
-  exact: reading starts at `from` (plus the playhead offset when entering
-  mid-clip), sample-accurate in both play and render.
+  used, so every clip has a known finite end; when the container states no
+  length the file is decoded to its end (see `probe` — ≈ marks an
+  estimate). A source that cannot be opened or decoded is refused (run
+  `bo probe <uri>`). Spans are half-open: clips may butt-join (one ends
+  exactly where the next starts). In-points are exact: reading starts at
+  `from` (plus the playhead offset when entering mid-clip),
+  sample-accurate in both play and render.
 
 EXAMPLES
   bo put bed.wav,00:00:00-00:00:30
@@ -817,15 +835,29 @@ fn dispatch(a: &mut Arrangement, command: Command, cwd: &str) -> Result<Output, 
         Command::Reset => reset_command(a),
         Command::Check => {
             let clips: usize = a.player.tracks().iter().map(Track::len).sum();
-            let problems: Vec<(String, String)> = probe_sources(a.player.tracks())
-                .into_iter()
-                .filter_map(|(uri, outcome)| outcome.err().map(|e| (uri, e)))
+            let outcomes = probe_sources(a.player.tracks());
+            let problems: Vec<(String, String)> = outcomes
+                .iter()
+                .filter_map(|(uri, result)| result.as_ref().err().map(|e| (uri.clone(), e.clone())))
                 .collect();
-            if problems.is_empty() {
-                Ok(Output::Check { clips, problems })
-            } else {
-                let out = Output::Check { clips, problems };
+            // A source whose length the container cannot state is not a
+            // problem: every clip carries a finite out-point (an open-ended
+            // put probed it when it was placed), so no clip depends on a
+            // measured length. It rates at most a note.
+            let estimated = outcomes
+                .iter()
+                .filter(|(_, r)| matches!(r, Ok(SourceLength::Estimated(_))))
+                .count();
+            let has_problem = !problems.is_empty();
+            let out = Output::Check {
+                clips,
+                problems,
+                estimated,
+            };
+            if has_problem {
                 Err((1, out.to_string()))
+            } else {
+                Ok(out)
             }
         }
         Command::Probe { uri } => match uri {
@@ -1287,17 +1319,18 @@ fn parse_bool(s: &str) -> Result<bool, String> {
 /// `probe <uri>`: measure one source. Used both locally (no daemon) and over
 /// the wire.
 fn probe_uri(uri: &str) -> Result<Output, (i32, String)> {
-    match probe(uri) {
-        Ok(d) => Ok(Output::Probed {
+    match measure(uri) {
+        Ok(length) => Ok(Output::Probed {
             uri: uri.to_string(),
-            duration: d,
+            length,
         }),
         Err(e) => Err(fail(e)),
     }
 }
 
 /// `probe` with no uri: measure every distinct source in the arrangement.
-/// Lists each source's length; exit 1 if any source cannot be measured.
+/// Lists each source's length (≈ marks an estimate); exit 1 if any source
+/// cannot be opened or decoded.
 fn probe_arrangement(a: &Arrangement) -> Result<Output, (i32, String)> {
     let sources: Vec<ProbeResult> = probe_sources(a.player.tracks())
         .into_iter()
@@ -1917,6 +1950,77 @@ mod tests {
                 crossings as f32 / (2.0 * window)
             })
             .collect()
+    }
+
+    /// A decodable wav whose header states no length (a zero-frame float
+    /// wav): the stand-in for an mp3 without a Xing/Info frame.
+    fn write_empty_wav(path: &std::path::Path) {
+        let spec = hound::WavSpec {
+            channels: 2,
+            sample_rate: 44_100,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        let w = hound::WavWriter::create(path, spec).unwrap();
+        w.finalize().unwrap();
+    }
+
+    #[test]
+    fn probe_marks_lengths_it_had_to_decode_as_estimated() {
+        let dir = temp_dir();
+        let empty = dir.join("empty.wav");
+        write_empty_wav(&empty);
+        let empty_s = empty.to_string_lossy().into_owned();
+        let a = dir.join("a.wav");
+        write_test_wav(&a, 0.2, 0.5);
+        let a_s = a.to_string_lossy().into_owned();
+
+        let mut arr = Arrangement::default();
+        // A container that states its length stays plain.
+        let out = run_ok(&mut arr, &["probe", &a_s]);
+        assert!(out.contains("duration=00:00:00.200"), "{out}");
+        assert!(!out.contains("estimated"), "{out}");
+        // One that does not (an mp3 without a Xing/Info frame) is decoded
+        // and marked.
+        let out = run_ok(&mut arr, &["probe", &empty_s]);
+        assert!(out.contains("duration≈00:00:00.000 (estimated)"), "{out}");
+
+        // The arrangement probe marks its rows the same way.
+        run_ok(&mut arr, &["put", &format!("{a_s},00:00:00-00:00:00.200")]);
+        run_ok(&mut arr, &["put", &format!("{empty_s},00:00:00-00:00:00.500")]);
+        let out = run_ok(&mut arr, &["probe"]);
+        assert!(out.contains("ok: 2 sources"), "{out}");
+        assert!(out.contains("duration=00:00:00.200"), "{out}");
+        assert!(out.contains("duration≈00:00:00.000 (estimated)"), "{out}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn check_reports_only_unreadable_sources_as_problems() {
+        // Every clip carries an explicit out-point, so a source whose length
+        // the container cannot state (a vbr mp3 without a Xing/Info frame)
+        // is at most a note — never a problem. Only an unreadable source
+        // exits 1.
+        let dir = temp_dir();
+        let empty = dir.join("empty.wav");
+        write_empty_wav(&empty);
+        let empty_s = empty.to_string_lossy().into_owned();
+
+        let mut arr = Arrangement::default();
+        run_ok(&mut arr, &["put", &format!("{empty_s},00:00:00-00:00:00.500")]);
+        let out = run_ok(&mut arr, &["check"]);
+        assert!(out.contains("ok: 1 clip, all sources ok"), "{out}");
+        assert!(
+            out.contains("note: 1 source with no header length"),
+            "{out}"
+        );
+
+        // A missing file is still a real problem: the clip cannot play.
+        run_ok(&mut arr, &["put", "gone.wav,00:00:00-00:00:00.500", "0@00:00:01"]);
+        let (code, msg) = run_err(&mut arr, &["check"]);
+        assert_eq!(code, 1, "{msg}");
+        assert!(msg.contains("err: 1 problem") && msg.contains("cannot open"), "{msg}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     fn send(socket: &Path, line: &str) -> String {

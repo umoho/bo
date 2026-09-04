@@ -16,6 +16,7 @@
 use std::fmt;
 use std::time::Duration;
 
+use bo::engine::rodio::SourceLength;
 use bo::engine::State;
 use bo::track::FadeShape;
 
@@ -135,7 +136,7 @@ pub(crate) enum SetResult {
 #[derive(Debug)]
 pub(crate) struct ProbeResult {
     pub(crate) uri: String,
-    pub(crate) outcome: Result<Duration, String>,
+    pub(crate) outcome: Result<SourceLength, String>,
 }
 
 /// One clip audible at `at <t>`.
@@ -244,10 +245,12 @@ pub(crate) enum Output {
     Check {
         clips: usize,
         problems: Vec<(String, String)>,
+        /// Distinct sources whose length the container could not state.
+        estimated: usize,
     },
     Probed {
         uri: String,
-        duration: Duration,
+        length: SourceLength,
     },
     ProbedMany {
         sources: Vec<ProbeResult>,
@@ -421,9 +424,13 @@ impl fmt::Display for Output {
             Self::Reset { tracks } => {
                 writeln!(f, "ok: {tracks} track{} removed", plural(*tracks))
             }
-            Self::Check { clips, problems } => {
+            Self::Check {
+                clips,
+                problems,
+                estimated,
+            } => {
                 if problems.is_empty() {
-                    writeln!(f, "ok: {clips} clip{}, all sources ok", plural(*clips))
+                    writeln!(f, "ok: {clips} clip{}, all sources ok", plural(*clips))?;
                 } else {
                     writeln!(
                         f,
@@ -434,12 +441,30 @@ impl fmt::Display for Output {
                     for (uri, err) in problems {
                         writeln!(f, "  {} error={err}", quote(uri))?;
                     }
-                    Ok(())
                 }
+                // An estimated length is not a problem — every clip carries
+                // its own finite out-point — but it is worth one note.
+                if *estimated > 0 {
+                    writeln!(
+                        f,
+                        "note: {} source{} with no header length — lengths were estimated",
+                        estimated,
+                        plural(*estimated)
+                    )?;
+                }
+                Ok(())
             }
-            Self::Probed { uri, duration } => {
-                writeln!(f, "ok: {} duration={}", quote(uri), Tc(*duration))
-            }
+            Self::Probed { uri, length } => match length {
+                SourceLength::Exact(d) => {
+                    writeln!(f, "ok: {} duration={}", quote(uri), Tc(*d))
+                }
+                SourceLength::Estimated(d) => writeln!(
+                    f,
+                    "ok: {} duration≈{} (estimated)",
+                    quote(uri),
+                    Tc(*d)
+                ),
+            },
             Self::ProbedMany { sources } => {
                 if sources.is_empty() {
                     return f.write_str("ok: no sources in the arrangement\n");
@@ -461,9 +486,15 @@ impl fmt::Display for Output {
                 }
                 for s in sources {
                     match &s.outcome {
-                        Ok(d) => {
+                        Ok(SourceLength::Exact(d)) => {
                             writeln!(f, "  {} duration={}", quote(&s.uri), Tc(*d))?
                         }
+                        Ok(SourceLength::Estimated(d)) => writeln!(
+                            f,
+                            "  {} duration≈{} (estimated)",
+                            quote(&s.uri),
+                            Tc(*d)
+                        )?,
                         Err(e) => writeln!(f, "  {} error={e}", quote(&s.uri))?,
                     }
                 }
@@ -664,10 +695,15 @@ pub(crate) fn example_reply(command: &str) -> Option<String> {
         "check" => Output::Check {
             clips: 2,
             problems: Vec::new(),
+            // A header-less source (an mp3 without a Xing/Info frame) is a
+            // note, not a problem: clips carry their own out-points.
+            estimated: 1,
         },
         "probe" => Output::Probed {
             uri: "/srv/bed.wav".into(),
-            duration: s(30),
+            // Containers that state no length (a vbr mp3 without a Xing/Info
+            // frame) are decoded to their end and marked as estimated.
+            length: SourceLength::Estimated(s(30)),
         },
         "set" => Output::Set(SetResult::TrackVolume { i: 0, v: 0.4 }),
         "play" => Output::Session {
