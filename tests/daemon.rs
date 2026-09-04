@@ -79,6 +79,72 @@ fn write_test_wav(path: &Path, seconds: f32, amp: f32) {
     std::fs::write(path, wav).unwrap();
 }
 
+/// A mono 16-bit wav whose content changes every whole second: second `i` is
+/// a sine at `freqs[i]`, so a render's audio identifies which second of the
+/// source it really came from.
+fn write_stepped_wav(path: &Path, freqs: &[f32]) {
+    let rate = 44_100u32;
+    let frames = (rate * freqs.len() as u32) as usize;
+    let mut data = Vec::with_capacity(frames * 2);
+    for i in 0..frames {
+        let f = freqs[(i / rate as usize).min(freqs.len() - 1)];
+        let v = (0.5
+            * (2.0 * std::f32::consts::PI * f * i as f32 / rate as f32).sin()
+            * 32767.0) as i16;
+        data.extend_from_slice(&v.to_le_bytes());
+    }
+    let mut wav = Vec::new();
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + data.len() as u32).to_le_bytes());
+    wav.extend_from_slice(b"WAVE");
+    wav.extend_from_slice(b"fmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&rate.to_le_bytes());
+    wav.extend_from_slice(&(rate * 2).to_le_bytes());
+    wav.extend_from_slice(&2u16.to_le_bytes());
+    wav.extend_from_slice(&16u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    wav.extend_from_slice(&data);
+    std::fs::write(path, wav).unwrap();
+}
+
+/// Parse a bo render (stereo, 32-bit float, 44.1 kHz) as raw interleaved
+/// samples, walking the RIFF chunks — deliberately not rodio, so the test
+/// also proves the file bo wrote is really readable.
+fn read_render_samples(path: &Path) -> Vec<f32> {
+    let bytes = std::fs::read(path).unwrap();
+    assert_eq!(&bytes[0..4], b"RIFF", "a riff header");
+    assert_eq!(&bytes[8..12], b"WAVE", "a wave file");
+    let mut off = 12usize;
+    while off + 8 <= bytes.len() {
+        let id = &bytes[off..off + 4];
+        let size = u32::from_le_bytes(bytes[off + 4..off + 8].try_into().unwrap()) as usize;
+        if id == b"data" {
+            let mut out = Vec::with_capacity(size / 4);
+            for chunk in bytes[off + 8..off + 8 + size].chunks_exact(4) {
+                out.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+            }
+            return out;
+        }
+        off += 8 + size + (size & 1); // chunks are word-aligned
+    }
+    panic!("no data chunk in {}", path.display());
+}
+
+/// Dominant frequency of the first whole second of a render, channel 0, by
+/// zero-crossing count.
+fn first_second_freq(samples: &[f32]) -> f32 {
+    let ch0: Vec<f32> = samples.iter().step_by(2).take(44_100).copied().collect();
+    let crossings = ch0
+        .windows(2)
+        .filter(|w| (w[0] < 0.0) != (w[1] < 0.0))
+        .count();
+    crossings as f32 / 2.0
+}
+
 fn wait_for_socket_gone(socket: &Path) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while socket.exists() {
@@ -164,6 +230,49 @@ fn stop_ends_the_session() {
         std::thread::sleep(Duration::from_millis(20));
     }
 
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn in_point_is_honored_end_to_end_over_the_wire() {
+    let dir = temp_dir();
+    let socket = dir.join("d.sock");
+    let sp = socket.to_string_lossy().into_owned();
+    let src = dir.join("steps.wav");
+    write_stepped_wav(&src, &[440.0, 880.0, 1760.0]);
+    let srcs = src.to_string_lossy().into_owned();
+
+    // A slice of the source's 3rd second plays the 3rd second, not the 1st.
+    let out = dir.join("out.wav");
+    let outs = out.to_string_lossy().into_owned();
+    let put = bo(&sp, &["put", &format!("{srcs},00:00:02-00:00:03")]);
+    assert!(put.contains("00:00:02.000-00:00:03.000"), "{put}");
+    let rendered = bo(&sp, &["render", &outs]);
+    assert!(rendered.contains("00:00:01.000"), "{rendered}");
+    let f = first_second_freq(&read_render_samples(&out));
+    assert!(
+        (f - 1760.0).abs() < 40.0,
+        "in-point ignored: rendered {f:.0} Hz, want the source's 3rd second (1760)"
+    );
+
+    // Entered mid-way — the render range starts 1 s into a 1..3 s clip —
+    // reading must start at from + offset (the 2 s mark), not at `from`.
+    bo(&sp, &["reset"]);
+    let put = bo(&sp, &["put", &format!("{srcs},00:00:01-00:00:03")]);
+    assert!(put.contains("00:00:01.000-00:00:03.000"), "{put}");
+    let out2 = dir.join("out2.wav");
+    let out2s = out2.to_string_lossy().into_owned();
+    let rendered = bo(&sp, &["render", &out2s, "00:00:01.000-00:00:02.000"]);
+    assert!(rendered.contains("00:00:01.000"), "{rendered}");
+    let f = first_second_freq(&read_render_samples(&out2));
+    assert!(
+        (f - 1760.0).abs() < 40.0,
+        "mid-clip entry wrong: rendered {f:.0} Hz, want from+offset = 2 s (1760)"
+    );
+
+    let out = bo(&sp, &["stop"]);
+    assert!(out.contains("stopped"), "{out}");
+    wait_for_socket_gone(&socket);
     std::fs::remove_dir_all(&dir).ok();
 }
 
