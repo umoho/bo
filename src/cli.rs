@@ -69,7 +69,7 @@
 //! * `probe [uri]` — measure the length of a source, or of every distinct
 //!   source in the arrangement; a bare uri is probed locally, no daemon. A
 //!   source whose container states no length is decoded to its end and the
-//!   reply marks it `≈` (estimated).
+//!   reply marks it `estimated`.
 //! * `ls` — dump the arrangement: an `ok:` reply, a session line
 //!   (`stopped, playhead at …, '…' backend, end=…, master=…`), then one
 //!   track block per track with indented `clip #id …` signature lines.
@@ -415,7 +415,8 @@ Arrangement:
   check                    verify every source is readable; unreadable
                            sources are problems (exit 1), sources with no
                            measurable length rate at most a note
-  probe [uri]              measure a source's length (≈ marks an estimate);
+  probe [uri]              measure a source's length; a length the container
+                           cannot state is decoded and marked estimated;
                            without a uri, every source in the arrangement
 
 Mix:
@@ -468,8 +469,8 @@ CLIP SPEC
 
   A source with no out-point is probed at put time and its whole length is
   used, so every clip has a known finite end; when the container states no
-  length the file is decoded to its end (see `probe` — ≈ marks an
-  estimate). A source that cannot be opened or decoded is refused (run
+  length the file is decoded to its end (see `probe` — the reply marks it
+  `estimated`). A source that cannot be opened or decoded is refused (run
   `bo probe <uri>`). Spans are half-open: clips may butt-join (one ends
   exactly where the next starts). In-points are exact: reading starts at
   `from` (plus the playhead offset when entering mid-clip),
@@ -1983,7 +1984,7 @@ mod tests {
         // One that does not (an mp3 without a Xing/Info frame) is decoded
         // and marked.
         let out = run_ok(&mut arr, &["probe", &empty_s]);
-        assert!(out.contains("duration≈00:00:00.000 (estimated)"), "{out}");
+        assert!(out.contains("duration=00:00:00.000 estimated"), "{out}");
 
         // The arrangement probe marks its rows the same way.
         run_ok(&mut arr, &["put", &format!("{a_s},00:00:00-00:00:00.200")]);
@@ -1991,7 +1992,7 @@ mod tests {
         let out = run_ok(&mut arr, &["probe"]);
         assert!(out.contains("ok: 2 sources"), "{out}");
         assert!(out.contains("duration=00:00:00.200"), "{out}");
-        assert!(out.contains("duration≈00:00:00.000 (estimated)"), "{out}");
+        assert!(out.contains("duration=00:00:00.000 estimated"), "{out}");
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -447,7 +447,7 @@ impl fmt::Display for Output {
                 if *estimated > 0 {
                     writeln!(
                         f,
-                        "note: {} source{} with no header length — lengths were estimated",
+                        "note: {} source{} with no header length; lengths were estimated",
                         estimated,
                         plural(*estimated)
                     )?;
@@ -458,12 +458,9 @@ impl fmt::Display for Output {
                 SourceLength::Exact(d) => {
                     writeln!(f, "ok: {} duration={}", quote(uri), Tc(*d))
                 }
-                SourceLength::Estimated(d) => writeln!(
-                    f,
-                    "ok: {} duration≈{} (estimated)",
-                    quote(uri),
-                    Tc(*d)
-                ),
+                SourceLength::Estimated(d) => {
+                    writeln!(f, "ok: {} duration={} estimated", quote(uri), Tc(*d))
+                }
             },
             Self::ProbedMany { sources } => {
                 if sources.is_empty() {
@@ -489,12 +486,9 @@ impl fmt::Display for Output {
                         Ok(SourceLength::Exact(d)) => {
                             writeln!(f, "  {} duration={}", quote(&s.uri), Tc(*d))?
                         }
-                        Ok(SourceLength::Estimated(d)) => writeln!(
-                            f,
-                            "  {} duration≈{} (estimated)",
-                            quote(&s.uri),
-                            Tc(*d)
-                        )?,
+                        Ok(SourceLength::Estimated(d)) => {
+                            writeln!(f, "  {} duration={} estimated", quote(&s.uri), Tc(*d))?
+                        }
                         Err(e) => writeln!(f, "  {} error={e}", quote(&s.uri))?,
                     }
                 }

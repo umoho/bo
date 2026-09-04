@@ -308,7 +308,7 @@ fn headerless_sources_probe_as_estimated_and_check_stays_ok() {
 
     // A bare probe marks the estimate.
     let out = bo(&sp, &["probe", &srcs]);
-    assert!(out.contains("duration≈00:00:00.000 (estimated)"), "{out}");
+    assert!(out.contains("duration=00:00:00.000 estimated"), "{out}");
     assert!(!socket.exists(), "a bare probe must not spawn a daemon");
 
     // Explicit out-points: put and check succeed; the source's missing
@@ -317,7 +317,7 @@ fn headerless_sources_probe_as_estimated_and_check_stays_ok() {
     assert!(out.contains("clip #0"), "{out}");
     let out = bo(&sp, &["probe"]);
     assert!(out.contains("ok: 1 source"), "{out}");
-    assert!(out.contains("duration≈00:00:00.000 (estimated)"), "{out}");
+    assert!(out.contains("duration=00:00:00.000 estimated"), "{out}");
     let out = bo(&sp, &["check"]);
     assert!(out.contains("ok: 1 clip, all sources ok"), "{out}");
     assert!(out.contains("note: 1 source with no header length"), "{out}");
