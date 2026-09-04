@@ -87,6 +87,10 @@
 //! timecodes (`SS`, `MM:SS` or `HH:MM:SS`, plus an optional `.fff` fraction).
 //! A source with no out-point is probed at put time so every clip has a known
 //! finite length; a source that cannot be measured is refused.
+//!
+//! In-points are honored exactly: a clip reads the source from `from` — plus
+//! the playhead offset when playback enters it mid-way — the same in live
+//! play and in offline render, sample-accurate for any decodable format.
 
 use std::fmt::Write as _;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -449,7 +453,9 @@ CLIP SPEC
   A source with no out-point is probed at put time and its whole length is
   used, so every clip has a known finite end; a source that cannot be
   measured is refused (run `bo probe <uri>`). Spans are half-open: clips
-  may butt-join (one ends exactly where the next starts).
+  may butt-join (one ends exactly where the next starts). In-points are
+  exact: reading starts at `from` (plus the playhead offset when entering
+  mid-clip), sample-accurate in both play and render.
 
 EXAMPLES
   bo put bed.wav,00:00:00-00:00:30
@@ -1847,6 +1853,70 @@ mod tests {
         std::fs::write(path, wav).unwrap();
     }
 
+    /// A mono 16-bit wav whose content changes every whole second: second `i`
+    /// is a sine at `freqs[i]`, so a render's audio identifies which second
+    /// of the source it really came from.
+    fn write_stepped_wav(path: &std::path::Path, freqs: &[f32]) {
+        let rate = 44_100u32;
+        let frames = (rate * freqs.len() as u32) as usize;
+        let mut data = Vec::with_capacity(frames * 2);
+        for i in 0..frames {
+            let f = freqs[(i / rate as usize).min(freqs.len() - 1)];
+            let v = (0.5
+                * (2.0 * std::f32::consts::PI * f * i as f32 / rate as f32).sin()
+                * 32767.0) as i16;
+            data.extend_from_slice(&v.to_le_bytes());
+        }
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data.len() as u32).to_le_bytes());
+        wav.extend_from_slice(b"WAVE");
+        wav.extend_from_slice(b"fmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&rate.to_le_bytes());
+        wav.extend_from_slice(&(rate * 2).to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        wav.extend_from_slice(&data);
+        std::fs::write(path, wav).unwrap();
+    }
+
+    /// Dominant frequency of each whole-second block of a stereo render,
+    /// channel 0, by zero-crossing count.
+    fn block_freqs(path: &std::path::Path) -> Vec<f32> {
+        let decoder = rodio::Decoder::new(std::io::BufReader::new(std::fs::File::open(path).unwrap()))
+            .unwrap();
+        let mut blocks: Vec<(u64, u64)> = Vec::new(); // (crossings, samples)
+        let mut prev: Option<f32> = None;
+        for (i, s) in decoder.enumerate() {
+            if i % 2 == 1 {
+                continue; // channel 1
+            }
+            let second = (i / 2) / 44_100;
+            while blocks.len() <= second {
+                blocks.push((0, 0));
+            }
+            if let Some(p) = prev
+                && (p < 0.0) != (s < 0.0)
+            {
+                blocks[second].0 += 1;
+            }
+            blocks[second].1 += 1;
+            prev = Some(s);
+        }
+        blocks
+            .into_iter()
+            .map(|(crossings, samples)| {
+                let window = samples as f32 / 44_100.0;
+                crossings as f32 / (2.0 * window)
+            })
+            .collect()
+    }
+
     fn send(socket: &Path, line: &str) -> String {
         let mut stream = UnixStream::connect(socket).unwrap();
         stream.write_all(format!("\n{line}\n").as_bytes()).unwrap();
@@ -2153,6 +2223,34 @@ mod tests {
         assert_eq!(code, 2);
         let (code, _) = run_err(&mut a, &["put", "--repeat", "2", "c.wav,00:00:00-00:00:00"]);
         assert_eq!(code, 2);
+    }
+
+    #[test]
+    fn put_repeat_with_an_in_point_repeats_the_slice_not_the_head() {
+        // --repeat n plus from-to: every copy is a butt-joined copy of the
+        // *slice*, each starting at the in-point. Regression: the in-point
+        // used to be dropped, so every copy silently played the source's
+        // start instead.
+        let dir = temp_dir();
+        let src = dir.join("steps.wav");
+        write_stepped_wav(&src, &[440.0, 880.0, 1760.0]);
+        let spec = format!("{},00:00:02-00:00:03", src.to_string_lossy());
+        let out = dir.join("out.wav");
+        let out_s = out.to_string_lossy().into_owned();
+
+        let mut a = Arrangement::default();
+        run_ok(&mut a, &["put", "--repeat", "3", spec.as_str(), "0"]);
+        let render = parse_command(&["render".to_string(), out_s]).unwrap();
+        dispatch(&mut a, render, "").unwrap();
+        let freqs = block_freqs(&out);
+        assert_eq!(freqs.len(), 3, "three butt-joined copies: {freqs:?}");
+        for (i, f) in freqs.iter().enumerate() {
+            assert!(
+                (f - 1760.0).abs() < 40.0,
+                "copy {i} must start at the in-point (1760 Hz), got {f:.0} Hz"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
