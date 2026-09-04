@@ -539,7 +539,7 @@ impl fmt::Display for Output {
                 )?;
                 writeln!(
                     f,
-                    "{}, playhead at {}, '{}' backend, end={}, master={}, idle-timeout={}s",
+                    "{}, playhead at {}, '{}' backend, end={}, master={}, idle_timeout={}s",
                     ls.state,
                     Tc(ls.playhead),
                     ls.backend,

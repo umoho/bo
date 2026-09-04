@@ -379,7 +379,7 @@ fn ls_reports_the_idle_timeout_the_daemon_was_started_with() {
         .expect("bo runs");
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let out = bo(&sp, &["ls"]);
-    assert!(out.contains("idle-timeout=3s"), "{out}");
+    assert!(out.contains("idle_timeout=3s"), "{out}");
 
     let out = bo(&sp, &["stop"]);
     assert!(out.contains("stopped"), "{out}");

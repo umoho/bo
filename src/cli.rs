@@ -78,7 +78,7 @@
 //!   reply marks it `estimated`.
 //! * `ls` — dump the arrangement: an `ok:` reply, a session line
 //!   (`stopped, playhead at …, '…' backend, end=…, master=…,
-//!   idle-timeout=…s`), then one track block per track with indented
+//!   idle_timeout=…s`), then one track block per track with indented
 //!   `clip #id …` signature lines.
 //! * `at <t>` — show the mix at track time `t`: every clip covering that
 //!   moment, one per track.
@@ -2398,10 +2398,10 @@ mod tests {
         let mut a = Arrangement::default();
         run_ok(&mut a, &["put", "a.wav,00:00:00-00:00:10"]);
         let out = run_ok(&mut a, &["ls"]);
-        assert!(out.contains("idle-timeout=600s"), "default: {out}");
+        assert!(out.contains("idle_timeout=600s"), "default: {out}");
         a.idle_timeout = 3;
         let out = run_ok(&mut a, &["ls"]);
-        assert!(out.contains("idle-timeout=3s"), "from BO_IDLE_TIMEOUT: {out}");
+        assert!(out.contains("idle_timeout=3s"), "from BO_IDLE_TIMEOUT: {out}");
     }
 
     #[test]
