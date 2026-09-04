@@ -95,17 +95,17 @@ fn client_spawns_a_daemon_and_it_cleans_up_when_done() {
 
     // The first command auto-spawns the daemon.
     let out = bo(&sp, &["put", "a.wav,00:00:00-00:00:00.200"]);
-    assert!(out.contains("ok: track 0 clip #0"), "{out}");
+    assert!(out.contains("clip #0"), "{out}");
 
     // A second invocation reaches the same daemon and its arrangement.
     let out = bo(&sp, &["put", "b.wav,00:00:00-00:00:00.200", "0@00:00:00.200"]);
-    assert!(out.contains("ok: track 0 clip #1"), "{out}");
+    assert!(out.contains("clip #1"), "{out}");
 
     // The second command sees the same arrangement over the wire.
     let out = bo(&sp, &["ls"]);
-    assert!(out.contains("track 0: volume=1.00 clips=2"), "{out}");
+    assert!(out.contains("track 0 untitled vol=1.00 end=00:00:00.400"), "{out}");
     let out = bo(&sp, &["set", "track.0.volume", "0.25"]);
-    assert!(out.contains("track 0 volume 0.25"), "{out}");
+    assert!(out.contains("`track.0.volume` set to `0.25`"), "{out}");
 
     // Play the 0.4s arrangement: the daemon exits and removes its socket.
     let out = bo(&sp, &["play"]);
@@ -128,7 +128,7 @@ fn save_and_load_survive_a_daemon_restart() {
     let ps = prog.to_string_lossy().into_owned();
 
     let out = bo(&sp, &["put", "a.wav,00:00:00-00:00:10"]);
-    assert!(out.contains("ok: track 0"), "{out}");
+    assert!(out.contains("on track 0"), "{out}");
     let out = bo(&sp, &["save", &ps]);
     assert!(out.contains("saved"), "{out}");
     let out = bo(&sp, &["stop"]);
@@ -154,7 +154,7 @@ fn stop_ends_the_session() {
     let sp = socket.to_string_lossy().into_owned();
 
     let out = bo(&sp, &["put", "a.wav,00:00:00-00:00:10"]);
-    assert!(out.contains("ok: track 0"), "{out}");
+    assert!(out.contains("on track 0"), "{out}");
     let out = bo(&sp, &["stop"]);
     assert!(out.contains("stopped"), "{out}");
 
@@ -178,14 +178,14 @@ fn probe_measures_locally_without_a_daemon_and_over_the_wire() {
 
     // A bare uri is probed in the client: no daemon is spawned.
     let out = bo(&sp, &["probe", src.to_str().unwrap()]);
-    assert!(out.contains("probe:") && out.contains("00:00:00.200"), "{out}");
+    assert!(out.contains("duration=00:00:00.200"), "{out}");
     assert!(!socket.exists(), "a bare probe must not spawn a daemon");
 
     // The arrangement's sources are probed over the wire.
     let out = bo(&sp, &["put", spec.as_str()]);
-    assert!(out.contains("ok: track 0"), "{out}");
+    assert!(out.contains("on track 0"), "{out}");
     let out = bo(&sp, &["probe"]);
-    assert!(out.contains("probe: 1 source"), "{out}");
+    assert!(out.contains("ok: 1 source"), "{out}");
     assert!(out.contains("00:00:00.200"), "{out}");
 
     let out = bo(&sp, &["stop"]);
@@ -202,7 +202,7 @@ fn play_on_an_empty_arrangement_is_refused_and_the_daemon_survives() {
 
     // Spawn a daemon, then empty the arrangement out from under it.
     let out = bo(&sp, &["put", "a.wav,00:00:00-00:00:10"]);
-    assert!(out.contains("ok: track 0"), "{out}");
+    assert!(out.contains("on track 0"), "{out}");
     let out = bo(&sp, &["take", "0", "0"]);
     assert!(out.contains("removed"), "{out}");
 
@@ -213,7 +213,7 @@ fn play_on_an_empty_arrangement_is_refused_and_the_daemon_survives() {
 
     // The daemon is still alive: the session did not vanish.
     let out = bo(&sp, &["ls"]);
-    assert!(out.contains("state: stopped"), "{out}");
+    assert!(out.contains("stopped, playhead at"), "{out}");
 
     let out = bo(&sp, &["stop"]);
     assert!(out.contains("stopped"), "{out}");
@@ -232,7 +232,7 @@ fn quoted_arguments_survive_the_wire_and_scripts() {
 
     // A space-bearing path arrives as one argument over the wire.
     let out = bo(&sp, &["put", &spec]);
-    assert!(out.contains("ok: track 0"), "{out}");
+    assert!(out.contains("on track 0"), "{out}");
     let out = bo(&sp, &["ls"]);
     assert!(out.contains("Bo FM.wav"), "{out}");
 
@@ -240,7 +240,7 @@ fn quoted_arguments_survive_the_wire_and_scripts() {
     let out = bo(&sp, &["set", "track.0.name", "bed soft"]);
     assert!(out.contains("bed soft"), "{out}");
     let out = bo(&sp, &["ls"]);
-    assert!(out.contains("name=bed soft"), "{out}");
+    assert!(out.contains("'bed soft'"), "{out}");
 
     // save writes quoted lines; a fresh daemon's load restores them.
     let prog = dir.join("show plan.bo");
@@ -271,13 +271,13 @@ fn at_reports_the_mix_at_a_timecode_over_the_wire() {
     let sp = socket.to_string_lossy().into_owned();
 
     let out = bo(&sp, &["put", "a.wav,00:00:00-00:00:10"]);
-    assert!(out.contains("ok: track 0"), "{out}");
+    assert!(out.contains("on track 0"), "{out}");
     let out = bo(&sp, &["put", "b.wav,00:00:00-00:00:03", "1@00:00:05"]);
-    assert!(out.contains("ok: track 1"), "{out}");
+    assert!(out.contains("on track 1"), "{out}");
 
     let out = bo(&sp, &["at", "00:00:06.000"]);
-    assert!(out.contains("track 0: clip=0"), "{out}");
-    assert!(out.contains("track 1: clip=0"), "{out}");
+    assert!(out.contains("track 0: clip #0"), "{out}");
+    assert!(out.contains("track 1: clip #0"), "{out}");
     let out = bo(&sp, &["at", "00:00:20.000"]);
     assert!(out.contains("silent at"), "{out}");
 
@@ -297,20 +297,20 @@ fn reset_clears_the_arrangement_for_a_script_replay() {
 
     // Build a two-track mix and save it as a session script.
     let out = bo(&sp, &["put", "a.wav,00:00:00-00:00:10"]);
-    assert!(out.contains("ok: track 0"), "{out}");
+    assert!(out.contains("on track 0"), "{out}");
     let out = bo(&sp, &["put", "b.wav,00:00:00-00:00:05"]);
-    assert!(out.contains("ok: track 1"), "{out}");
+    assert!(out.contains("on track 1"), "{out}");
     let out = bo(&sp, &["save", &ps]);
     assert!(out.contains("saved"), "{out}");
 
     // Reset, then replay: the arrangement is rebuilt, not duplicated.
     let out = bo(&sp, &["reset"]);
-    assert!(out.contains("reset: 2 tracks removed"), "{out}");
+    assert!(out.contains("ok: 2 tracks removed"), "{out}");
     let out = bo(&sp, &["load", &ps]);
     assert!(out.contains("loaded"), "{out}");
     let out = bo(&sp, &["ls"]);
-    assert!(out.contains("tracks: 2"), "{out}");
-    assert!(!out.contains("clips=2"), "no duplicates after reset + replay: {out}");
+    assert!(out.contains("ok: 2 tracks,"), "{out}");
+    assert_eq!(out.matches("clip #").count(), 2, "no duplicates after reset + replay: {out}");
 
     let out = bo(&sp, &["stop"]);
     assert!(out.contains("stopped"), "{out}");
@@ -325,10 +325,10 @@ fn put_repeat_places_butt_joined_copies_over_the_wire() {
     let sp = socket.to_string_lossy().into_owned();
 
     let out = bo(&sp, &["put", "--repeat", "3", "crackle.wav,00:00:00-00:00:12"]);
-    assert_eq!(out.matches("ok: track 0 clip #").count(), 3, "{out}");
+    assert_eq!(out.matches("clip #").count(), 3, "{out}");
     let out = bo(&sp, &["ls"]);
-    assert!(out.contains("clips=3"), "{out}");
-    assert!(out.contains("at=00:00:12.000") && out.contains("at=00:00:24.000"), "{out}");
+    assert_eq!(out.matches("clip #").count(), 3, "{out}");
+    assert!(out.contains("@ 00:00:12.000") && out.contains("@ 00:00:24.000"), "{out}");
 
     let out = bo(&sp, &["stop"]);
     assert!(out.contains("stopped"), "{out}");
@@ -369,17 +369,17 @@ fn take_addresses_clips_by_timecode_over_the_wire() {
     let sp = socket.to_string_lossy().into_owned();
 
     let out = bo(&sp, &["put", "a.wav,00:00:00-00:00:10"]);
-    assert!(out.contains("ok: track 0 clip #0"), "{out}");
+    assert!(out.contains("clip #0"), "{out}");
     let out = bo(&sp, &["put", "b.wav,00:00:00-00:00:05", "0@00:00:10"]);
-    assert!(out.contains("ok: track 0 clip #1"), "{out}");
+    assert!(out.contains("clip #1"), "{out}");
 
     // Delete by timecode: b covers 00:00:12, so it goes — by its stable id.
     let out = bo(&sp, &["take", "0", "@00:00:12"]);
-    assert!(out.contains("removed track 0 clip #1") && out.contains("b.wav"), "{out}");
+    assert!(out.contains("removed 1 clip from track 0") && out.contains("clip #1") && out.contains("b.wav"), "{out}");
 
     // Ids are stable: a is still id 0 even though b is gone.
     let out = bo(&sp, &["take", "0", "0"]);
-    assert!(out.contains("removed track 0 clip #0") && out.contains("a.wav"), "{out}");
+    assert!(out.contains("removed 1 clip from track 0") && out.contains("clip #0") && out.contains("a.wav"), "{out}");
 
     let out = bo(&sp, &["stop"]);
     assert!(out.contains("stopped"), "{out}");
@@ -414,13 +414,13 @@ fn relative_paths_resolve_against_the_invocation_cwd() {
     };
 
     let out = run_in(&["put", "a.wav,00:00:00-00:00:10"]);
-    assert!(out.contains("ok: track 0 clip #0"), "{out}");
+    assert!(out.contains("clip #0"), "{out}");
 
     let out = run_in(&["ls"]);
     // current_dir() returns the canonical path (macOS: /private/var/...), so
     // compare against the canonicalized dir, not the symlinky temp_dir().
     let resolved = std::fs::canonicalize(&dir).unwrap();
-    let expected = format!("uri={}/a.wav", resolved.to_string_lossy());
+    let expected = format!("'{}/a.wav'", resolved.to_string_lossy());
     assert!(out.contains(&expected), "ls should show the absolute uri: {out}");
 
     let out = run_in(&["stop"]);

@@ -64,10 +64,15 @@
 //! * `check` — verify every distinct source is readable.
 //! * `probe [uri]` — measure the length of a source, or of every distinct
 //!   source in the arrangement; a bare uri is probed locally, no daemon.
-//! * `ls` — dump the whole arrangement as machine-readable text: a `key: value`
-//!   status block, then one `key=value` line per track and per clip.
+//! * `ls` — dump the arrangement: an `ok:` reply, a session line
+//!   (`stopped, playhead at …, '…' backend, end=…, master=…`), then one
+//!   track block per track with indented `clip #id …` signature lines.
 //! * `at <t>` — show the mix at track time `t`: every clip covering that
 //!   moment, one per track.
+//!
+//! Every reply opens with `ok: …` or `err: …`; timecodes are `HH:MM:SS.fff`
+//! strings, gains two decimals, and absent means default. `bo <command>
+//! --help` documents each command's reply shape.
 //!
 //! # Clip specs
 //!
@@ -94,7 +99,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use bo::engine::rodio::{check_sources, probe, probe_sources, render_and_measure, render_to_file, Rodio};
+use bo::engine::rodio::{probe, probe_sources, render_and_measure, render_to_file, Rodio};
 use bo::engine::{Backend, BackendError, Player, Silent, State};
 use bo::track::{Clip, Fade, FadeShape, Source, Track};
 use clap::error::ErrorKind;
@@ -231,9 +236,13 @@ enum Command {
     /// Apply the arrangement to a running transport, so pending mix
     /// changes (volume, mute) take effect now.
     Apply,
-    /// Show the grouped help.
+    /// Show the grouped help; `bo help <command>` shows that command's
+    /// usage and an example of its reply.
     #[command(hide = true)]
-    Help,
+    Help {
+        /// Command to document: put, take, ls, …
+        topic: Option<String>,
+    },
     /// Hidden: run the session daemon (spawned by the client on demand).
     #[command(hide = true)]
     Daemon,
@@ -373,8 +382,9 @@ Arrangement:
                            --fade-out-to set the clip's gain and fades)
   take <track> <clip>      remove a clip — by its id, or the @timecode it
                            covers
-  ls                       dump the arrangement; a key: value status block,
-                           then one key=value line per track and clip
+  ls                       dump the arrangement: an ok: reply, a session
+                           line, then one track block per track with clip
+                           signature lines
   at <t>                   show what plays at track time t
   render [file] [from-to]  mix the arrangement to a wav file; a range
                            renders only that span (from- to the end)
@@ -415,6 +425,18 @@ OPTIONS
                            (default: $TMPDIR/bo/daemon.sock)
   -h, --help               show this help
   -V, --version            print version
+  help <command>           show a command's usage and its reply example
+
+OUTPUT
+  Every reply opens with ok: ... or err: ... (exit codes: 0 ok, 1 refused,
+  2 usage). Timecodes are HH:MM:SS.fff strings; gains two decimals; absent
+  means default. A clip is one signature line, a track a header over its
+  clips:
+
+    clip #<id> '<uri>' <from>-<to> @ <at> [gain=..] [fade_in=..] ...
+    track <n> '<name>'|untitled vol=.. end=.. [muted]
+
+  bo help <command> shows that command's reply shape with a real example.
 
 CLIP SPEC
   uri[,from-to]            from-to = slice of the source (default: whole,
@@ -600,6 +622,30 @@ fn fail(msg: impl Into<String>) -> (i32, String) {
     (1, msg.into())
 }
 
+/// Frame an error message as the `err:` reply. A leading `error: ` (clap's
+/// own framing) is stripped; the first line gets the `err:` prefix and any
+/// further lines (a `reason:` or indented body) follow as-is. Replies that
+/// already carry their own `ok:`/`err:` head pass through untouched —
+/// `check` and `probe` report failure inside the reply itself.
+fn frame_err(msg: &str) -> String {
+    let msg = msg.strip_prefix("error: ").unwrap_or(msg);
+    if msg.starts_with("ok: ") || msg.starts_with("err: ") {
+        return format!("{msg}\n");
+    }
+    let mut out = String::new();
+    for (i, line) in msg.lines().enumerate() {
+        if i == 0 {
+            let _ = writeln!(out, "err: {line}");
+        } else {
+            let _ = writeln!(out, "{line}");
+        }
+    }
+    if out.is_empty() {
+        out.push_str("err: \n");
+    }
+    out
+}
+
 /// Parse the whole command line, including the global `--socket` option.
 fn parse_full(args: &[String]) -> Result<Cli, clap::Error> {
     let argv = std::iter::once("bo".to_string()).chain(args.iter().cloned());
@@ -656,7 +702,7 @@ fn dispatch(a: &mut Arrangement, command: Command, cwd: &str) -> Result<Output, 
             let t = parse_timecode(&at).map_err(usage)?;
             if t > a.player.duration() {
                 return Err(fail(format!(
-                    "refused: cannot seek to {} — the arrangement ends at {}",
+                    "cannot seek to {} — the arrangement ends at {}",
                     format_time(t),
                     format_time(a.player.duration())
                 )));
@@ -765,7 +811,10 @@ fn dispatch(a: &mut Arrangement, command: Command, cwd: &str) -> Result<Output, 
         Command::Reset => reset_command(a),
         Command::Check => {
             let clips: usize = a.player.tracks().iter().map(Track::len).sum();
-            let problems = check_sources(a.player.tracks());
+            let problems: Vec<(String, String)> = probe_sources(a.player.tracks())
+                .into_iter()
+                .filter_map(|(uri, outcome)| outcome.err().map(|e| (uri, e)))
+                .collect();
             if problems.is_empty() {
                 Ok(Output::Check { clips, problems })
             } else {
@@ -779,16 +828,15 @@ fn dispatch(a: &mut Arrangement, command: Command, cwd: &str) -> Result<Output, 
         },
         // Help is handled locally by the client; this arm keeps a stray
         // "help" line over the socket harmless.
-        Command::Help => Ok(Output::Text(HELP)),
+        Command::Help { .. } => Ok(Output::Text(HELP)),
         Command::Daemon => Err(fail("the daemon runs standalone, not over the socket")),
     }
 }
 
-/// The arrangement as data for `ls`: a `key: value` status block (state,
-/// playhead, end, backend, master volume, track count), then one line per
-/// track and per clip of `key=value` tokens. Row labels are stable
-/// (`player`-level keys, `track N:`, `clip N:`), so parsers can grep by
-/// prefix and keys never move position.
+/// The arrangement as data for `ls`: an `ok:` head, a session line (state,
+/// playhead, backend, end, master), then one `track` block per track with
+/// indented `clip #id` signature lines. See [`Output::Ls`]'s rendering for
+/// the exact grammar.
 fn arrangement_view(a: &Arrangement) -> Ls {
     let p = &a.player;
     Ls {
@@ -812,9 +860,8 @@ fn arrangement_view(a: &Arrangement) -> Ls {
                         id: c.id,
                         uri: c.source.uri.clone(),
                         at: c.at,
-                        end: c.end(),
                         from: c.from,
-                        src_to: c.to,
+                        to: c.to,
                         gain: c.gain,
                         fade_in: c.fade.fade_in,
                         fade_in_from: c.fade.fade_in_from,
@@ -829,7 +876,7 @@ fn arrangement_view(a: &Arrangement) -> Ls {
 }
 
 /// `at <t>`: the mix at track time `t` — every clip covering that moment,
-/// one per track, or a `silent at ...` line when nothing plays there.
+/// one per track, or `ok: silent at ...` when nothing plays there.
 fn at_command(a: &Arrangement, at_arg: &str) -> Result<Output, (i32, String)> {
     let t = parse_timecode(at_arg).map_err(usage)?;
     let active: Vec<AtLine> = a
@@ -843,7 +890,8 @@ fn at_command(a: &Arrangement, at_arg: &str) -> Result<Output, (i32, String)> {
                 id: c.id,
                 uri: c.source.uri.clone(),
                 at: c.at,
-                end: c.end(),
+                from: c.from,
+                to: c.to,
             })
         })
         .collect();
@@ -878,6 +926,15 @@ fn take_command(
             track: track_index,
             id: clip.id,
             uri: clip.source.uri.clone(),
+            at: clip.at,
+            from: clip.from,
+            to: clip.to,
+            gain: clip.gain,
+            fade_in: clip.fade.fade_in,
+            fade_in_from: clip.fade.fade_in_from,
+            fade_out: clip.fade.fade_out,
+            fade_out_to: clip.fade.fade_out_to,
+            fade_shape: clip.fade.shape,
         }),
         None => Err(fail(format!("no clip {track_index}#{clip_arg}"))),
     }
@@ -979,11 +1036,15 @@ fn put_command(
                 conflict.end().as_secs_f64()
             );
             let next = track.next_free_start(c.at, c.duration());
-            let hint = format!("next free start {:.3}s", next.as_secs_f64());
+            let who = if repeat > 1 {
+                format!("copy {i} on track {track_index} @ {}", Tc(c.at))
+            } else {
+                format!("track {track_index} @ {}", Tc(c.at))
+            };
             return Err(fail(format!(
-                "refused: copy {i} at {:.3}s collides with clip #{} {span}; {hint}",
-                c.at.as_secs_f64(),
+                "put refused: {who} overlaps\nreason: clip #{} occupies {span}; next free start is {:.3}s",
                 conflict.id,
+                next.as_secs_f64(),
             )));
         }
     }
@@ -1003,6 +1064,12 @@ fn put_command(
             at: placed.at,
             from: placed.from,
             to: placed.to,
+            gain: placed.gain,
+            fade_in: placed.fade.fade_in,
+            fade_in_from: placed.fade.fade_in_from,
+            fade_out: placed.fade.fade_out,
+            fade_out_to: placed.fade.fade_out_to,
+            fade_shape: placed.fade.shape,
         });
     }
     Ok(Output::Put {
@@ -1337,7 +1404,7 @@ fn command_line(command: &Command) -> String {
             Some(uri) => format!("probe {}", quote_arg(uri)),
             None => "probe".to_string(),
         },
-        Command::Help => unreachable!("help is handled locally, never sent"),
+        Command::Help { .. } => unreachable!("help is handled locally, never sent"),
         Command::Daemon => unreachable!("the daemon is spawned, not sent"),
     }
 }
@@ -1444,14 +1511,54 @@ pub fn run(args: Vec<String>) -> i32 {
         None => default_socket(),
     };
     match cli.command {
-        Command::Help => {
+        Command::Help { topic: None } => {
             println!("{HELP}");
             0
         }
+        Command::Help { topic: Some(topic) } => match help_topic(&topic) {
+            Some(text) => {
+                println!("{text}");
+                0
+            }
+            None => {
+                eprintln!("bo: no such command {topic:?} — try `bo help`");
+                2
+            }
+        },
         Command::Daemon => daemon_main(&socket),
         Command::Probe { uri: Some(uri) } => probe_client(&absolutize(&uri, &cwd)),
         command => client_main(&socket, &command),
     }
+}
+
+/// `bo help <command>`: one page per command — a usage synopsis and a real
+/// example of its reply. The example is rendered by the same code that
+/// renders live replies ([`reply::example_reply`]), so the documented shape
+/// cannot drift from the actual output.
+fn help_topic(topic: &str) -> Option<String> {
+    let synopsis = match topic {
+        "put" => "bo put <spec> [track[@pos]] [--repeat n] [--gain g] \
+                   [--fade-in t] [--fade-in-from v] [--fade-out t] [--fade-out-to v]",
+        "take" => "bo take <track> <clip>        # clip: an id, or @timecode",
+        "ls" => "bo ls",
+        "at" => "bo at <t>",
+        "render" => "bo render [file] [from-to] [--measure]",
+        "save" => "bo save <file>",
+        "load" => "bo load <file>",
+        "reset" => "bo reset",
+        "check" => "bo check",
+        "probe" => "bo probe [uri]",
+        "set" => "bo set <var> <value>",
+        "play" => "bo play",
+        "pause" => "bo pause",
+        "resume" => "bo resume",
+        "stop" => "bo stop",
+        "seek" => "bo seek <t>",
+        "apply" => "bo apply",
+        _ => return None,
+    };
+    let reply = reply::example_reply(topic)?;
+    Some(format!("{synopsis}\n\nreply example:\n{reply}"))
 }
 
 /// `probe <uri>` runs in the client: measuring a file needs no daemon or
@@ -1463,7 +1570,7 @@ fn probe_client(uri: &str) -> i32 {
             0
         }
         Err((code, msg)) => {
-            eprintln!("bo: {msg}");
+            print!("{}", frame_err(&msg));
             code
         }
     }
@@ -1663,17 +1770,17 @@ fn serve_loop(
 fn handle_line(state: &Mutex<Arrangement>, line: &str, cwd: &str) -> (i32, String, bool) {
     let args = match tokenize(line) {
         Ok(args) => args,
-        Err(e) => return (2, format!("bo: {e}\n"), false),
+        Err(e) => return (2, frame_err(&e), false),
     };
     let command = match parse_command(&args) {
         Ok(command) => command,
-        Err(e) => return (e.exit_code(), format!("{}\n", e.to_string().trim_end()), false),
+        Err(e) => return (e.exit_code(), frame_err(&e.to_string()), false),
     };
     let ends_session = matches!(command, Command::Stop);
     let mut a = state.lock().unwrap();
     match dispatch(&mut a, command, cwd) {
         Ok(out) => (0, out.to_string(), ends_session),
-        Err((code, msg)) => (code, format!("bo: {msg}\n"), ends_session),
+        Err((code, msg)) => (code, frame_err(&msg), ends_session),
     }
 }
 
@@ -1899,8 +2006,8 @@ mod tests {
         // and that a butt-join at its end is the next legal start.
         let (code, msg) = run_err(&mut a, &["put", "b.wav,00:00:00-00:00:10", "0@00:00:05"]);
         assert_eq!(code, 1);
-        assert!(msg.contains("clip #0 [0.000,10.000)"), "{msg}");
-        assert!(msg.contains("next free start 10.000s"), "{msg}");
+        assert!(msg.contains("clip #0 occupies [0.000,10.000)"), "{msg}");
+        assert!(msg.contains("next free start is 10.000s"), "{msg}");
     }
 
     #[test]
@@ -1944,13 +2051,9 @@ mod tests {
         run_ok(&mut a, &["put", "c.wav,00:00:00-00:00:03"]);
         let out = run_ok(&mut a, &["play"]);
         let session = out.lines().next().unwrap();
-        assert!(session.contains("session: 2 tracks | 3 clips"), "{out}");
+        assert!(session.contains("ok: 2 tracks, 3 clips"), "{out}");
         assert!(session.contains("ends 00:00:15.000"), "{out}");
-        assert!(session.contains("backend"), "{out}");
-        assert!(
-            out.find("session:").unwrap() < out.find("playing from").unwrap(),
-            "the session line comes first: {out}"
-        );
+        assert!(session.contains("playing from 00:00:00.000"), "{out}");
     }
 
     #[test]
@@ -1961,8 +2064,8 @@ mod tests {
         ));
         run_ok(&mut a, &["put", "a.wav,00:00:00-00:00:10"]);
         let out = run_ok(&mut a, &["play"]);
-        assert!(out.contains("(no audio device: x)"), "{out}");
-        assert!(run_ok(&mut a, &["ls"]).contains("backend: silent"), "ls names the backend");
+        assert!(out.contains("note: no audio device: x, 'silent' backend"), "{out}");
+        assert!(run_ok(&mut a, &["ls"]).contains("'silent' backend"), "ls names the backend");
     }
 
     #[test]
@@ -1971,14 +2074,18 @@ mod tests {
         run_ok(&mut a, &["put", "a.wav,00:00:00-00:00:10"]);
         run_ok(&mut a, &["put", "b.wav,00:00:00-00:00:05", "0@00:00:10"]);
         let out = run_ok(&mut a, &["ls"]);
-        assert!(out.contains("state: stopped"), "{out}");
-        for key in ["playhead:", "end:", "backend:", "volume:", "tracks:"] {
+        for key in [
+            "stopped, playhead at",
+            "end=00:00:15.000",
+            "'silent' backend",
+            "master=1.00",
+            "track 0 untitled vol=1.00",
+        ] {
             assert!(out.contains(key), "missing {key}: {out}");
         }
-        assert!(out.contains("track 0: volume=1.00 clips=2"), "{out}");
         assert!(out.contains("a.wav") && out.contains("b.wav"), "{out}");
         let out = run_ok(&mut a, &["ls"]);
-        assert!(out.contains("at=00:00:10.000 end=00:00:15.000"), "butt-joined clip: {out}");
+        assert!(out.contains("@ 00:00:10.000"), "butt-joined clip: {out}");
     }
 
     #[test]
@@ -1986,18 +2093,18 @@ mod tests {
         let mut a = Arrangement::default();
         run_ok(&mut a, &["put", "a.wav,00:00:00-00:00:10"]);
         let out = run_ok(&mut a, &["set", "track.0.volume", "0.5"]);
-        assert!(out.contains("track 0 volume 0.50"), "{out}");
+        assert!(out.contains("`track.0.volume` set to `0.50`"), "{out}");
         assert_eq!(a.player.tracks()[0].volume(), 0.5);
         run_ok(&mut a, &["set", "track.0.volume", "2.5"]);
         assert_eq!(a.player.tracks()[0].volume(), 1.0, "clamped");
         let (code, msg) = run_err(&mut a, &["set", "track.9.volume", "0.5"]);
         assert_eq!(code, 1);
         assert!(msg.contains("no track 9"), "{msg}");
-        assert!(run_ok(&mut a, &["ls"]).contains("volume=1.00"), "ls shows the gain");
+        assert!(run_ok(&mut a, &["ls"]).contains("vol=1.00"), "ls shows the gain");
 
         // Master is real-time and clamped too.
         let out = run_ok(&mut a, &["set", "master", "0.78"]);
-        assert!(out.contains("master 0.78"), "{out}");
+        assert!(out.contains("`master` set to `0.78`"), "{out}");
         assert_eq!(a.player.volume(), 0.78);
         let (code, _) = run_err(&mut a, &["set", "master", "abc"]);
         assert_eq!(code, 2);
@@ -2009,7 +2116,7 @@ mod tests {
     fn put_repeat_places_butt_joined_copies() {
         let mut a = Arrangement::default();
         let out = run_ok(&mut a, &["put", "--repeat", "3", "crackle.wav,00:00:00-00:00:12"]);
-        assert_eq!(out.matches("ok: track 0 clip #").count(), 3, "{out}");
+        assert_eq!(out.matches("clip #").count(), 3, "{out}");
         let t = &a.player.tracks()[0];
         assert_eq!(t.clips().len(), 3);
         assert_eq!(t.clips()[0].at, Duration::ZERO);
@@ -2022,7 +2129,7 @@ mod tests {
         );
         // Copies are independent: removing one leaves the others.
         let out = run_ok(&mut a, &["take", "0", "1"]);
-        assert!(out.contains("removed track 0 clip #1"), "{out}");
+        assert!(out.contains("clip #1"), "{out}");
         assert_eq!(a.player.tracks()[0].clips().len(), 2);
     }
 
@@ -2033,7 +2140,7 @@ mod tests {
         run_ok(&mut a, &["put", "a.wav,00:00:00-00:00:10", "@00:00:15"]);
         let (code, msg) = run_err(&mut a, &["put", "--repeat", "4", "b.wav,00:00:00-00:00:05", "0"]);
         assert_eq!(code, 1);
-        assert!(msg.contains("copy 3") && msg.contains("collides"), "{msg}");
+        assert!(msg.contains("copy 3") && msg.contains("overlaps"), "{msg}");
         assert_eq!(a.player.tracks()[0].clips().len(), 1, "no trace");
 
         // A source that cannot be measured is refused.
@@ -2056,13 +2163,13 @@ mod tests {
         run_ok(&mut a, &["put", "c.wav,00:00:00-00:00:03"]);
 
         let out = run_ok(&mut a, &["at", "00:00:01.000"]);
-        assert!(out.contains("track 0: clip=0"), "{out}");
-        assert!(out.contains("track 1: clip=0"), "{out}");
+        assert!(out.contains("track 0: clip #0"), "{out}");
+        assert!(out.contains("track 1: clip #0"), "{out}");
         let out = run_ok(&mut a, &["at", "00:00:12.000"]);
-        assert!(out.contains("track 0: clip=1"), "{out}");
+        assert!(out.contains("track 0: clip #1"), "{out}");
         assert!(!out.contains("track 1"), "{out}");
         let out = run_ok(&mut a, &["at", "00:00:20.000"]);
-        assert!(out.contains("silent at 00:00:20.000"), "{out}");
+        assert!(out.contains("ok: silent at 00:00:20.000"), "{out}");
         let (code, _) = run_err(&mut a, &["at", "bogus"]);
         assert_eq!(code, 2);
     }
@@ -2109,7 +2216,7 @@ mod tests {
         run_ok(&mut a, &["set", "track.0.name", "bed"]);
         run_ok(&mut a, &["play"]);
         let out = run_ok(&mut a, &["reset"]);
-        assert!(out.contains("reset: 2 tracks removed"), "{out}");
+        assert!(out.contains("ok: 2 tracks removed"), "{out}");
         assert_eq!(a.player.tracks().len(), 0);
         assert_eq!(a.player.state(), State::Stopped);
         assert_eq!(a.player.playhead(), Duration::ZERO);
@@ -2124,11 +2231,11 @@ mod tests {
 
         // By timecode: the clip covering 00:00:12 on track 0 is b (id 1).
         let out = run_ok(&mut a, &["take", "0", "@00:00:12"]);
-        assert!(out.contains("removed track 0 clip #1 b.wav"), "{out}");
+        assert!(out.contains("removed 1 clip from track 0") && out.contains("clip #1") && out.contains("b.wav"), "{out}");
 
         // By id: the remaining a on track 0 is id 0.
         let out = run_ok(&mut a, &["take", "0", "0"]);
-        assert!(out.contains("removed track 0 clip #0 a.wav"), "{out}");
+        assert!(out.contains("removed 1 clip from track 0") && out.contains("clip #0") && out.contains("a.wav"), "{out}");
 
         // A timecode nothing covers is a miss.
         let (code, msg) = run_err(&mut a, &["take", "0", "@00:00:30"]);
@@ -2146,7 +2253,7 @@ mod tests {
         run_ok(&mut a, &["put", "a.wav,00:00:00-00:00:10"]);
         run_ok(&mut a, &["put", "b.wav,00:00:00-00:00:05", "0@00:00:10"]);
         let out = run_ok(&mut a, &["take", "0", "0"]);
-        assert!(out.contains("removed track 0 clip #0"), "{out}");
+        assert!(out.contains("removed 1 clip from track 0") && out.contains("clip #0"), "{out}");
         assert_eq!(a.player.tracks()[0].clips().len(), 1);
         assert_eq!(
             a.player.tracks()[0].clips()[0].source.uri,
@@ -2165,10 +2272,10 @@ mod tests {
         let mut a = Arrangement::default();
         run_ok(&mut a, &["put", "a.wav,00:00:00-00:00:10"]);
         let out = run_ok(&mut a, &["set", "track.0.muted", "true"]);
-        assert!(out.contains("track 0 muted"), "{out}");
+        assert!(out.contains("`track.0.muted` set to `true`"), "{out}");
         assert!(a.player.tracks()[0].muted());
         let out = run_ok(&mut a, &["set", "track.0.muted", "false"]);
-        assert!(out.contains("track 0 unmuted"), "{out}");
+        assert!(out.contains("`track.0.muted` set to `false`"), "{out}");
         assert!(!a.player.tracks()[0].muted());
         assert!(!run_ok(&mut a, &["ls"]).contains("muted"), "no marker when unmuted");
         run_ok(&mut a, &["set", "track.0.muted", "true"]);
@@ -2228,16 +2335,16 @@ mod tests {
 
         send(&socket, "put a.wav,00:00:00-00:00:10");
         let reply = send(&socket, "ls");
-        assert!(reply.contains("track 0: volume=1.00 clips=1") && reply.contains("a.wav"), "{reply}");
+        assert!(reply.contains("track 0 untitled vol=1.00 end=00:00:10.000") && reply.contains("a.wav"), "{reply}");
 
         let reply = send(&socket, "set track.0.volume 0.5");
-        assert!(reply.contains("track 0 volume 0.50"), "{reply}");
+        assert!(reply.contains("`track.0.volume` set to `0.50`"), "{reply}");
         let reply = send(&socket, "set track.0.muted true");
-        assert!(reply.contains("track 0 muted"), "{reply}");
+        assert!(reply.contains("`track.0.muted` set to `true`"), "{reply}");
         let reply = send(&socket, "set track.0.muted false");
-        assert!(reply.contains("track 0 unmuted"), "{reply}");
+        assert!(reply.contains("`track.0.muted` set to `false`"), "{reply}");
         let reply = send(&socket, "take 0 0");
-        assert!(reply.contains("removed track 0 clip #0"), "{reply}");
+        assert!(reply.contains("removed 1 clip from track 0") && reply.contains("clip #0"), "{reply}");
         let reply = send(&socket, "ls");
         assert!(!reply.contains("a.wav"), "the clip is gone: {reply}");
 
@@ -2255,7 +2362,7 @@ mod tests {
         // Refill the empty arrangement, name the track, and check the source.
         send(&socket, "put a.wav,00:00:00-00:00:10");
         let reply = send(&socket, "set track.0.name bed");
-        assert!(reply.contains("named \"bed\""), "{reply}");
+        assert!(reply.contains("`track.0.name` set to `bed`"), "{reply}");
         // a.wav does not exist, so check must report it.
         let reply = send(&socket, "check");
         assert_eq!(reply.lines().next().unwrap(), "1", "{reply}");
@@ -2334,8 +2441,8 @@ mod tests {
         let mut a = Arrangement::default();
         run_ok(&mut a, &["put", "a.wav,00:00:00-00:00:10"]);
         let out = run_ok(&mut a, &["set", "track.0.name", "bed"]);
-        assert!(out.contains("track 0 named \"bed\""), "{out}");
-        assert!(run_ok(&mut a, &["ls"]).contains("track 0: name=bed"), "ls shows the label");
+        assert!(out.contains("`track.0.name` set to `bed`"), "{out}");
+        assert!(run_ok(&mut a, &["ls"]).contains("track 0 'bed'"), "ls shows the label");
         let (code, msg) = run_err(&mut a, &["set", "track.9.name", "x"]);
         assert_eq!(code, 1);
         assert!(msg.contains("no track 9"), "{msg}");
@@ -2381,7 +2488,7 @@ mod tests {
                 "0.2",
             ],
         );
-        assert!(out.contains("track 0 clip #0"), "{out}");
+        assert!(out.contains("clip #0"), "{out}");
         let t = &a.player.tracks()[0];
         assert_eq!(t.clips()[0].gain, 0.5);
         assert_eq!(t.clips()[0].fade.fade_in, Duration::from_millis(600));
@@ -2401,15 +2508,15 @@ mod tests {
 
         // set tweaks them after the fact, addressed by clip id.
         let out = run_ok(&mut a, &["set", "clip.0.0.gain", "0.25"]);
-        assert!(out.contains("clip 0#0 gain 0.25"), "{out}");
+        assert!(out.contains("`clip.0.0.gain` set to `0.25`"), "{out}");
         let out = run_ok(&mut a, &["set", "clip.0.0.fade_in", "1"]);
-        assert!(out.contains("clip 0#0 fade_in 00:00:01.000"), "{out}");
+        assert!(out.contains("`clip.0.0.fade_in` set to `00:00:01.000`"), "{out}");
         assert_eq!(
             a.player.tracks()[0].clips()[0].fade.fade_in,
             Duration::from_secs(1)
         );
         let out = run_ok(&mut a, &["set", "clip.0.0.fade_out_to", "0.4"]);
-        assert!(out.contains("clip 0#0 fade_out_to 0.40"), "{out}");
+        assert!(out.contains("`clip.0.0.fade_out_to` set to `0.40`"), "{out}");
 
         // Unknown shape is a usage error; a missing clip id is refused.
         let (code, _) = run_err(&mut a, &["set", "clip.0.0.fade_shape", "wavy"]);
@@ -2516,13 +2623,13 @@ mod tests {
 
         let render = parse_command(&["render".to_string(), "--measure".to_string()]).unwrap();
         let reply = dispatch(&mut a, render, "").unwrap().to_string();
-        assert!(reply.starts_with("measure: 00:00:01.000"), "{reply}");
-        assert!(reply.contains("peak: -6.0 dBFS"), "{reply}");
-        assert!(reply.contains("rms: -9.0 dBFS"), "{reply}");
-        assert!(reply.contains("true_peak:"), "{reply}");
-        assert!(reply.contains("loudest_1s:"), "{reply}");
+        assert!(reply.starts_with("ok: measured 00:00:01.000"), "{reply}");
+        assert!(reply.contains("peak_db=-6.0"), "{reply}");
+        assert!(reply.contains("rms_db=-9.0"), "{reply}");
+        assert!(reply.contains("true_peak_db=-6.0"), "{reply}");
+        assert!(reply.contains("loudest_1s=00:00:00.000"), "{reply}");
         assert!(reply.contains("note: span under 3s"), "under 3 s, no LUFS: {reply}");
-        assert!(!reply.contains("integrated:"), "no LUFS under 3 s: {reply}");
+        assert!(!reply.contains("integrated_lufs="), "no LUFS under 3 s: {reply}");
         // Nothing was written.
         assert!(!dir.join("out.wav").exists());
         std::fs::remove_dir_all(&dir).ok();
@@ -2545,8 +2652,8 @@ mod tests {
         ])
         .unwrap();
         let reply = dispatch(&mut a, render, "").unwrap().to_string();
-        assert!(reply.starts_with("rendered"), "{reply}");
-        assert!(reply.contains("rms:"), "{reply}");
+        assert!(reply.starts_with("ok: rendered"), "{reply}");
+        assert!(reply.contains("rms_db="), "{reply}");
         assert!(out.exists(), "the file was still written");
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2609,12 +2716,12 @@ mod tests {
 
         let mut a = Arrangement::default();
         let out = run_ok(&mut a, &["probe", path.as_str()]);
-        assert!(out.contains("probe:") && out.contains("00:00:00.200"), "{out}");
+        assert!(out.contains("duration=00:00:00.200"), "{out}");
         assert_eq!(a.player.tracks().len(), 0, "a bare probe touches nothing");
 
         run_ok(&mut a, &["put", path.as_str()]);
         let out = run_ok(&mut a, &["probe"]);
-        assert!(out.contains("probe: 1 source"), "{out}");
+        assert!(out.contains("ok: 1 source"), "{out}");
         assert!(out.contains("00:00:00.200"), "{out}");
 
         // A source that cannot be opened is reported, and fails the probe.
@@ -2664,9 +2771,9 @@ mod tests {
         wait_until("socket", || UnixStream::connect(&socket).is_ok());
 
         let reply = send(&socket, "put a.wav,00:00:00-00:00:00.200");
-        assert!(reply.contains("ok: track 0 clip #0"), "{reply}");
+        assert!(reply.contains("clip #0"), "{reply}");
         let reply = send(&socket, "put b.wav,00:00:00-00:00:00.200 0@00:00:00.200");
-        assert!(reply.contains("ok: track 0 clip #1"), "{reply}");
+        assert!(reply.contains("clip #1"), "{reply}");
 
         // A refused command still gets a framed reply and exit code.
         let reply = send(&socket, "nope");

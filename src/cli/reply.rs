@@ -1,8 +1,17 @@
 //! Command replies as data, separated from how they are rendered.
 //!
-//! [`Output`] is the data a command reports; `Display` is the current text
-//! rendering of it. A future JSON rendering can serialize the same types
-//! without touching the command logic that builds them.
+//! [`Output`] is the data a command reports; the `Display` impl renders it as
+//! the reply grammar every consumer (human or agent) reads:
+//!
+//! * every reply opens with `ok: ...` or `err: ...` — the status line;
+//! * timecodes are `HH:MM:SS.fff` strings, gains two decimals;
+//! * absent means default, except in `ls`, which dumps everything;
+//! * a clip is one signature line: `clip #{id} '{uri}' {from}-{to} @ {at}`
+//!   with `key=value` suffixes for non-default gain and fades;
+//! * a track block is a header line with indented clip lines.
+//!
+//! `bo <command> --help` documents each command's reply shape; both render
+//! from this module so they cannot drift apart.
 
 use std::fmt;
 use std::time::Duration;
@@ -26,7 +35,7 @@ impl fmt::Display for Tc {
     }
 }
 
-/// A gain, rendered with two decimals.
+/// A gain or level, rendered with two decimals.
 #[derive(Debug)]
 pub(crate) struct Gain(pub(crate) f32);
 
@@ -36,7 +45,62 @@ impl fmt::Display for Gain {
     }
 }
 
-/// One clip reported by `put`.
+/// Single-quote a free string (uri, name, file) for a reply line. Every
+/// string of that kind is quoted on output, so boundaries never depend on
+/// guessing; an embedded quote is escaped.
+pub(crate) fn quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "\\'"))
+}
+
+/// `""` for one, `"s"` otherwise.
+fn plural(n: usize) -> &'static str {
+    if n == 1 { "" } else { "s" }
+}
+
+/// The head of a clip signature: `clip #{id} '{uri}' {from}-{to} @ {at}`.
+fn clip_head(id: u64, uri: &str, from: Duration, to: Duration, at: Duration) -> String {
+    format!(
+        "clip #{id} {} {}-{} @ {}",
+        quote(uri),
+        Tc(from),
+        Tc(to),
+        Tc(at)
+    )
+}
+
+/// ` key=value` suffixes for a clip's non-default gain and fades.
+fn clip_suffix(
+    gain: f32,
+    fade_in: Duration,
+    fade_in_from: f32,
+    fade_out: Duration,
+    fade_out_to: f32,
+    shape: FadeShape,
+) -> String {
+    let mut s = String::new();
+    if gain != 1.0 {
+        s.push_str(&format!(" gain={}", Gain(gain)));
+    }
+    if fade_in > Duration::ZERO {
+        s.push_str(&format!(" fade_in={}", Tc(fade_in)));
+    }
+    if fade_in_from != 0.0 {
+        s.push_str(&format!(" fade_in_from={}", Gain(fade_in_from)));
+    }
+    if fade_out > Duration::ZERO {
+        s.push_str(&format!(" fade_out={}", Tc(fade_out)));
+    }
+    if fade_out_to != 0.0 {
+        s.push_str(&format!(" fade_out_to={}", Gain(fade_out_to)));
+    }
+    if shape != FadeShape::Linear {
+        s.push_str(&format!(" fade_shape={shape}"));
+    }
+    s
+}
+
+/// One clip reported by `put`, with the gain and fades it was placed with
+/// (echoed only when non-default).
 #[derive(Debug)]
 pub(crate) struct PlacedClip {
     pub(crate) id: u64,
@@ -44,6 +108,12 @@ pub(crate) struct PlacedClip {
     pub(crate) at: Duration,
     pub(crate) from: Duration,
     pub(crate) to: Duration,
+    pub(crate) gain: f32,
+    pub(crate) fade_in: Duration,
+    pub(crate) fade_in_from: f32,
+    pub(crate) fade_out: Duration,
+    pub(crate) fade_out_to: f32,
+    pub(crate) fade_shape: FadeShape,
 }
 
 /// The four shapes of `set`.
@@ -75,7 +145,8 @@ pub(crate) struct AtLine {
     pub(crate) id: u64,
     pub(crate) uri: String,
     pub(crate) at: Duration,
-    pub(crate) end: Duration,
+    pub(crate) from: Duration,
+    pub(crate) to: Duration,
 }
 
 /// The `ls` report.
@@ -103,9 +174,8 @@ pub(crate) struct LsClip {
     pub(crate) id: u64,
     pub(crate) uri: String,
     pub(crate) at: Duration,
-    pub(crate) end: Duration,
     pub(crate) from: Duration,
-    pub(crate) src_to: Duration,
+    pub(crate) to: Duration,
     pub(crate) gain: f32,
     pub(crate) fade_in: Duration,
     pub(crate) fade_in_from: f32,
@@ -147,6 +217,15 @@ pub(crate) enum Output {
         track: usize,
         id: u64,
         uri: String,
+        at: Duration,
+        from: Duration,
+        to: Duration,
+        gain: f32,
+        fade_in: Duration,
+        fade_in_from: f32,
+        fade_out: Duration,
+        fade_out_to: f32,
+        fade_shape: FadeShape,
     },
     Rendered {
         file: Option<String>,
@@ -164,7 +243,7 @@ pub(crate) enum Output {
     },
     Check {
         clips: usize,
-        problems: Vec<String>,
+        problems: Vec<(String, String)>,
     },
     Probed {
         uri: String,
@@ -186,15 +265,25 @@ impl fmt::Display for Output {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Put { track, clips } => {
+                writeln!(
+                    f,
+                    "ok: {} clip{} on track {track}",
+                    clips.len(),
+                    plural(clips.len())
+                )?;
                 for c in clips {
                     writeln!(
                         f,
-                        "ok: track {track} clip #{} {} @ {} src={}-{}",
-                        c.id,
-                        c.uri,
-                        Tc(c.at),
-                        Tc(c.from),
-                        Tc(c.to)
+                        "  {}{}",
+                        clip_head(c.id, &c.uri, c.from, c.to, c.at),
+                        clip_suffix(
+                            c.gain,
+                            c.fade_in,
+                            c.fade_in_from,
+                            c.fade_out,
+                            c.fade_out_to,
+                            c.fade_shape,
+                        )
                     )?;
                 }
                 Ok(())
@@ -209,51 +298,86 @@ impl fmt::Display for Output {
             } => {
                 writeln!(
                     f,
-                    "session: {tracks} tracks | {clips} clips | ends {} | backend {backend}",
-                    Tc(*end)
+                    "ok: {tracks} track{}, {clips} clip{}, ends {}, playing from {}",
+                    plural(*tracks),
+                    plural(*clips),
+                    Tc(*end),
+                    Tc(*playhead)
                 )?;
-                writeln!(f, "playing from {}", Tc(*playhead))?;
                 if let Some(note) = note {
-                    writeln!(f, "({note})")?;
+                    writeln!(f, "note: {note}, '{backend}' backend")?;
                 }
                 Ok(())
             }
-            Self::Paused { at } => writeln!(f, "paused at {}", Tc(*at)),
-            Self::Resumed { at } => writeln!(f, "playing from {}", Tc(*at)),
-            Self::Stopped => f.write_str("stopped\n"),
-            Self::Seeked { at } => writeln!(f, "playhead at {}", Tc(*at)),
+            Self::Paused { at } => writeln!(f, "ok: paused at {}", Tc(*at)),
+            Self::Resumed { at } => writeln!(f, "ok: playing from {}", Tc(*at)),
+            Self::Stopped => f.write_str("ok: stopped\n"),
+            Self::Seeked { at } => writeln!(f, "ok: playhead at {}", Tc(*at)),
             Self::Applied { rebuilt } => match rebuilt {
-                Some(at) => writeln!(f, "apply: rebuilt from {}", Tc(*at)),
-                None => f.write_str("apply: transport not playing; changes land at next play\n"),
+                Some(at) => writeln!(f, "ok: rebuilt from {}", Tc(*at)),
+                None => f.write_str("ok: not playing; changes land at next play\n"),
             },
-            Self::Set(set) => match set {
-                SetResult::Master { v } => writeln!(f, "master {}", Gain(*v)),
-                SetResult::TrackVolume { i, v } => writeln!(f, "track {i} volume {}", Gain(*v)),
-                SetResult::TrackMuted { i, muted } => {
-                    writeln!(f, "track {i} {}", if *muted { "muted" } else { "unmuted" })
-                }
-                SetResult::TrackName { i, name } => writeln!(f, "track {i} named {name:?}"),
-                SetResult::ClipGain { track, id, gain } => {
-                    writeln!(f, "clip {track}#{id} gain {}", Gain(*gain))
-                }
-                SetResult::ClipFadeIn { track, id, d } => {
-                    writeln!(f, "clip {track}#{id} fade_in {}", Tc(*d))
-                }
-                SetResult::ClipFadeInFrom { track, id, level } => {
-                    writeln!(f, "clip {track}#{id} fade_in_from {}", Gain(*level))
-                }
-                SetResult::ClipFadeOut { track, id, d } => {
-                    writeln!(f, "clip {track}#{id} fade_out {}", Tc(*d))
-                }
-                SetResult::ClipFadeOutTo { track, id, level } => {
-                    writeln!(f, "clip {track}#{id} fade_out_to {}", Gain(*level))
-                }
-                SetResult::ClipFadeShape { track, id, shape } => {
-                    writeln!(f, "clip {track}#{id} fade_shape {shape}")
-                }
-            },
-            Self::Removed { track, id, uri } => {
-                writeln!(f, "removed track {track} clip #{id} {uri}")
+            Self::Set(set) => {
+                let (var, value): (String, String) = match set {
+                    SetResult::Master { v } => ("master".into(), Gain(*v).to_string()),
+                    SetResult::TrackVolume { i, v } => {
+                        (format!("track.{i}.volume"), Gain(*v).to_string())
+                    }
+                    SetResult::TrackMuted { i, muted } => {
+                        (format!("track.{i}.muted"), muted.to_string())
+                    }
+                    SetResult::TrackName { i, name } => (format!("track.{i}.name"), name.clone()),
+                    SetResult::ClipGain { track, id, gain } => {
+                        (format!("clip.{track}.{id}.gain"), Gain(*gain).to_string())
+                    }
+                    SetResult::ClipFadeIn { track, id, d } => {
+                        (format!("clip.{track}.{id}.fade_in"), Tc(*d).to_string())
+                    }
+                    SetResult::ClipFadeInFrom { track, id, level } => (
+                        format!("clip.{track}.{id}.fade_in_from"),
+                        Gain(*level).to_string(),
+                    ),
+                    SetResult::ClipFadeOut { track, id, d } => {
+                        (format!("clip.{track}.{id}.fade_out"), Tc(*d).to_string())
+                    }
+                    SetResult::ClipFadeOutTo { track, id, level } => (
+                        format!("clip.{track}.{id}.fade_out_to"),
+                        Gain(*level).to_string(),
+                    ),
+                    SetResult::ClipFadeShape { track, id, shape } => {
+                        (format!("clip.{track}.{id}.fade_shape"), shape.to_string())
+                    }
+                };
+                writeln!(f, "ok: `{var}` set to `{value}`")
+            }
+            Self::Removed {
+                track,
+                id,
+                uri,
+                at,
+                from,
+                to,
+                gain,
+                fade_in,
+                fade_in_from,
+                fade_out,
+                fade_out_to,
+                fade_shape,
+            } => {
+                writeln!(f, "ok: removed 1 clip from track {track}")?;
+                writeln!(
+                    f,
+                    "  {}{}",
+                    clip_head(*id, uri, *from, *to, *at),
+                    clip_suffix(
+                        *gain,
+                        *fade_in,
+                        *fade_in_from,
+                        *fade_out,
+                        *fade_out_to,
+                        *fade_shape,
+                    )
+                )
             }
             Self::Rendered {
                 file,
@@ -261,141 +385,157 @@ impl fmt::Display for Output {
                 stats,
             } => {
                 match file {
-                    Some(file) => writeln!(f, "rendered {file} ({})", Tc(*duration))?,
-                    None => writeln!(f, "measure: {}", Tc(*duration))?,
+                    Some(file) => writeln!(f, "ok: rendered {} ({})", quote(file), Tc(*duration))?,
+                    None => writeln!(f, "ok: measured {}", Tc(*duration))?,
                 }
                 if let Some(m) = stats {
-                    let db = |v: f32| format!("{v:.1} dBFS");
-                    writeln!(f, "peak: {}", db(m.peak_db))?;
-                    writeln!(f, "true_peak: {}", db(m.true_peak_db))?;
-                    writeln!(f, "rms: {}", db(m.rms_db))?;
-                    let mut lufs_line = |name: &str, v: Option<f32>, unit: &str| match v {
-                        Some(v) => writeln!(f, "{name}: {v:.1} {unit}"),
-                        None => Ok(()),
-                    };
-                    lufs_line("integrated", m.integrated_lufs, "LUFS")?;
-                    lufs_line("momentary_max", m.momentary_max_lufs, "LUFS")?;
-                    lufs_line("short_term_max", m.short_term_max_lufs, "LUFS")?;
-                    lufs_line("lra", m.lra, "LU")?;
+                    writeln!(f, "measure:")?;
+                    writeln!(f, "  peak_db={:.1}", m.peak_db)?;
+                    writeln!(f, "  true_peak_db={:.1}", m.true_peak_db)?;
+                    writeln!(f, "  rms_db={:.1}", m.rms_db)?;
+                    let mut lufs_line =
+                        |name: &str, v: Option<f32>| -> fmt::Result {
+                            if let Some(v) = v {
+                                writeln!(f, "  {name}={v:.1}")?;
+                            }
+                            Ok(())
+                        };
+                    lufs_line("integrated_lufs", m.integrated_lufs)?;
+                    lufs_line("momentary_max_lufs", m.momentary_max_lufs)?;
+                    lufs_line("short_term_max_lufs", m.short_term_max_lufs)?;
+                    lufs_line("lra", m.lra)?;
                     if let Some(t) = m.loudest_1s {
-                        writeln!(f, "loudest_1s: {}", Tc(t))?;
+                        writeln!(f, "  loudest_1s={}", Tc(t))?;
                     }
                     if let Some(t) = m.quietest_1s {
-                        writeln!(f, "quietest_1s: {}", Tc(t))?;
+                        writeln!(f, "  quietest_1s={}", Tc(t))?;
                     }
-                    if m.integrated_lufs.is_none()
-                        && m.span < std::time::Duration::from_secs(3)
-                    {
+                    if m.integrated_lufs.is_none() && m.span < Duration::from_secs(3) {
                         writeln!(f, "note: span under 3s, too short for LUFS")?;
                     }
                 }
                 Ok(())
             }
-            Self::Saved { file } => writeln!(f, "saved {file}"),
-            Self::Loaded { file } => writeln!(f, "loaded {file}"),
+            Self::Saved { file } => writeln!(f, "ok: saved {}", quote(file)),
+            Self::Loaded { file } => writeln!(f, "ok: loaded {}", quote(file)),
             Self::Reset { tracks } => {
-                let noun = if *tracks == 1 { "track" } else { "tracks" };
-                writeln!(f, "reset: {tracks} {noun} removed")
+                writeln!(f, "ok: {tracks} track{} removed", plural(*tracks))
             }
             Self::Check { clips, problems } => {
                 if problems.is_empty() {
-                    writeln!(f, "check: {clips} clips, all sources ok")
+                    writeln!(f, "ok: {clips} clip{}, all sources ok", plural(*clips))
                 } else {
-                    let noun = if problems.len() == 1 { "problem" } else { "problems" };
-                    writeln!(f, "check: {} {noun}", problems.len())?;
-                    for problem in problems {
-                        writeln!(f, "  - {problem}")?;
+                    writeln!(
+                        f,
+                        "err: {} problem{}",
+                        problems.len(),
+                        plural(problems.len())
+                    )?;
+                    for (uri, err) in problems {
+                        writeln!(f, "  {} error={err}", quote(uri))?;
                     }
                     Ok(())
                 }
             }
             Self::Probed { uri, duration } => {
-                writeln!(f, "probe: {uri} {} {:.2} s", Tc(*duration), duration.as_secs_f64())
+                writeln!(f, "ok: {} duration={}", quote(uri), Tc(*duration))
             }
             Self::ProbedMany { sources } => {
                 if sources.is_empty() {
-                    return f.write_str("probe: no sources in the arrangement\n");
+                    return f.write_str("ok: no sources in the arrangement\n");
                 }
-                let noun = if sources.len() == 1 { "source" } else { "sources" };
-                writeln!(f, "probe: {} {noun}", sources.len())?;
+                let unreadable = sources.iter().filter(|s| s.outcome.is_err()).count();
+                if unreadable == 0 {
+                    writeln!(
+                        f,
+                        "ok: {} source{}",
+                        sources.len(),
+                        plural(sources.len())
+                    )?;
+                } else {
+                    writeln!(
+                        f,
+                        "err: {} sources, {unreadable} unreadable",
+                        sources.len()
+                    )?;
+                }
                 for s in sources {
                     match &s.outcome {
-                        Ok(d) => writeln!(f, "  {} {} {:.2} s", s.uri, Tc(*d), d.as_secs_f64())?,
-                        Err(e) => writeln!(f, "  {}: {e}", s.uri)?,
+                        Ok(d) => {
+                            writeln!(f, "  {} duration={}", quote(&s.uri), Tc(*d))?
+                        }
+                        Err(e) => writeln!(f, "  {} error={e}", quote(&s.uri))?,
                     }
                 }
                 Ok(())
             }
             Self::Ls(ls) => {
+                let clips: usize = ls.tracks.iter().map(|t| t.clips.len()).sum();
                 writeln!(
                     f,
-                    "state: {}\nplayhead: {}\nend: {}\nbackend: {}\nvolume: {}\ntracks: {}",
+                    "ok: {} track{}, {} clip{}",
+                    ls.tracks.len(),
+                    plural(ls.tracks.len()),
+                    clips,
+                    plural(clips)
+                )?;
+                writeln!(
+                    f,
+                    "{}, playhead at {}, '{}' backend, end={}, master={}",
                     ls.state,
                     Tc(ls.playhead),
-                    Tc(ls.end),
                     ls.backend,
-                    Gain(ls.volume),
-                    ls.tracks.len()
+                    Tc(ls.end),
+                    Gain(ls.volume)
                 )?;
                 for (ti, t) in ls.tracks.iter().enumerate() {
-                    let mute = if t.muted { " muted" } else { "" };
                     let name = match &t.name {
-                        Some(name) => format!("name={name} "),
-                        None => String::new(),
+                        Some(name) => quote(name),
+                        None => "untitled".to_string(),
                     };
+                    let muted = if t.muted { " muted" } else { "" };
                     writeln!(
                         f,
-                        "track {ti}: {name}volume={}{mute} clips={} end={}",
+                        "track {ti} {name} vol={} end={}{}",
                         Gain(t.volume),
-                        t.clips.len(),
-                        Tc(t.end)
+                        Tc(t.end),
+                        muted
                     )?;
                     for c in &t.clips {
-                        let mut line = format!(
-                            "  clip {}: uri={} at={} end={} src={}-{}",
-                            c.id,
-                            c.uri,
-                            Tc(c.at),
-                            Tc(c.end),
-                            Tc(c.from),
-                            Tc(c.src_to)
-                        );
-                        if c.gain != 1.0 {
-                            line.push_str(&format!(" gain={}", Gain(c.gain)));
-                        }
-                        if c.fade_in > Duration::ZERO {
-                            line.push_str(&format!(" fade_in={}", Tc(c.fade_in)));
-                        }
-                        if c.fade_in_from != 0.0 {
-                            line.push_str(&format!(" fade_in_from={}", Gain(c.fade_in_from)));
-                        }
-                        if c.fade_out > Duration::ZERO {
-                            line.push_str(&format!(" fade_out={}", Tc(c.fade_out)));
-                        }
-                        if c.fade_out_to != 0.0 {
-                            line.push_str(&format!(" fade_out_to={}", Gain(c.fade_out_to)));
-                        }
-                        if c.fade_shape != FadeShape::Linear {
-                            line.push_str(&format!(" fade_shape={}", c.fade_shape));
-                        }
-                        writeln!(f, "{line}")?;
+                        writeln!(
+                            f,
+                            "  {}{}",
+                            clip_head(c.id, &c.uri, c.from, c.to, c.at),
+                            clip_suffix(
+                                c.gain,
+                                c.fade_in,
+                                c.fade_in_from,
+                                c.fade_out,
+                                c.fade_out_to,
+                                c.fade_shape,
+                            )
+                        )?;
                     }
                 }
                 Ok(())
             }
             Self::At { at, active } => {
                 if active.is_empty() {
-                    return writeln!(f, "silent at {}", Tc(*at));
+                    return writeln!(f, "ok: silent at {}", Tc(*at));
                 }
+                writeln!(
+                    f,
+                    "ok: {} clip{} at {}",
+                    active.len(),
+                    plural(active.len()),
+                    Tc(*at)
+                )?;
                 for line in active {
                     writeln!(
                         f,
-                        "track {}: clip={} uri={} at={} end={}",
+                        "  track {}: {}",
                         line.track,
-                        line.id,
-                        line.uri,
-                        Tc(line.at),
-                        Tc(line.end)
+                        clip_head(line.id, &line.uri, line.from, line.to, line.at)
                     )?;
                 }
                 Ok(())
@@ -403,4 +543,156 @@ impl fmt::Display for Output {
             Self::Text(text) => f.write_str(text),
         }
     }
+}
+
+/// A real rendered reply for one command, used by `bo help <command>`.
+/// The example goes through the same [`Display`] the daemon uses, so the
+/// documented shape can never drift from the actual output.
+pub(crate) fn example_reply(command: &str) -> Option<String> {
+    use bo::engine::measure::Measurement;
+    use bo::track::FadeShape::Linear;
+    use std::time::Duration as D;
+
+    let s = D::from_secs;
+    let ms = D::from_millis;
+    let clip = |id: u64, uri: &str, at: D, from: D, to: D, gain: f32| PlacedClip {
+        id,
+        uri: uri.to_string(),
+        at,
+        from,
+        to,
+        gain,
+        fade_in: D::ZERO,
+        fade_in_from: 0.0,
+        fade_out: D::ZERO,
+        fade_out_to: 0.0,
+        fade_shape: Linear,
+    };
+    let out = match command {
+        "put" => Output::Put {
+            track: 0,
+            clips: vec![clip(0, "/srv/bed.wav", D::ZERO, D::ZERO, s(30), 1.0)],
+        },
+        "take" => Output::Removed {
+            track: 0,
+            id: 1,
+            uri: "/srv/voice.wav".into(),
+            at: s(10),
+            from: D::ZERO,
+            to: s(5),
+            gain: 1.0,
+            fade_in: D::ZERO,
+            fade_in_from: 0.0,
+            fade_out: D::ZERO,
+            fade_out_to: 0.0,
+            fade_shape: Linear,
+        },
+        "ls" => Output::Ls(Ls {
+            state: State::Stopped,
+            playhead: D::ZERO,
+            end: s(30),
+            backend: "silent",
+            volume: 1.0,
+            tracks: vec![
+                LsTrack {
+                    name: Some("bed".into()),
+                    volume: 0.4,
+                    muted: false,
+                    end: s(30),
+                    clips: vec![LsClip {
+                        id: 0,
+                        uri: "/srv/bed.wav".into(),
+                        at: D::ZERO,
+                        from: D::ZERO,
+                        to: s(30),
+                        gain: 0.5,
+                        fade_in: ms(600),
+                        fade_in_from: 0.0,
+                        fade_out: D::ZERO,
+                        fade_out_to: 0.0,
+                        fade_shape: Linear,
+                    }],
+                },
+                LsTrack {
+                    name: Some("voice".into()),
+                    volume: 0.8,
+                    muted: true,
+                    end: s(8),
+                    clips: vec![LsClip {
+                        id: 0,
+                        uri: "/srv/voice.wav".into(),
+                        at: D::ZERO,
+                        from: D::ZERO,
+                        to: s(8),
+                        gain: 1.0,
+                        fade_in: D::ZERO,
+                        fade_in_from: 0.0,
+                        fade_out: D::ZERO,
+                        fade_out_to: 0.0,
+                        fade_shape: Linear,
+                    }],
+                },
+            ],
+        }),
+        "at" => Output::At {
+            at: s(5),
+            active: vec![AtLine {
+                track: 0,
+                id: 0,
+                uri: "/srv/bed.wav".into(),
+                at: D::ZERO,
+                from: D::ZERO,
+                to: s(30),
+            }],
+        },
+        "render" => Output::Rendered {
+            file: Some("/srv/mix.wav".into()),
+            duration: s(30),
+            stats: Some(Measurement {
+                span: s(30),
+                peak_db: -6.0,
+                true_peak_db: -5.8,
+                rms_db: -9.0,
+                integrated_lufs: Some(-12.3),
+                momentary_max_lufs: Some(-9.1),
+                short_term_max_lufs: Some(-11.2),
+                lra: Some(3.1),
+                loudest_1s: Some(s(21)),
+                quietest_1s: Some(s(3)),
+            }),
+        },
+        "check" => Output::Check {
+            clips: 2,
+            problems: Vec::new(),
+        },
+        "probe" => Output::Probed {
+            uri: "/srv/bed.wav".into(),
+            duration: s(30),
+        },
+        "set" => Output::Set(SetResult::TrackVolume { i: 0, v: 0.4 }),
+        "play" => Output::Session {
+            tracks: 2,
+            clips: 2,
+            end: s(30),
+            backend: "silent",
+            playhead: D::ZERO,
+            note: None,
+        },
+        "seek" => Output::Seeked { at: s(4) },
+        "pause" => Output::Paused { at: s(12) },
+        "resume" => Output::Resumed { at: s(12) },
+        "stop" => Output::Stopped,
+        "apply" => Output::Applied {
+            rebuilt: Some(s(4)),
+        },
+        "save" => Output::Saved {
+            file: "/srv/mix.bo".into(),
+        },
+        "load" => Output::Loaded {
+            file: "/srv/mix.bo".into(),
+        },
+        "reset" => Output::Reset { tracks: 2 },
+        _ => return None,
+    };
+    Some(out.to_string())
 }

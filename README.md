@@ -46,18 +46,19 @@ A two-track session — a voice over a bed of music:
 
 ```console
 $ bo put bed.wav,00:00:00-00:00:30          # 30 s of a bed, on a fresh track
-ok: track 0 clip #0 bed.wav @ 00:00:00.000 src=00:00:00.000-00:00:30.000
+ok: 1 clip on track 0
+  clip #0 'bed.wav' 00:00:00.000-00:00:30.000 @ 00:00:00.000
 $ bo put voice.wav,00:00:00-00:00:30 1@00:00:00      # voice on track 1
-ok: track 1 clip #0 voice.wav @ 00:00:00.000 src=00:00:00.000-00:00:30.000
+ok: 1 clip on track 1
+  clip #0 'voice.wav' 00:00:00.000-00:00:30.000 @ 00:00:00.000
 $ bo play
-session: 2 tracks | 2 clips | ends 00:00:30.000 | backend rodio
-playing from 00:00:00.000
+ok: 2 tracks, 2 clips, ends 00:00:30.000, playing from 00:00:00.000
 $ bo set track.0.volume 0.4   # duck the bed under the voice
-track 0 volume 0.40
+ok: `track.0.volume` set to `0.40`
 $ bo apply                    # make the change audible now
-apply: rebuilt from 00:00:00.000
+ok: rebuilt from 00:00:00.000
 $ bo stop                     # end the session; the daemon cleans up
-stopped
+ok: stopped
 ```
 
 ## License

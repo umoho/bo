@@ -46,18 +46,19 @@ crates.io 上的 `bo` 名字已被占用，`cargo install bo` 装的是另一个
 
 ```console
 $ bo put bed.wav,00:00:00-00:00:30          # 30 秒垫乐，放到新音轨上
-ok: track 0 clip #0 bed.wav @ 00:00:00.000 src=00:00:00.000-00:00:30.000
+ok: 1 clip on track 0
+  clip #0 'bed.wav' 00:00:00.000-00:00:30.000 @ 00:00:00.000
 $ bo put voice.wav,00:00:00-00:00:30 1@00:00:00      # 人声放到 1 号音轨
-ok: track 1 clip #0 voice.wav @ 00:00:00.000 src=00:00:00.000-00:00:30.000
+ok: 1 clip on track 1
+  clip #0 'voice.wav' 00:00:00.000-00:00:30.000 @ 00:00:00.000
 $ bo play
-session: 2 tracks | 2 clips | ends 00:00:30.000 | backend rodio
-playing from 00:00:00.000
+ok: 2 tracks, 2 clips, ends 00:00:30.000, playing from 00:00:00.000
 $ bo set track.0.volume 0.4   # 把人声底下的垫乐压低
-track 0 volume 0.40
+ok: `track.0.volume` set to `0.40`
 $ bo apply                    # 让改动立即生效
-apply: rebuilt from 00:00:00.000
+ok: rebuilt from 00:00:00.000
 $ bo stop                     # 结束会话；daemon 自动清理
-stopped
+ok: stopped
 ```
 
 ## 许可
