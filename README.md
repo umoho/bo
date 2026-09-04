@@ -10,9 +10,9 @@ Each `bo ...` invocation is one action: place a clip, remove one, move the playh
 
 ## What bo is — and isn't
 
-**bo** is an editing, mixing, and playback tool for agents: slicing sources, placing clips on a timeline, stacking tracks, adjusting gain and mute — auditioning a section while you work, playing a finished arrangement out in full, or rendering it to a file.
+**bo** is an editing, mixing, and playback tool for agents: slicing sources, placing clips on a timeline, stacking tracks, adjusting gain, fades and mute — auditioning a section while you work, playing a finished arrangement out in full, or rendering it to a file.
 
-What it is **not** — yet — is a DAW: no pan, no effects, no fades or automation, no project files. But the data model underneath — `Source` → `Clip` → `Track`, a timeline, a transport — is exactly the spine a CLI DAW is built on. The roadmap is to grow DAW operations onto that spine, not to replace it.
+What it is **not** — yet — is a DAW: no pan, no effects, no automation, and no project files — clips do carry gain and linear fade in/out, and the data model underneath — `Source` → `Clip` → `Track`, a timeline, a transport — is exactly the spine a CLI DAW is built on. The roadmap is to grow DAW operations onto that spine, not to replace it.
 
 ## Features
 
@@ -21,11 +21,11 @@ What it is **not** — yet — is a DAW: no pan, no effects, no fades or automat
 - **Play it live, or render it offline** — audition from the playhead mid-edit, play a finished arrangement out end to end (rodio), or mix the whole arrangement — or just a range — to a wav file.
 - **Silent fallback** — with no audio device the daemon still runs; set `BO_BACKEND=silent` for deterministic, headless tests and CI.
 - **Self-cleaning** — the daemon exits and removes its socket when playback finishes, on `stop`, or after `BO_IDLE_TIMEOUT` seconds of silence (default 600, `0` disables).
-- **Slicing, not files** — `uri,from-to` places any slice of a source anywhere on the timeline; no trimming, no copies.
+- **Slicing, not files** — `uri,from-to` places any slice of a source anywhere on the timeline; in-points are sample-accurate in live play and offline render alike; no trimming, no copies.
 
 ## Install
 
-Requires **Rust 1.85 or newer** (edition 2024).
+Requires **Rust 1.88 or newer** (edition 2024).
 
 ```console
 $ cargo build --release
