@@ -33,8 +33,11 @@ pub struct TrackPlan {
 pub struct ClipPlan {
     /// Address of the source.
     pub uri: String,
-    /// Playback starts this far into the source (`from`, plus any playhead
-    /// offset).
+    /// The slice's in-point, measured into the source: reading starts at
+    /// `from + into`, never before it.
+    pub from: Duration,
+    /// How far past the in-point the playhead already is — zero for a clip
+    /// entered at its start, up to the clip's length when entered mid-way.
     pub into: Duration,
     /// How long it plays.
     pub length: Duration,
@@ -79,6 +82,7 @@ impl Timeline {
                 };
                 clips.push(ClipPlan {
                     uri: clip.source.uri.clone(),
+                    from: clip.from,
                     into,
                     length: remaining,
                     delay,

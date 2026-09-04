@@ -118,7 +118,12 @@ fn make_source(plan: &ClipPlan) -> Result<impl Source + Send + 'static, String> 
         shape: plan.fade.shape,
     };
     Ok(apply_fade(
-        decoder.skip_duration(plan.into).take_duration(plan.length),
+        // Skip to the in-point plus however far into the clip the playhead
+        // already is; the decoder drains exactly `from + into` of samples,
+        // so the entry point is sample-accurate for every decodable format.
+        decoder
+            .skip_duration(plan.from + plan.into)
+            .take_duration(plan.length),
         fade,
         plan.length,
     )
@@ -484,6 +489,76 @@ mod tests {
         write_wav_full(path, seconds, freq, amp, 44_100, 1, 16)
     }
 
+    /// A wav whose content changes every whole second: second `i` is a sine at
+    /// `freqs[i]`. Lets a test tell *which* second of the source a render
+    /// actually contains by measuring the dominant frequency of its output.
+    fn write_stepped_wav(path: &std::path::Path, freqs: &[f32], rate: u32, channels: u16, bits: u16) {
+        let seconds = freqs.len() as u32;
+        let frames = (rate * seconds) as usize;
+        let bytes = u32::from(bits) / 8;
+        let fmt_tag: u16 = if bits == 32 { 3 } else { 1 };
+        let mut data = Vec::with_capacity(frames * channels as usize * bytes as usize);
+        for i in 0..frames {
+            let second = (i / rate as usize).min(freqs.len() - 1);
+            let freq = freqs[second];
+            let v = 0.5 * (2.0 * std::f32::consts::PI * freq * i as f32 / rate as f32).sin();
+            for _ in 0..channels {
+                match bits {
+                    16 => data.extend_from_slice(&((v * 32767.0) as i16).to_le_bytes()),
+                    24 => {
+                        let s = (v * 8_388_607.0) as i32;
+                        data.extend_from_slice(&s.to_le_bytes()[..3]);
+                    }
+                    32 => data.extend_from_slice(&v.to_le_bytes()),
+                    _ => unreachable!(),
+                }
+            }
+        }
+        let block_align = channels * bytes as u16;
+        let byte_rate = rate * u32::from(block_align);
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data.len() as u32).to_le_bytes());
+        wav.extend_from_slice(b"WAVE");
+        wav.extend_from_slice(b"fmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&fmt_tag.to_le_bytes());
+        wav.extend_from_slice(&channels.to_le_bytes());
+        wav.extend_from_slice(&rate.to_le_bytes());
+        wav.extend_from_slice(&byte_rate.to_le_bytes());
+        wav.extend_from_slice(&block_align.to_le_bytes());
+        wav.extend_from_slice(&bits.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        wav.extend_from_slice(&data);
+        std::fs::write(path, wav).unwrap();
+    }
+
+    /// The dominant frequency of the first `window` seconds of a stereo wav,
+    /// channel 0, by zero-crossing count — plenty for whole-second tone
+    /// steps an octave apart.
+    fn freq_of(path: &std::path::Path, window: f32) -> f32 {
+        let decoder = Decoder::new(BufReader::new(File::open(path).unwrap())).unwrap();
+        let n = (decoder.sample_rate().get() as f32 * window) as usize;
+        let mut crossings = 0u64;
+        let mut prev: Option<f32> = None;
+        for (i, s) in decoder.enumerate() {
+            if i % 2 == 1 {
+                continue; // channel 1
+            }
+            if i / 2 >= n {
+                break;
+            }
+            if let Some(p) = prev
+                && (p < 0.0) != (s < 0.0)
+            {
+                crossings += 1;
+            }
+            prev = Some(s);
+        }
+        crossings as f32 / (2.0 * window)
+    }
+
     /// A PCM wav at `rate` Hz with `channels` interleaved channels and
     /// `bits` per sample (16 or 24; 32 = IEEE float), a sine at `freq` and
     /// `amp` amplitude on every channel.
@@ -700,6 +775,141 @@ mod tests {
             assert!(
                 (total.as_secs_f64() - 1.0).abs() < 0.05,
                 "{rate} Hz {channels}ch {bits}bit rendered {total:?}, expected ~1.0 s"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn render_starts_at_the_clip_in_point() {
+        // A sliced clip must read the source from its in-point, not from the
+        // top of the file. The source's 1st/2nd/3rd seconds are 440/880/1760
+        // Hz, so the rendered audio identifies which second it really came
+        // from. Regression: `from > 0` used to be silently ignored and the
+        // clip played the source's start.
+        let dir = std::env::temp_dir().join(format!("bo-inpoint-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("steps.wav");
+        write_stepped_wav(&src, &[440.0, 880.0, 1760.0], 44_100, 1, 16);
+
+        let mut track = Track::named("a");
+        track
+            .insert(
+                Clip::sliced(
+                    Arc::new(Source {
+                        uri: src.to_str().unwrap().to_string(),
+                    }),
+                    Duration::from_secs(2),
+                    Duration::from_secs(3),
+                )
+                .at(Duration::ZERO),
+            )
+            .unwrap();
+        let out = dir.join("out.wav");
+        render_to_file(&[track], &out, Duration::ZERO, None, 1.0).unwrap();
+        let f = freq_of(&out, 0.5);
+        assert!(
+            (f - 1760.0).abs() < 40.0,
+            "clip from=2s must start at the source's 3rd second (1760 Hz), got {f:.0} Hz"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn render_enters_a_midway_clip_at_from_plus_playhead_offset() {
+        // Seeking into a clip must enter it at `from + (playhead - at)`: a
+        // clip sliced 1..3 s of a stepped source, entered 1 s in, plays the
+        // source's 2 s mark (1760 Hz) — not the in-point's content (880 Hz)
+        // and certainly not the file's start (440 Hz).
+        let dir = std::env::temp_dir().join(format!("bo-inpoint-mid-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("steps.wav");
+        write_stepped_wav(&src, &[440.0, 880.0, 1760.0], 44_100, 1, 16);
+
+        let mut track = Track::named("a");
+        track
+            .insert(
+                Clip::sliced(
+                    Arc::new(Source {
+                        uri: src.to_str().unwrap().to_string(),
+                    }),
+                    Duration::from_secs(1),
+                    Duration::from_secs(3),
+                )
+                .at(Duration::ZERO),
+            )
+            .unwrap();
+        let out = dir.join("out.wav");
+        // Playhead 1 s into a clip that spans 0..2 s of the track.
+        render_to_file(&[track], &out, Duration::from_secs(1), None, 1.0).unwrap();
+        let f = freq_of(&out, 0.5);
+        assert!(
+            (f - 1760.0).abs() < 40.0,
+            "entered mid-way must skip from+offset=2s (1760 Hz), got {f:.0} Hz"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn in_point_is_sample_accurate_across_rates_channels_and_depths() {
+        // The in-point guarantee holds whatever the source's sample rate,
+        // channel count or bit depth: a slice from 2 s of a stepped source
+        // must play its 3rd second, and entering a 1..3 s clip 1 s in must
+        // play the source's 2 s mark too.
+        let dir = std::env::temp_dir().join(format!("bo-inpoint-matrix-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (n, (rate, channels, bits)) in [
+            (44_100u32, 1u16, 16u16),
+            (48_000, 1, 16),
+            (48_000, 2, 16),
+            (48_000, 2, 24),
+            (48_000, 2, 32), // IEEE float
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let src = dir.join(format!("steps-{rate}-{channels}-{bits}.wav"));
+            write_stepped_wav(&src, &[440.0, 880.0, 1760.0], rate, channels, bits);
+            let uri = src.to_str().unwrap().to_string();
+
+            // Whole-slice case: from 2 s, straight render from the start.
+            let mut track = Track::named("a");
+            track
+                .insert(
+                    Clip::sliced(
+                        Arc::new(Source { uri: uri.clone() }),
+                        Duration::from_secs(2),
+                        Duration::from_secs(3),
+                    )
+                    .at(Duration::ZERO),
+                )
+                .unwrap();
+            let out = dir.join(format!("out-{n}a.wav"));
+            render_to_file(&[track], &out, Duration::ZERO, None, 1.0).unwrap();
+            let f = freq_of(&out, 0.5);
+            assert!(
+                (f - 1760.0).abs() < 40.0,
+                "{rate} Hz {channels}ch {bits}bit slice: {f:.0} Hz, want 1760"
+            );
+
+            // Mid-clip case: a 1..3 s clip entered 1 s in starts at 2 s.
+            let mut track = Track::named("b");
+            track
+                .insert(
+                    Clip::sliced(
+                        Arc::new(Source { uri }),
+                        Duration::from_secs(1),
+                        Duration::from_secs(3),
+                    )
+                    .at(Duration::ZERO),
+                )
+                .unwrap();
+            let out = dir.join(format!("out-{n}b.wav"));
+            render_to_file(&[track], &out, Duration::from_secs(1), None, 1.0).unwrap();
+            let f = freq_of(&out, 0.5);
+            assert!(
+                (f - 1760.0).abs() < 40.0,
+                "{rate} Hz {channels}ch {bits}bit mid-clip: {f:.0} Hz, want 1760"
             );
         }
         std::fs::remove_dir_all(&dir).ok();
