@@ -145,6 +145,27 @@ fn first_second_freq(samples: &[f32]) -> f32 {
     crossings as f32 / 2.0
 }
 
+/// A decodable wav whose header states no length (zero frames of float
+/// audio): the stand-in for an mp3 without a Xing/Info frame.
+fn write_empty_wav(path: &Path) {
+    let mut wav = Vec::new();
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&36u32.to_le_bytes());
+    wav.extend_from_slice(b"WAVE");
+    wav.extend_from_slice(b"fmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&3u16.to_le_bytes()); // IEEE float
+    wav.extend_from_slice(&2u16.to_le_bytes());
+    wav.extend_from_slice(&44_100u32.to_le_bytes());
+    let byte_rate: u32 = 44_100 * 8;
+    wav.extend_from_slice(&byte_rate.to_le_bytes());
+    wav.extend_from_slice(&8u16.to_le_bytes());
+    wav.extend_from_slice(&32u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&0u32.to_le_bytes());
+    std::fs::write(path, wav).unwrap();
+}
+
 fn wait_for_socket_gone(socket: &Path) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while socket.exists() {
@@ -269,6 +290,37 @@ fn in_point_is_honored_end_to_end_over_the_wire() {
         (f - 1760.0).abs() < 40.0,
         "mid-clip entry wrong: rendered {f:.0} Hz, want from+offset = 2 s (1760)"
     );
+
+    let out = bo(&sp, &["stop"]);
+    assert!(out.contains("stopped"), "{out}");
+    wait_for_socket_gone(&socket);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn headerless_sources_probe_as_estimated_and_check_stays_ok() {
+    let dir = temp_dir();
+    let socket = dir.join("d.sock");
+    let sp = socket.to_string_lossy().into_owned();
+    let src = dir.join("empty.wav");
+    write_empty_wav(&src);
+    let srcs = src.to_string_lossy().into_owned();
+
+    // A bare probe marks the estimate.
+    let out = bo(&sp, &["probe", &srcs]);
+    assert!(out.contains("duration≈00:00:00.000 (estimated)"), "{out}");
+    assert!(!socket.exists(), "a bare probe must not spawn a daemon");
+
+    // Explicit out-points: put and check succeed; the source's missing
+    // header length is a note, not a problem.
+    let out = bo(&sp, &["put", &format!("{srcs},00:00:00-00:00:00.500")]);
+    assert!(out.contains("clip #0"), "{out}");
+    let out = bo(&sp, &["probe"]);
+    assert!(out.contains("ok: 1 source"), "{out}");
+    assert!(out.contains("duration≈00:00:00.000 (estimated)"), "{out}");
+    let out = bo(&sp, &["check"]);
+    assert!(out.contains("ok: 1 clip, all sources ok"), "{out}");
+    assert!(out.contains("note: 1 source with no header length"), "{out}");
 
     let out = bo(&sp, &["stop"]);
     assert!(out.contains("stopped"), "{out}");
