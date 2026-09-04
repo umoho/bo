@@ -232,6 +232,11 @@ pub(crate) enum Output {
         fade_out_to: f32,
         fade_shape: FadeShape,
     },
+    Moved {
+        from_track: usize,
+        to_track: usize,
+        clip: PlacedClip,
+    },
     Rendered {
         file: Option<String>,
         duration: Duration,
@@ -383,6 +388,30 @@ impl fmt::Display for Output {
                         *fade_out,
                         *fade_out_to,
                         *fade_shape,
+                    )
+                )
+            }
+            Self::Moved {
+                from_track,
+                to_track,
+                clip,
+            } => {
+                writeln!(
+                    f,
+                    "ok: moved 1 clip from track {from_track} to track {to_track} @ {}",
+                    Tc(clip.at)
+                )?;
+                writeln!(
+                    f,
+                    "  {}{}",
+                    clip_head(clip.id, &clip.uri, clip.from, clip.to, clip.at),
+                    clip_suffix(
+                        clip.gain,
+                        clip.fade_in,
+                        clip.fade_in_from,
+                        clip.fade_out,
+                        clip.fade_out_to,
+                        clip.fade_shape,
                     )
                 )
             }
@@ -616,6 +645,11 @@ pub(crate) fn example_reply(command: &str) -> Option<String> {
             fade_out: D::ZERO,
             fade_out_to: 0.0,
             fade_shape: Linear,
+        },
+        "move" => Output::Moved {
+            from_track: 0,
+            to_track: 1,
+            clip: clip(3, "/srv/voice.wav", s(5), D::ZERO, s(10), 0.5),
         },
         "ls" => Output::Ls(Ls {
             state: State::Stopped,

@@ -52,6 +52,12 @@
 //!   and fades land on the next `play` or `apply`).
 //! * `take <track> <clip>` — remove a clip; the clip is addressed by its
 //!   stable id or an `@timecode` (the clip covering that moment).
+//! * `move <track> <clip> <dest>` — move a clip to another track, or to a
+//!   new position on its own; `dest` is `[track]@[pos]`, an omitted track
+//!   meaning the source track and an omitted pos the playhead. The move
+//!   keeps the clip's gain, fades and — when the id is free on the
+//!   destination — its id, and is refused whole if the destination is
+//!   occupied.
 //! * `render [file] [from-to]` — mix the arrangement to a wav file,
 //!   offline; a range renders only that span. With `--measure` the reply
 //!   also reports the mix's peak/RMS/true peak and EBU R128 loudness,
@@ -185,6 +191,18 @@ enum Command {
         track: usize,
         /// Clip id, or `@timecode`.
         clip: String,
+    },
+    /// Move a clip to another track, or to a new position on its own.
+    /// Keeps the clip's gain, fades and — when the id is free on the
+    /// destination — its id.
+    Move {
+        /// Track the clip is on now.
+        track: usize,
+        /// Clip id, or `@timecode`.
+        clip: String,
+        /// Destination: `[track]@[pos]`. An omitted track means the source
+        /// track; an omitted pos means the playhead.
+        dest: String,
     },
     /// Show the whole arrangement.
     Ls,
@@ -406,6 +424,12 @@ Arrangement:
                            --fade-out-to set the clip's gain and fades)
   take <track> <clip>      remove a clip — by its id, or the @timecode it
                            covers
+  move <track> <clip> <dest>
+                           move a clip to another track, or to a new
+                           position on its own; keeps its gain, fades and
+                           (when free on the destination) its id. dest =
+                           [track]@[pos] — track omitted: the same track,
+                           pos omitted: the playhead
   ls                       dump the arrangement: an ok: reply, a session
                            line, then one track block per track with clip
                            signature lines
@@ -494,9 +518,9 @@ EXAMPLES
 
 /// Names of the user-facing subcommands: `bo <name> --help` must keep
 /// clap's own per-command help, while `bo --help` shows the grouped [`HELP`].
-const SUBCOMMAND_NAMES: [&str; 17] = [
-    "put", "take", "ls", "at", "render", "save", "load", "reset", "check", "probe", "play", "pause",
-    "resume", "stop", "seek", "apply", "set",
+const SUBCOMMAND_NAMES: [&str; 18] = [
+    "put", "take", "move", "ls", "at", "render", "save", "load", "reset", "check", "probe", "play",
+    "pause", "resume", "stop", "seek", "apply", "set",
 ];
 
 /// Tokenize a wire or script line: whitespace-separated words with
@@ -744,6 +768,7 @@ fn dispatch(a: &mut Arrangement, command: Command, cwd: &str) -> Result<Output, 
         Command::Apply => apply_command(a),
         Command::Set { var, value } => set_command(a, &var, &value),
         Command::Take { track, clip } => take_command(a, track, &clip),
+        Command::Move { track, clip, dest } => move_command(a, track, &clip, &dest),
         Command::Render {
             file,
             range,
@@ -984,6 +1009,113 @@ fn take_command(
         }),
         None => Err(fail(format!("no clip {track_index}#{clip_arg}"))),
     }
+}
+
+/// `move <track> <clip> <dest>`: move a clip to another track, or to a new
+/// position on its own. Unlike take+put the clip keeps its gain, fades and —
+/// when the id is free on the destination — its id; the move is one atomic
+/// step, refused whole if the destination is occupied.
+///
+/// The destination is `[track]@[pos]`: an omitted track means the source
+/// track, an omitted pos means the playhead. A destination track index is
+/// created on demand, exactly as `put` does.
+fn move_command(
+    a: &mut Arrangement,
+    track_index: usize,
+    clip_arg: &str,
+    dest_arg: &str,
+) -> Result<Output, (i32, String)> {
+    let (want_track, want_pos) = parse_placement(dest_arg).map_err(usage)?;
+    if want_track.is_none() && want_pos.is_none() {
+        return Err(usage(format!(
+            "move needs a destination: [track]@[pos], got {dest_arg:?}"
+        )));
+    }
+    // The clip to move, as it sits on the source track now.
+    let clip = {
+        let t = a
+            .player
+            .tracks()
+            .get(track_index)
+            .ok_or_else(|| fail(format!("no track {track_index}")))?;
+        let id = if let Ok(id) = clip_arg.parse::<u64>() {
+            Some(id)
+        } else if let Some(tc) = clip_arg.strip_prefix('@') {
+            let at = parse_timecode(tc).map_err(usage)?;
+            t.clip_at(at).map(|c| c.id)
+        } else {
+            return Err(usage(format!(
+                "clip must be an id or @timecode, got {clip_arg:?}"
+            )));
+        };
+        id.and_then(|id| t.clips().iter().find(|c| c.id == id).cloned())
+            .ok_or_else(|| fail(format!("no clip {track_index}#{clip_arg}")))?
+    };
+    let dest_index = want_track.unwrap_or(track_index);
+    while a.player.tracks().len() <= dest_index {
+        a.player.add_track(Track::new());
+    }
+    let pos = want_pos.unwrap_or_else(|| a.player.playhead());
+    let mut moved = clip;
+    moved.at = pos;
+    // Refuse whole if the destination is occupied: check every clip on the
+    // destination except the moving clip itself (a same-track move vacates
+    // its own span).
+    let destination = &a.player.tracks()[dest_index];
+    if let Some(conflict) = destination
+        .clips()
+        .iter()
+        .filter(|x| !(dest_index == track_index && x.id == moved.id))
+        .find(|x| x.overlaps(&moved))
+    {
+        let span = format!(
+            "[{:.3},{:.3})",
+            conflict.at.as_secs_f64(),
+            conflict.end().as_secs_f64()
+        );
+        let next = destination.next_free_start(moved.at, moved.duration());
+        return Err(fail(format!(
+            "move refused: clip #{} overlaps\nreason: clip #{} occupies {}; next free start is {:.3}s",
+            moved.id,
+            conflict.id,
+            span,
+            next.as_secs_f64(),
+        )));
+    }
+    // Ids are per-track counters: the moved clip keeps its id unless the
+    // destination track already carries it, in which case it takes the
+    // destination's next free id (the reply says which).
+    let keep_id = dest_index == track_index
+        || !destination.clips().iter().any(|c| c.id == moved.id);
+    a.player.tracks_mut()[track_index]
+        .remove(moved.id)
+        .expect("the clip was found above");
+    let id = if keep_id {
+        a.player.tracks_mut()[dest_index].insert_keeping_id(moved.clone());
+        moved.id
+    } else {
+        a.player.tracks_mut()[dest_index]
+            .insert(moved.clone())
+            .expect("pre-checked: the destination is free")
+    };
+    moved.id = id;
+    Ok(Output::Moved {
+        from_track: track_index,
+        to_track: dest_index,
+        clip: PlacedClip {
+            id: moved.id,
+            uri: moved.source.uri.clone(),
+            at: moved.at,
+            from: moved.from,
+            to: moved.to,
+            gain: moved.gain,
+            fade_in: moved.fade.fade_in,
+            fade_in_from: moved.fade.fade_in_from,
+            fade_out: moved.fade.fade_out,
+            fade_out_to: moved.fade.fade_out_to,
+            fade_shape: moved.fade.shape,
+        },
+    })
 }
 
 /// `put <spec> [track[@pos]]`: place a clip, creating the track when needed.
@@ -1428,6 +1560,11 @@ fn command_line(command: &Command) -> String {
         Command::Apply => "apply".to_string(),
         Command::Set { var, value } => format!("set {} {}", quote_arg(var), quote_arg(value)),
         Command::Take { track, clip } => format!("take {track} {}", quote_arg(clip)),
+        Command::Move {
+            track,
+            clip,
+            dest,
+        } => format!("move {track} {} {}", quote_arg(clip), quote_arg(dest)),
         Command::Render {
             file,
             range,
@@ -1589,6 +1726,7 @@ fn help_topic(topic: &str) -> Option<String> {
         "put" => "bo put <spec> [track[@pos]] [--repeat n] [--gain g] \
                    [--fade-in t] [--fade-in-from v] [--fade-out t] [--fade-out-to v]",
         "take" => "bo take <track> <clip>        # clip: an id, or @timecode",
+        "move" => "bo move <track> <clip> <dest>  # dest: [track]@[pos]; track omitted = same\n                              # track, pos omitted = playhead",
         "ls" => "bo ls",
         "at" => "bo at <t>",
         "render" => "bo render [file] [from-to] [--measure]",
@@ -2672,6 +2810,120 @@ mod tests {
         let (code, msg) = run_err(&mut a, &["set", "track.9.name", "x"]);
         assert_eq!(code, 1);
         assert!(msg.contains("no track 9"), "{msg}");
+    }
+
+    #[test]
+    fn move_repositions_a_clip_between_tracks_keeping_identity() {
+        let mut a = Arrangement::default();
+        run_ok(&mut a, &["put", "a.wav,00:00:00-00:00:10", "0@00:00:00"]); // #0
+        run_ok(
+            &mut a,
+            &["put", "--gain", "0.5", "b.wav,00:00:00-00:00:05", "0@00:00:10"],
+        ); // #1, gain 0.5
+        run_ok(&mut a, &["put", "c.wav,00:00:00-00:00:03"]); // track 1, #0
+
+        // Cross-track: b (#1, gain 0.5) lands on a fresh track 2 at 2 s.
+        let out = run_ok(&mut a, &["move", "0", "1", "2@00:00:02"]);
+        assert!(out.contains("from track 0 to track 2 @ 00:00:02.000"), "{out}");
+        assert!(out.contains("clip #1") && out.contains("gain=0.50"), "{out}");
+        assert_eq!(a.player.tracks()[0].clips().len(), 1, "source kept a only");
+        let moved = &a.player.tracks()[2].clips()[0];
+        assert_eq!(
+            (moved.id, moved.at, moved.gain, moved.from, moved.to),
+            (
+                1,
+                Duration::from_secs(2),
+                0.5,
+                Duration::ZERO,
+                Duration::from_secs(5)
+            ),
+            "identity, gain and slice survive the move"
+        );
+    }
+
+    #[test]
+    fn move_within_a_track_repositions_by_timecode() {
+        let mut a = Arrangement::default();
+        run_ok(&mut a, &["put", "a.wav,00:00:00-00:00:10", "0@00:00:00"]); // #0 0..10
+        run_ok(&mut a, &["put", "b.wav,00:00:00-00:00:05", "0@00:00:10"]); // #1 10..15
+        // a (covering @00:00:02) moves to 15 s on the same track: 15..25.
+        let out = run_ok(&mut a, &["move", "0", "@00:00:02", "@00:00:15"]);
+        assert!(out.contains("from track 0 to track 0 @ 00:00:15.000"), "{out}");
+        assert!(out.contains("clip #0"), "{out}");
+        let t = &a.player.tracks()[0];
+        assert_eq!(t.clips().len(), 2);
+        assert_eq!(t.clips()[0].id, 1, "b leads at 10 s");
+        assert_eq!(t.clips()[0].at, Duration::from_secs(10));
+        assert_eq!(t.clips()[1].id, 0, "a keeps its id at 15 s");
+        assert_eq!(t.clips()[1].at, Duration::from_secs(15));
+    }
+
+    #[test]
+    fn move_defaults_pos_to_the_playhead_and_creates_the_destination_track() {
+        let mut a = Arrangement::default();
+        run_ok(&mut a, &["put", "a.wav,00:00:00-00:00:10"]); // track 0, #0
+        run_ok(&mut a, &["seek", "00:00:04"]);
+        let out = run_ok(&mut a, &["move", "0", "0", "3"]);
+        assert!(out.contains("to track 3 @ 00:00:04.000"), "{out}");
+        assert_eq!(a.player.tracks().len(), 4, "tracks up to the destination");
+        let moved = &a.player.tracks()[3].clips()[0];
+        assert_eq!(moved.id, 0, "fresh destination: id kept");
+        assert_eq!(moved.at, Duration::from_secs(4));
+    }
+
+    #[test]
+    fn move_takes_a_fresh_id_when_the_destination_already_has_it() {
+        let mut a = Arrangement::default();
+        run_ok(&mut a, &["put", "a.wav,00:00:00-00:00:10", "0@00:00:00"]); // #0 on 0
+        run_ok(&mut a, &["put", "c.wav,00:00:00-00:00:03", "1@00:00:00"]); // #0 on 1
+        let out = run_ok(&mut a, &["move", "0", "0", "1@00:00:05"]);
+        assert!(out.contains("clip #1"), "reassigned on the destination: {out}");
+        let t = &a.player.tracks()[1];
+        assert_eq!(t.clips().len(), 2);
+        assert_eq!(t.clips()[0].id, 0);
+        assert_eq!(t.clips()[1].id, 1, "no id collision on the destination");
+        assert!(a.player.tracks()[0].is_empty());
+    }
+
+    #[test]
+    fn move_is_refused_atomically_when_the_destination_is_occupied() {
+        let mut a = Arrangement::default();
+        run_ok(&mut a, &["put", "a.wav,00:00:00-00:00:10"]); // #0 0..10 on 0
+        run_ok(&mut a, &["put", "c.wav,00:00:00-00:00:03", "1@00:00:00"]); // #0 0..3 on 1
+        let (code, msg) = run_err(&mut a, &["move", "0", "0", "1@00:00:01"]);
+        assert_eq!(code, 1, "{msg}");
+        assert!(
+            msg.contains("move refused") && msg.contains("occupies [0.000,3.000)"),
+            "{msg}"
+        );
+        assert_eq!(a.player.tracks()[0].clips().len(), 1, "source untouched");
+        assert_eq!(a.player.tracks()[1].clips().len(), 1, "destination untouched");
+
+        // A missing clip and a bad destination are refusal/usage errors too.
+        let (code, msg) = run_err(&mut a, &["move", "0", "9", "1@00:00:00"]);
+        assert_eq!(code, 1);
+        assert!(msg.contains("no clip 0#9"), "{msg}");
+        let (code, _) = run_err(&mut a, &["move", "0", "0", "bogus"]);
+        assert_eq!(code, 2);
+        let (code, _) = run_err(&mut a, &["move", "9", "0", "1@00:00:00"]);
+        assert_eq!(code, 1, "no track 9");
+    }
+
+    #[test]
+    fn move_takes_an_id_or_timecode_like_take_does() {
+        let mut a = Arrangement::default();
+        run_ok(&mut a, &["put", "a.wav,00:00:00-00:00:10"]);
+        // By id.
+        run_ok(&mut a, &["move", "0", "0", "1@00:00:00"]);
+        assert!(a.player.tracks()[1].clips().iter().any(|c| c.id == 0));
+        // By @timecode, back onto track 0.
+        let out = run_ok(&mut a, &["move", "1", "@00:00:00", "0@00:00:00"]);
+        assert!(out.contains("from track 1 to track 0"), "{out}");
+        assert!(a.player.tracks()[0].clips().iter().any(|c| c.id == 0));
+        assert!(a.player.tracks()[1].is_empty());
+        // A bare word is neither: usage error.
+        let (code, _) = run_err(&mut a, &["move", "0", "xyz", "1@00:00:00"]);
+        assert_eq!(code, 2);
     }
 
     #[test]
