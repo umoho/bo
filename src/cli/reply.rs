@@ -539,13 +539,13 @@ impl fmt::Display for Output {
                 )?;
                 writeln!(
                     f,
-                    "{}, playhead at {}, '{}' backend, end={}, master={}, idle_timeout={}s",
+                    "{}, playhead at {}, '{}' backend, end={}, master={}, idle_timeout={}",
                     ls.state,
                     Tc(ls.playhead),
                     ls.backend,
                     Tc(ls.end),
                     Gain(ls.volume),
-                    ls.idle_timeout
+                    Tc(Duration::from_secs(ls.idle_timeout))
                 )?;
                 for (ti, t) in ls.tracks.iter().enumerate() {
                     let name = match &t.name {
