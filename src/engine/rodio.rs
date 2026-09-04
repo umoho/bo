@@ -438,20 +438,71 @@ impl<I: Source> Source for Gain<I> {
     }
 }
 
-/// Decode a file far enough to learn its length. Pure decoding — no device
-/// needed, so it works headless (`bo probe <uri>`, tests, CI).
-pub fn probe(uri: &str) -> Result<Duration, String> {
+/// How a source's length was learned.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SourceLength {
+    /// The container states its own length (a wav/flac header, an mp3 with a
+    /// Xing/Info frame, …): exact.
+    Exact(Duration),
+    /// No container length: the source was decoded to its end and the length
+    /// follows from the samples heard. Within one encoder frame of the truth
+    /// for lossy codecs; exact for lossless ones.
+    Estimated(Duration),
+}
+
+impl SourceLength {
+    /// The length, however it was learned.
+    #[must_use]
+    pub fn duration(self) -> Duration {
+        match self {
+            Self::Exact(d) | Self::Estimated(d) => d,
+        }
+    }
+}
+
+/// Learn a source's length — from its container when the container states
+/// one, otherwise by decoding to the end. Pure decoding, no device needed,
+/// so it works headless (`bo probe <uri>`, tests, CI). Fails only when the
+/// file cannot be opened or decoded at all.
+pub fn measure(uri: &str) -> Result<SourceLength, String> {
     let file = File::open(uri).map_err(|e| format!("cannot open {uri}: {e}"))?;
     let decoder = Decoder::new(BufReader::new(file))
         .map_err(|e| format!("cannot decode {uri}: {e}"))?;
-    decoder
-        .total_duration()
-        .ok_or_else(|| format!("cannot determine the length of {uri}"))
+    Ok(measure_source(decoder))
 }
 
-/// Measure every distinct source in the arrangement: the uri plus its length,
-/// or the reason it could not be measured. Duplicate uris are probed once.
-pub fn probe_sources(tracks: &[Track]) -> Vec<(String, Result<Duration, String>)> {
+/// Classify a decoder's length: exact when the container states it, otherwise
+/// estimated by decoding to the end.
+fn measure_source<D: Source>(decoder: D) -> SourceLength {
+    match decoder.total_duration() {
+        Some(d) => SourceLength::Exact(d),
+        None => SourceLength::Estimated(decode_to_end(decoder)),
+    }
+}
+
+/// Decode `source` to its end and report how long it played: samples heard
+/// over rate × channels. The fallback for containers that state no length —
+/// mp3 without a Xing/Info frame, for example.
+fn decode_to_end<D: Source>(mut source: D) -> Duration {
+    let rate = source.sample_rate().get() as f64;
+    let channels = source.channels().get() as f64;
+    let mut samples = 0u64;
+    for _ in source.by_ref() {
+        samples += 1;
+    }
+    Duration::from_secs_f64(samples as f64 / (rate * channels))
+}
+
+/// Measure a source's length as a plain duration, exact or estimated — the
+/// form put and planning need. `bo probe` reports which kind it got.
+pub fn probe(uri: &str) -> Result<Duration, String> {
+    measure(uri).map(SourceLength::duration)
+}
+
+/// Measure every distinct source in the arrangement: the uri plus how its
+/// length was learned, or why it could not be measured. Duplicate uris are
+/// probed once.
+pub fn probe_sources(tracks: &[Track]) -> Vec<(String, Result<SourceLength, String>)> {
     let mut seen = std::collections::HashSet::new();
     let mut results = Vec::new();
     for track in tracks {
@@ -460,20 +511,10 @@ pub fn probe_sources(tracks: &[Track]) -> Vec<(String, Result<Duration, String>)
             if !seen.insert(uri) {
                 continue;
             }
-            results.push((uri.to_string(), probe(uri)));
+            results.push((uri.to_string(), measure(uri)));
         }
     }
     results
-}
-
-/// Probe every distinct source in the arrangement, returning one problem
-/// string per source that cannot be opened, decoded, or measured. Duplicate
-/// uris are probed once.
-pub fn check_sources(tracks: &[Track]) -> Vec<String> {
-    probe_sources(tracks)
-        .into_iter()
-        .filter_map(|(_, result)| result.err())
-        .collect()
 }
 
 #[cfg(test)]
@@ -962,6 +1003,63 @@ mod tests {
         let d = probe(a.to_str().unwrap()).unwrap();
         assert!((d.as_secs_f64() - 0.5).abs() < 0.05, "probed {d:?}");
         assert!(probe("/nonexistent.wav").is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn measure_reports_container_lengths_as_exact() {
+        // A wav header states its own length, so measure is exact and probe
+        // reports it as such.
+        let dir = std::env::temp_dir().join(format!("bo-measure-exact-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.wav");
+        write_wav_full(&a, 1.0, 440.0, 0.5, 44_100, 2, 16);
+        let length = measure(a.to_str().unwrap()).unwrap();
+        assert!(
+            matches!(length, SourceLength::Exact(_)),
+            "a wav states its length: {length:?}"
+        );
+        let d = length.duration();
+        assert!((d.as_secs_f64() - 1.0).abs() < 0.05, "{d:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn measure_decodes_sources_that_state_no_length() {
+        // A container that states no length (an mp3 without a Xing/Info
+        // frame, or a data-less wav) must not fail probe: the file is
+        // decoded to its end and the length marked estimated. Only a file
+        // that cannot be opened or decoded at all is an error.
+        let dir = std::env::temp_dir().join(format!("bo-measure-est-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A zero-frame wav decodes fine but states no length.
+        let zero = dir.join("zero.wav");
+        {
+            let spec = hound::WavSpec {
+                channels: 2,
+                sample_rate: 44_100,
+                bits_per_sample: 32,
+                sample_format: hound::SampleFormat::Float,
+            };
+            let w = hound::WavWriter::create(&zero, spec).unwrap();
+            w.finalize().unwrap();
+        }
+        let length = measure(zero.to_str().unwrap()).unwrap();
+        assert!(
+            matches!(length, SourceLength::Estimated(_)),
+            "no frames in the header, so the length is decoded: {length:?}"
+        );
+        assert_eq!(length.duration(), Duration::ZERO);
+
+        // An infinite source (SineWave) never states a length either; a
+        // bounded take lands close to its bound.
+        use rodio::source::SineWave;
+        let length = measure_source(SineWave::new(440.0).take_duration(Duration::from_secs(1)));
+        assert!(matches!(length, SourceLength::Estimated(_)), "{length:?}");
+        let d = length.duration();
+        assert!((d.as_secs_f64() - 1.0).abs() < 0.05, "{d:?}");
+
         std::fs::remove_dir_all(&dir).ok();
     }
 
