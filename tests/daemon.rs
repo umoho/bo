@@ -648,3 +648,99 @@ fn relative_paths_resolve_against_the_invocation_cwd() {
     wait_for_socket_gone(&socket);
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn edits_land_on_a_running_mix_and_apply_reports_what_it_did() {
+    // `apply` means "make the settings take effect", so what a running mix can
+    // take — a gain, a clip queued past its tail — lands as it is set, and
+    // only what it cannot take (a clip out of the middle of a queue) is what
+    // an apply rebuilds for. Each case is visible in the reply.
+    let dir = temp_dir();
+    let socket = dir.join("d.sock");
+    let s = socket.to_str().unwrap();
+    let a = dir.join("a.wav");
+    write_test_wav(&a, 4.0, 0.5);
+    let uri = a.to_str().unwrap();
+
+    bo(s, &["put", &format!("{uri},0-4"), "0@0"]);
+    let out = bo(s, &["apply"]);
+    assert!(
+        out.contains("ok: not playing; changes land at next play"),
+        "{out}"
+    );
+
+    bo(s, &["play"]);
+
+    // A track's gain lands on the mix that is sounding it: no note, and an
+    // apply afterwards has nothing left to do.
+    let out = bo(s, &["set", "track.0.volume", "0.4"]);
+    assert!(out.contains("ok: `track.0.volume` set to `0.40`"), "{out}");
+    assert!(!out.contains("note:"), "a live landing needs no note: {out}");
+    let out = bo(s, &["apply"]);
+    assert!(out.contains("ok: nothing pending"), "{out}");
+
+    // The live-show move: queue the next item while the current one plays.
+    let out = bo(s, &["put", &format!("{uri},0-4"), "0@4"]);
+    assert!(out.contains("ok: 1 clip on track 0"), "{out}");
+    assert!(!out.contains("note:"), "it joined the running queue: {out}");
+    let out = bo(s, &["apply"]);
+    assert!(out.contains("ok: nothing pending"), "{out}");
+
+    // Taking a clip out of a queue that is sounding cannot be done live: the
+    // reply says it waits, `ls` counts what is waiting, and apply rebuilds.
+    let out = bo(s, &["take", "0", "1"]);
+    assert!(out.contains("note: lands at next apply"), "{out}");
+    let out = bo(s, &["ls"]);
+    assert!(out.contains("pending=1"), "{out}");
+    let out = bo(s, &["apply"]);
+    assert!(out.contains("ok: rebuilt from"), "{out}");
+    let out = bo(s, &["ls"]);
+    assert!(!out.contains("pending="), "the rebuild drained it: {out}");
+
+    bo(s, &["stop"]);
+    wait_for_socket_gone(&socket);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_paused_mix_takes_edits_and_resume_lands_what_it_could_not() {
+    // Pausing holds the sound, not the graph. The old trap: an edit made
+    // while paused answered `ok:` and then never took effect, because
+    // `resume` did not re-plan and `apply` refused to do anything.
+    let dir = temp_dir();
+    let socket = dir.join("d.sock");
+    let s = socket.to_str().unwrap();
+    let a = dir.join("a.wav");
+    write_test_wav(&a, 8.0, 0.5);
+    let uri = a.to_str().unwrap();
+
+    bo(s, &["put", &format!("{uri},0-8"), "0@0"]);
+    bo(s, &["put", &format!("{uri},0-8"), "1@0"]);
+    bo(s, &["play"]);
+    bo(s, &["pause"]);
+
+    // A gain lands on the paused graph, and says nothing about it.
+    let out = bo(s, &["set", "track.0.volume", "0.25"]);
+    assert!(out.contains("ok: `track.0.volume` set to `0.25`"), "{out}");
+    assert!(!out.contains("note:"), "{out}");
+    let out = bo(s, &["apply"]);
+    assert!(out.contains("ok: nothing pending"), "{out}");
+
+    // A structural edit cannot; resume must not drop it.
+    let out = bo(s, &["take", "1", "0"]);
+    assert!(out.contains("note: lands at next apply"), "{out}");
+    let out = bo(s, &["ls"]);
+    assert!(out.contains("pending=1"), "{out}");
+    let out = bo(s, &["resume"]);
+    assert!(out.contains("ok: playing from"), "{out}");
+    let out = bo(s, &["ls"]);
+    assert!(!out.contains("pending="), "resume landed it: {out}");
+    assert!(
+        out.contains("2 tracks, 1 clip"),
+        "the taken clip is gone, its track stays: {out}"
+    );
+
+    bo(s, &["stop"]);
+    wait_for_socket_gone(&socket);
+    std::fs::remove_dir_all(&dir).ok();
+}

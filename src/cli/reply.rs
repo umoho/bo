@@ -6,6 +6,8 @@
 //! * every reply opens with `ok: ...` or `err: ...` — the status line;
 //! * timecodes are `HH:MM:SS.fff` strings, gains two decimals;
 //! * absent means default, except in `ls`, which dumps everything;
+//! * an edit that a running graph could not take is worth one `note:` line;
+//!   one that landed, or one made while nothing was playing, is not;
 //! * a clip is one signature line: `clip #{id} '{uri}' {from}-{to} @ {at}`
 //!   with `key=value` suffixes for non-default gain and fades;
 //! * a track block is a header line with indented clip lines.
@@ -17,7 +19,7 @@ use std::fmt;
 use std::time::Duration;
 
 use bo::engine::rodio::SourceLength;
-use bo::engine::State;
+use bo::engine::{Landed, State};
 use bo::track::FadeShape;
 
 /// A timecode, rendered as `HH:MM:SS.fff`. Exact integer math, no floats.
@@ -56,6 +58,18 @@ pub(crate) fn quote(s: &str) -> String {
 /// `""` for one, `"s"` otherwise.
 fn plural(n: usize) -> &'static str {
     if n == 1 { "" } else { "s" }
+}
+
+/// The `note:` line for an edit a running graph could not take.
+///
+/// `None` says nothing: an edit that landed live needs no report, and one
+/// made while nothing was playing lands at the next `play`, which is the
+/// default rather than news.
+fn pending_note(f: &mut fmt::Formatter<'_>, landed: Option<Landed>) -> fmt::Result {
+    match landed {
+        Some(Landed::Pending) => writeln!(f, "note: lands at next apply"),
+        _ => Ok(()),
+    }
 }
 
 /// The head of a clip signature: `clip #{id} '{uri}' {from}-{to} @ {at}`.
@@ -162,6 +176,8 @@ pub(crate) struct Ls {
     /// this long without a command (`0` disables). Shown so a long session
     /// cannot silently time out.
     pub(crate) idle_timeout: u64,
+    /// Edits a running graph could not take, waiting for the next `apply`.
+    pub(crate) pending: usize,
     pub(crate) tracks: Vec<LsTrack>,
 }
 
@@ -189,12 +205,25 @@ pub(crate) struct LsClip {
     pub(crate) fade_shape: FadeShape,
 }
 
+/// What `apply` reports: which edits landed, and whether a graph had to be
+/// rebuilt for the rest.
+#[derive(Debug)]
+pub(crate) struct ApplyReport {
+    /// Edits the running graph took as they were.
+    pub(crate) live: usize,
+    /// The timecode a rebuild started from, when one was needed.
+    pub(crate) rebuilt: Option<Duration>,
+    /// Nothing is playing, so there is no graph to land anything on.
+    pub(crate) stopped: bool,
+}
+
 /// The data of one command reply.
 #[derive(Debug)]
 pub(crate) enum Output {
     Put {
         track: usize,
         clips: Vec<PlacedClip>,
+        landed: Option<Landed>,
     },
     Session {
         tracks: usize,
@@ -214,10 +243,11 @@ pub(crate) enum Output {
     Seeked {
         at: Duration,
     },
-    Applied {
-        rebuilt: Option<Duration>,
+    Applied(ApplyReport),
+    Set {
+        result: SetResult,
+        landed: Option<Landed>,
     },
-    Set(SetResult),
     Removed {
         track: usize,
         id: u64,
@@ -231,11 +261,13 @@ pub(crate) enum Output {
         fade_out: Duration,
         fade_out_to: f32,
         fade_shape: FadeShape,
+        landed: Option<Landed>,
     },
     Moved {
         from_track: usize,
         to_track: usize,
         clip: PlacedClip,
+        landed: Option<Landed>,
     },
     Rendered {
         file: Option<String>,
@@ -276,7 +308,11 @@ pub(crate) enum Output {
 impl fmt::Display for Output {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Put { track, clips } => {
+            Self::Put {
+                track,
+                clips,
+                landed,
+            } => {
                 writeln!(
                     f,
                     "ok: {} clip{} on track {track}",
@@ -298,7 +334,7 @@ impl fmt::Display for Output {
                         )
                     )?;
                 }
-                Ok(())
+                pending_note(f, *landed)
             }
             Self::Session {
                 tracks,
@@ -325,11 +361,35 @@ impl fmt::Display for Output {
             Self::Resumed { at } => writeln!(f, "ok: playing from {}", Tc(*at)),
             Self::Stopped => f.write_str("ok: stopped\n"),
             Self::Seeked { at } => writeln!(f, "ok: playhead at {}", Tc(*at)),
-            Self::Applied { rebuilt } => match rebuilt {
-                Some(at) => writeln!(f, "ok: rebuilt from {}", Tc(*at)),
-                None => f.write_str("ok: not playing; changes land at next play\n"),
-            },
-            Self::Set(set) => {
+            Self::Applied(report) => {
+                if report.stopped {
+                    return f.write_str("ok: not playing; changes land at next play\n");
+                }
+                match report.rebuilt {
+                    // A rebuild is the one outcome worth a timecode: it says
+                    // where the sound picked back up.
+                    Some(at) => {
+                        writeln!(f, "ok: rebuilt from {}", Tc(at))?;
+                        if report.live > 0 {
+                            writeln!(
+                                f,
+                                "note: {} change{} landed live",
+                                report.live,
+                                plural(report.live)
+                            )?;
+                        }
+                    }
+                    None if report.live == 0 => f.write_str("ok: nothing pending\n")?,
+                    None => writeln!(
+                        f,
+                        "ok: {} change{} landed",
+                        report.live,
+                        plural(report.live)
+                    )?,
+                }
+                Ok(())
+            }
+            Self::Set { result: set, landed } => {
                 let (var, value): (String, String) = match set {
                     SetResult::Master { v } => ("master".into(), Gain(*v).to_string()),
                     SetResult::TrackVolume { i, v } => {
@@ -360,7 +420,8 @@ impl fmt::Display for Output {
                         (format!("clip.{track}.{id}.fade_shape"), shape.to_string())
                     }
                 };
-                writeln!(f, "ok: `{var}` set to `{value}`")
+                writeln!(f, "ok: `{var}` set to `{value}`")?;
+                pending_note(f, *landed)
             }
             Self::Removed {
                 track,
@@ -375,6 +436,7 @@ impl fmt::Display for Output {
                 fade_out,
                 fade_out_to,
                 fade_shape,
+                landed,
             } => {
                 writeln!(f, "ok: removed 1 clip from track {track}")?;
                 writeln!(
@@ -389,12 +451,14 @@ impl fmt::Display for Output {
                         *fade_out_to,
                         *fade_shape,
                     )
-                )
+                )?;
+                pending_note(f, *landed)
             }
             Self::Moved {
                 from_track,
                 to_track,
                 clip,
+                landed,
             } => {
                 writeln!(
                     f,
@@ -413,7 +477,8 @@ impl fmt::Display for Output {
                         clip.fade_out_to,
                         clip.fade_shape,
                     )
-                )
+                )?;
+                pending_note(f, *landed)
             }
             Self::Rendered {
                 file,
@@ -537,15 +602,23 @@ impl fmt::Display for Output {
                     clips,
                     plural(clips)
                 )?;
+                // Edits waiting for a graph are the one thing `ls` reports
+                // that is not arrangement data: they are what an `apply`
+                // would have to do something about.
+                let pending = match ls.pending {
+                    0 => String::new(),
+                    n => format!(" pending={n}"),
+                };
                 writeln!(
                     f,
-                    "{}, playhead at {}, '{}' backend, end={}, master={}, idle_timeout={}",
+                    "{}, playhead at {}, '{}' backend, end={}, master={}, idle_timeout={}{}",
                     ls.state,
                     Tc(ls.playhead),
                     ls.backend,
                     Tc(ls.end),
                     Gain(ls.volume),
-                    Tc(Duration::from_secs(ls.idle_timeout))
+                    Tc(Duration::from_secs(ls.idle_timeout)),
+                    pending
                 )?;
                 for (ti, t) in ls.tracks.iter().enumerate() {
                     let name = match &t.name {
@@ -631,6 +704,7 @@ pub(crate) fn example_reply(command: &str) -> Option<String> {
         "put" => Output::Put {
             track: 0,
             clips: vec![clip(0, "/srv/bed.wav", D::ZERO, D::ZERO, s(30), 1.0)],
+            landed: None,
         },
         "take" => Output::Removed {
             track: 0,
@@ -645,11 +719,13 @@ pub(crate) fn example_reply(command: &str) -> Option<String> {
             fade_out: D::ZERO,
             fade_out_to: 0.0,
             fade_shape: Linear,
+            landed: None,
         },
         "move" => Output::Moved {
             from_track: 0,
             to_track: 1,
             clip: clip(3, "/srv/voice.wav", s(5), D::ZERO, s(10), 0.5),
+            landed: None,
         },
         "ls" => Output::Ls(Ls {
             state: State::Stopped,
@@ -658,6 +734,7 @@ pub(crate) fn example_reply(command: &str) -> Option<String> {
             backend: "silent",
             volume: 1.0,
             idle_timeout: 600,
+            pending: 0,
             tracks: vec![
                 LsTrack {
                     name: Some("bed".into()),
@@ -739,7 +816,10 @@ pub(crate) fn example_reply(command: &str) -> Option<String> {
             // frame) are decoded to their end and marked as estimated.
             length: SourceLength::Estimated(s(30)),
         },
-        "set" => Output::Set(SetResult::TrackVolume { i: 0, v: 0.4 }),
+        "set" => Output::Set {
+            result: SetResult::TrackVolume { i: 0, v: 0.4 },
+            landed: None,
+        },
         "play" => Output::Session {
             tracks: 2,
             clips: 2,
@@ -752,9 +832,11 @@ pub(crate) fn example_reply(command: &str) -> Option<String> {
         "pause" => Output::Paused { at: s(12) },
         "resume" => Output::Resumed { at: s(12) },
         "stop" => Output::Stopped,
-        "apply" => Output::Applied {
-            rebuilt: Some(s(4)),
-        },
+        "apply" => Output::Applied(ApplyReport {
+            live: 2,
+            rebuilt: None,
+            stopped: false,
+        }),
         "save" => Output::Saved {
             file: "/srv/mix.bo".into(),
         },

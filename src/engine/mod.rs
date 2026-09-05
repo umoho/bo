@@ -42,6 +42,45 @@ impl fmt::Display for BackendError {
 
 impl std::error::Error for BackendError {}
 
+/// One arrangement edit, addressed the way the CLI addresses it. This is what
+/// a running graph is asked to take without being rebuilt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Change {
+    /// A track's gain changed: its volume, or its mute.
+    TrackGain(usize),
+    /// A clip's gain or fade envelope changed.
+    ClipParams(usize, u64),
+    /// Clips were placed past the end of a track's queued material.
+    Appended(usize),
+    /// The arrangement's shape changed: a clip was removed or moved, or the
+    /// whole arrangement was replaced. Nothing running can express that.
+    Structure,
+}
+
+/// How an edit reached the sound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Landed {
+    /// The running graph took it, without interrupting playback.
+    Live,
+    /// Nothing is running, or the edit needs a graph built from scratch: it
+    /// is remembered, and lands at the next `apply`, `play` or `resume`.
+    Pending,
+}
+
+/// What [`Player::apply`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Applied {
+    /// Nothing was waiting.
+    Nothing,
+    /// `n` edits landed on the running graph; it was not rebuilt.
+    Live(usize),
+    /// `live` edits landed and the rest needed a graph rebuilt from `at`.
+    Rebuilt { live: usize, at: Duration },
+    /// The transport is stopped: there is no graph, so every edit stays
+    /// pending until it plays.
+    NotPlaying,
+}
+
 /// The thing that makes sound.
 ///
 /// `Player` never decodes anything itself; it decides *what* should be audible
@@ -66,6 +105,18 @@ pub trait Backend {
     /// Master gain, already clamped to `0.0 ..= 1.0`.
     fn set_volume(&mut self, volume: f32);
 
+    /// Take one arrangement edit on a graph that is already running, without
+    /// interrupting it. `false` means this backend cannot express the edit
+    /// live, so the caller keeps it pending and re-plans at the next `apply`.
+    ///
+    /// `tracks` is the arrangement as edited (the values to land), and `at`
+    /// is where the graph is sounding now, so a backend can tell a clip that
+    /// already passed from one still to come.
+    fn land(&mut self, tracks: &[Track], at: Duration, change: &Change) -> bool {
+        let _ = (tracks, at, change);
+        false
+    }
+
     /// Where the audio clock really is, if this backend can say. Used to
     /// correct the playhead against drift.
     fn position(&self) -> Option<Duration> {
@@ -80,6 +131,8 @@ pub struct Silent {
     pub last_play: Option<(usize, Duration)>,
     /// Requests so far, in order. Lets a test assert "seek re-planned".
     pub events: Vec<BackendEvent>,
+    /// The edits offered to [`Backend::land`], in order.
+    pub landed: Vec<Change>,
     volume: f32,
 }
 
@@ -91,6 +144,7 @@ pub enum BackendEvent {
     Resume,
     Stop,
     SetVolume,
+    Land,
 }
 
 impl Backend for Silent {
@@ -115,6 +169,15 @@ impl Backend for Silent {
     fn set_volume(&mut self, volume: f32) {
         self.volume = volume;
         self.events.push(BackendEvent::SetVolume);
+    }
+
+    /// Takes every edit a real graph could take live — gains, fades, clips
+    /// appended to a tail — and refuses the ones that need a graph built
+    /// from scratch, so tests see the same split the daemon does.
+    fn land(&mut self, _tracks: &[Track], _at: Duration, change: &Change) -> bool {
+        self.events.push(BackendEvent::Land);
+        self.landed.push(change.clone());
+        !matches!(change, Change::Structure)
     }
 }
 
@@ -154,6 +217,9 @@ pub struct Player<B: Backend = Silent> {
     state: State,
     volume: f32,
     backend: B,
+    /// Arrangement edits the running graph could not take, waiting for the
+    /// next `apply`, `play` or `resume`.
+    pending: Vec<Change>,
 }
 
 impl Default for Player<Silent> {
@@ -171,6 +237,7 @@ impl<B: Backend> Player<B> {
             state: State::Stopped,
             volume: 1.0,
             backend,
+            pending: Vec::new(),
         }
     }
 
@@ -180,8 +247,9 @@ impl<B: Backend> Player<B> {
         &self.tracks
     }
 
-    /// Edit the arrangement. Whether a live edit takes effect now or at the next
-    /// `play` is up to the caller: the player does not re-plan behind your back.
+    /// Edit the arrangement. The player cannot see an edit made through here:
+    /// report it with [`Player::changed`], so it lands on the running graph
+    /// (or is remembered until a graph can take it).
     pub fn tracks_mut(&mut self) -> &mut Vec<Track> {
         &mut self.tracks
     }
@@ -268,6 +336,7 @@ impl<B: Backend> Player<B> {
             tracks,
             playhead,
             volume,
+            pending,
             ..
         } = self;
         Player {
@@ -276,14 +345,25 @@ impl<B: Backend> Player<B> {
             state: State::Stopped,
             volume,
             backend,
+            pending,
         }
+    }
+
+    /// The edits waiting for a graph that can take them.
+    #[must_use]
+    pub fn pending(&self) -> &[Change] {
+        &self.pending
     }
 }
 
 impl<B: Backend> Player<B> {
-    /// Start playing from the current playhead.
+    /// Start playing from the current playhead. A fresh graph takes every
+    /// edit, so nothing stays pending.
     pub fn play(&mut self) -> Result<(), BackendError> {
-        self.backend.play(&self.tracks, self.playhead)?;
+        let at = self.playhead();
+        self.backend.play(&self.tracks, at)?;
+        self.playhead = at;
+        self.pending.clear();
         self.state = State::Playing;
         Ok(())
     }
@@ -291,18 +371,38 @@ impl<B: Backend> Player<B> {
     /// Hold position and silence output.
     pub fn pause(&mut self) {
         if self.state == State::Playing {
+            // Take the audio clock's reading before freezing it, so what we
+            // report — and where a later re-plan enters — is really where the
+            // sound stopped.
+            self.playhead = self.playhead();
             self.backend.pause();
             self.state = State::Paused;
         }
     }
 
-    /// Continue from where `pause` left off — no re-planning.
+    /// Continue from where `pause` left off.
+    ///
+    /// Edits made while paused usually land on the paused graph as they are
+    /// made; one that could not is given a graph here, rather than being
+    /// silently dropped on the floor.
     pub fn resume(&mut self) -> Result<(), BackendError> {
-        if self.state == State::Paused {
-            self.backend.resume();
-            self.state = State::Playing;
-        } else if self.state == State::Stopped {
-            return self.play();
+        match self.state {
+            State::Paused => {
+                if self.pending.is_empty() {
+                    self.backend.resume();
+                } else {
+                    let at = self.playhead();
+                    self.backend.play(&self.tracks, at)?;
+                    self.playhead = at;
+                    self.pending.clear();
+                    // A graph built while paused comes out paused; this one
+                    // is meant to be running.
+                    self.backend.resume();
+                }
+                self.state = State::Playing;
+            }
+            State::Stopped => return self.play(),
+            State::Playing => {}
         }
         Ok(())
     }
@@ -319,27 +419,92 @@ impl<B: Backend> Player<B> {
     pub fn reset(&mut self) {
         self.stop();
         self.tracks.clear();
+        self.pending.clear();
     }
 
     /// Jump the playhead. A running transport is re-planned from the new
-    /// position, because most backends cannot seek mid-stream.
+    /// position, because most backends cannot seek mid-stream; the fresh
+    /// graph takes every pending edit with it.
     pub fn seek(&mut self, at: Duration) -> Result<(), BackendError> {
         self.playhead = at;
         if self.state == State::Playing {
             self.backend.play(&self.tracks, at)?;
+            self.pending.clear();
         }
         Ok(())
     }
 
-    /// Apply the arrangement to a running transport: rebuild the backend's
-    /// playback graph from the current playhead, so pending mix changes
-    /// (volume, mute) take effect now. No-op unless playing; the playhead is
-    /// untouched either way.
-    pub fn apply(&mut self) -> Result<(), BackendError> {
-        if self.state == State::Playing {
-            self.backend.play(&self.tracks, self.playhead)?;
+    /// Report an arrangement edit, so it can take effect.
+    ///
+    /// The edit is already in the tracks; this is the player being told about
+    /// it. A live landing is asked for first, and only what the running graph
+    /// cannot express stays pending for the next [`Player::apply`]. A stopped
+    /// transport has no graph at all, so everything is pending there — and
+    /// lands at the next `play`.
+    pub fn changed(&mut self, change: Change) -> Landed {
+        if self.state != State::Stopped {
+            let at = self.playhead();
+            if self.backend.land(&self.tracks, at, &change) {
+                return Landed::Live;
+            }
         }
-        Ok(())
+        self.remember(change)
+    }
+
+    /// Keep an edit for the next graph. A structural edit supersedes
+    /// everything waiting: a rebuilt graph takes all of it anyway.
+    fn remember(&mut self, change: Change) -> Landed {
+        if change == Change::Structure {
+            self.pending.clear();
+        } else if self.pending.contains(&Change::Structure) {
+            return Landed::Pending;
+        }
+        if !self.pending.contains(&change) {
+            self.pending.push(change);
+        }
+        Landed::Pending
+    }
+
+    /// Make every pending edit audible.
+    ///
+    /// Each edit is offered to the running graph again; only what it still
+    /// cannot take forces a rebuild, and a rebuild re-plans from where the
+    /// audio really is, so it resumes what the listener is hearing rather
+    /// than jumping ahead of it. A stopped transport is left alone: its edits
+    /// are pending by definition and land at the next `play`.
+    pub fn apply(&mut self) -> Result<Applied, BackendError> {
+        if self.state == State::Stopped {
+            return Ok(Applied::NotPlaying);
+        }
+        let at = self.playhead();
+        let waiting = std::mem::take(&mut self.pending);
+        let total = waiting.len();
+        let mut rest = Vec::new();
+        for change in waiting {
+            if !self.backend.land(&self.tracks, at, &change) {
+                rest.push(change);
+            }
+        }
+        let live = total - rest.len();
+        if rest.is_empty() {
+            return Ok(if live == 0 {
+                Applied::Nothing
+            } else {
+                Applied::Live(live)
+            });
+        }
+        // Something needs a graph of its own. Read the clock again: landing
+        // the rest may have taken a moment, and the entry point should be
+        // where the sound is now.
+        let at = self.playhead();
+        if let Err(e) = self.backend.play(&self.tracks, at) {
+            // The rebuild did not happen, so those edits are still waiting;
+            // what landed live stays landed.
+            self.pending = rest;
+            return Err(e);
+        }
+        self.playhead = at;
+        Ok(Applied::Rebuilt { live, at })
     }
 
     /// Move the playhead to match a backend-reported clock, without re-planning.
@@ -446,7 +611,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_rebuilds_a_running_transport_only() {
+    fn apply_with_nothing_pending_rebuilds_nothing() {
         let mut p: Player<Silent> = Player::default();
         p.add_track(track_with("a.wav", 10));
         let plays = |p: &Player<Silent>| {
@@ -457,26 +622,166 @@ mod tests {
                 .count()
         };
 
-        p.apply().unwrap();
+        assert_eq!(p.apply().unwrap(), Applied::NotPlaying);
         assert_eq!(plays(&p), 0, "stopped: nothing to plan");
         assert_eq!(p.backend().last_play, None);
 
         p.play().unwrap();
         p.seek(Duration::from_secs(4)).unwrap();
         assert_eq!(plays(&p), 2);
-        p.apply().unwrap();
-        assert_eq!(plays(&p), 3, "apply rebuilds from the current playhead");
-        assert_eq!(p.backend().last_play, Some((1, Duration::from_secs(4))));
+        assert_eq!(p.apply().unwrap(), Applied::Nothing);
         assert_eq!(
-            p.playhead(),
-            Duration::from_secs(4),
-            "apply does not move the playhead"
+            plays(&p),
+            2,
+            "an apply with nothing waiting does not touch the graph"
+        );
+        assert_eq!(p.playhead(), Duration::from_secs(4), "nor the playhead");
+    }
+
+    #[test]
+    fn gains_land_live_and_only_structure_rebuilds() {
+        let mut p: Player<Silent> = Player::default();
+        p.add_track(track_with("a.wav", 10));
+        let plays = |p: &Player<Silent>| {
+            p.backend()
+                .events
+                .iter()
+                .filter(|e| **e == BackendEvent::Play)
+                .count()
+        };
+        p.play().unwrap();
+        assert_eq!(plays(&p), 1);
+
+        // A gain is something a running graph can take as it is.
+        assert_eq!(p.changed(Change::TrackGain(0)), Landed::Live);
+        assert_eq!(p.changed(Change::ClipParams(0, 3)), Landed::Live);
+        assert_eq!(plays(&p), 1, "no rebuild to change a gain");
+        assert!(p.pending().is_empty(), "and nothing left waiting");
+        assert_eq!(p.apply().unwrap(), Applied::Nothing);
+
+        // A clip removed or moved is not: it waits, and apply is what gives
+        // it a graph.
+        assert_eq!(p.changed(Change::Structure), Landed::Pending);
+        assert_eq!(p.pending(), &[Change::Structure]);
+        assert_eq!(
+            p.apply().unwrap(),
+            Applied::Rebuilt {
+                live: 0,
+                at: Duration::ZERO
+            }
+        );
+        assert_eq!(plays(&p), 2, "the rebuild is one re-plan");
+        assert!(p.pending().is_empty(), "and it drained the queue");
+
+        // A structural edit supersedes the small ones waiting behind it: one
+        // rebuild takes all of it.
+        p.changed(Change::TrackGain(0));
+        p.backend_mut().landed.clear();
+        p.changed(Change::Structure);
+        assert_eq!(p.pending(), &[Change::Structure]);
+        assert_eq!(p.apply().unwrap(), Applied::Rebuilt { live: 0, at: Duration::ZERO });
+        assert_eq!(plays(&p), 3);
+    }
+
+    #[test]
+    fn edits_made_while_stopped_land_at_the_next_play() {
+        let mut p: Player<Silent> = Player::default();
+        p.add_track(track_with("a.wav", 10));
+        assert_eq!(p.changed(Change::TrackGain(0)), Landed::Pending);
+        assert_eq!(p.changed(Change::Structure), Landed::Pending);
+        assert_eq!(p.apply().unwrap(), Applied::NotPlaying);
+        assert!(
+            p.backend().landed.is_empty(),
+            "a stopped transport has no graph to offer an edit to"
         );
 
-        // Paused: nothing to rebuild.
+        p.play().unwrap();
+        assert!(
+            p.pending().is_empty(),
+            "a fresh graph took everything with it"
+        );
+        assert_eq!(p.apply().unwrap(), Applied::Nothing);
+    }
+
+    #[test]
+    fn resume_gives_a_paused_edit_the_graph_it_needs() {
+        let mut p: Player<Silent> = Player::default();
+        p.add_track(track_with("a.wav", 10));
+        let plays = |p: &Player<Silent>| {
+            p.backend()
+                .events
+                .iter()
+                .filter(|e| **e == BackendEvent::Play)
+                .count()
+        };
+        p.play().unwrap();
         p.pause();
-        p.apply().unwrap();
-        assert_eq!(plays(&p), 3);
+
+        // A gain lands on the paused graph: pausing stops the sound, not the
+        // graph's ability to take a new value.
+        assert_eq!(p.changed(Change::TrackGain(0)), Landed::Live);
+        p.resume().unwrap();
+        assert_eq!(plays(&p), 1, "so resuming re-plans nothing");
+
+        // A structural edit cannot; resume must not drop it on the floor.
+        p.pause();
+        assert_eq!(p.changed(Change::Structure), Landed::Pending);
+        p.resume().unwrap();
+        assert_eq!(plays(&p), 2, "resume rebuilt for it");
+        assert!(p.pending().is_empty());
+        assert_eq!(
+            p.backend().events.last(),
+            Some(&BackendEvent::Resume),
+            "and the rebuilt graph is running, not paused"
+        );
+    }
+
+    /// A backend that can be told to refuse re-plans: what happens to edits
+    /// that were waiting for one.
+    #[derive(Debug, Default)]
+    struct Refuses {
+        refuse: bool,
+    }
+
+    impl Backend for Refuses {
+        fn play(&mut self, _tracks: &[Track], _at: Duration) -> Result<(), BackendError> {
+            if self.refuse {
+                return Err(BackendError::new("refuses", "no graph for you"));
+            }
+            Ok(())
+        }
+        fn pause(&mut self) {}
+        fn resume(&mut self) {}
+        fn stop(&mut self) {}
+        fn set_volume(&mut self, _volume: f32) {}
+    }
+
+    #[test]
+    fn a_failed_apply_keeps_what_it_could_not_land() {
+        let mut p = Player::new(Refuses::default());
+        p.add_track(track_with("a.wav", 10));
+        p.play().unwrap();
+        assert_eq!(p.changed(Change::Structure), Landed::Pending);
+
+        p.backend_mut().refuse = true;
+        assert!(p.apply().is_err());
+        assert_eq!(
+            p.pending(),
+            &[Change::Structure],
+            "a rebuild that did not happen leaves the edit waiting"
+        );
+        assert_eq!(p.state(), State::Playing, "and the transport untouched");
+
+        p.backend_mut().refuse = false;
+        assert_eq!(
+            p.apply().unwrap(),
+            Applied::Rebuilt {
+                live: 0,
+                at: Duration::ZERO
+            },
+            "so the next apply can still land it"
+        );
+        assert!(p.pending().is_empty());
     }
 
     #[test]

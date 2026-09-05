@@ -43,13 +43,17 @@
 //! * `stop` — stop and rewind; ends the daemon's session (cleanup as usual).
 //! * `seek <t>` — move the playhead; a running transport re-plans. Seeking
 //!   past the arrangement's end is refused.
-//! * `apply` — rebuild the running transport from the current playhead, so
-//!   pending mix changes take effect now.
-//! * `set <var> <value>` — set an attribute: `master` (real-time), or
-//!   `track.N.volume` / `track.N.muted` / `track.N.name` / `clip.N.N.gain` /
-//!   `clip.N.N.fade_in` / `clip.N.N.fade_in_from` / `clip.N.N.fade_out` /
-//!   `clip.N.N.fade_out_to` / `clip.N.N.fade_shape` (arrangement data; gain
-//!   and fades land on the next `play` or `apply`).
+//! * `apply` — make every pending arrangement edit audible. Most edits land
+//!   as they are made: a gain or a fade goes straight into the graph that is
+//!   playing it, and a clip placed past the end of a track's queue is
+//!   appended to it. `apply` is for what a running graph cannot take — a clip
+//!   taken or moved — and rebuilds the graph from where the audio really is.
+//! * `set <var> <value>` — set an attribute and land it: `master` (always
+//!   real-time), or `track.N.volume` / `track.N.muted` / `track.N.name` /
+//!   `clip.N.N.gain` / `clip.N.N.fade_in` / `clip.N.N.fade_in_from` /
+//!   `clip.N.N.fade_out` / `clip.N.N.fade_out_to` / `clip.N.N.fade_shape`.
+//!   Gains and fades land on the running graph; a name is a label, and an
+//!   edit made while nothing plays lands at the next `play`.
 //! * `take <track> <clip>` — remove a clip; the clip is addressed by its
 //!   stable id or an `@timecode` (the clip covering that moment).
 //! * `move <track> <clip> <dest>` — move a clip to another track, or to a
@@ -121,14 +125,16 @@ use std::time::{Duration, Instant};
 use bo::engine::rodio::{
     measure, probe, probe_sources, render_and_measure, render_to_file, Rodio, SourceLength,
 };
-use bo::engine::{Backend, BackendError, Player, Silent, State};
+use bo::engine::{Applied, Backend, BackendError, Change, Landed, Player, Silent, State};
 use bo::track::{Clip, Fade, FadeShape, Source, Track};
 use clap::error::ErrorKind;
 use clap::{Parser, Subcommand};
 
 mod reply;
 
-use reply::{AtLine, Ls, LsClip, LsTrack, Output, PlacedClip, ProbeResult, SetResult, Tc};
+use reply::{
+    ApplyReport, AtLine, Ls, LsClip, LsTrack, Output, PlacedClip, ProbeResult, SetResult, Tc,
+};
 
 /// bo — edit and mix audio, one command at a time.
 #[derive(Debug, Parser)]
@@ -398,6 +404,20 @@ impl Backend for AnyBackend {
             Self::Rodio(backend) => backend.set_volume(volume),
         }
     }
+
+    fn land(&mut self, tracks: &[Track], at: Duration, change: &Change) -> bool {
+        match self {
+            Self::Silent(backend, _) => backend.land(tracks, at, change),
+            Self::Rodio(backend) => backend.land(tracks, at, change),
+        }
+    }
+
+    fn position(&self) -> Option<Duration> {
+        match self {
+            Self::Silent(backend, _) => backend.position(),
+            Self::Rodio(backend) => backend.position(),
+        }
+    }
 }
 
 /// Where the daemon listens by default: `$TMPDIR/bo/daemon.sock`.
@@ -450,16 +470,18 @@ Arrangement:
                            without a uri, every source in the arrangement
 
 Mix:
-  set master <v>           set the master gain, 0..1 (real-time)
-  set track.N.volume <v>   set a track's gain, 0..1 (apply to land)
+  set master <v>           set the master gain, 0..1
+  set track.N.volume <v>   set a track's gain, 0..1
   set track.N.muted <b>    mute (true) or restore (false) a track
   set track.N.name <name>  label a track
-  set clip.N.N.gain <v>    set a clip's gain, 0..1 (apply to land)
+  set clip.N.N.gain <v>    set a clip's gain, 0..1
   set clip.N.N.fade_in <t> set a clip's fade-in
   set clip.N.N.fade_in_from <v>  set the fade-in's start level, 0..1
   set clip.N.N.fade_out <t> set a clip's fade-out
   set clip.N.N.fade_out_to <v>  set the fade-out's end level, 0..1
   set clip.N.N.fade_shape <s>  set a clip's fade curve (linear)
+                           gains and fades land on the mix as they are set,
+                           playing or paused; a name is only a label
 
 Transport:
   play                     start playback from the current playhead
@@ -468,8 +490,9 @@ Transport:
   resume                   continue after a pause
   stop                     stop, rewind, end the session
   seek <t>                 move the playhead (refused past the end)
-  apply                    rebuild the running transport, so pending mix
-                           changes take effect now
+  apply                    make pending edits audible: what a running mix
+                           cannot take itself (a clip taken or moved) is
+                           what rebuilds it
 
 OPTIONS
   --socket PATH            unix socket the daemon listens on
@@ -481,8 +504,9 @@ OPTIONS
 OUTPUT
   Every reply opens with ok: ... or err: ... (exit codes: 0 ok, 1 refused,
   2 usage). Timecodes are HH:MM:SS.fff strings; gains two decimals; absent
-  means default. A clip is one signature line, a track a header over its
-  clips:
+  means default. An edit a running mix could not take itself adds one
+  note: line, and `ls` counts what is waiting as pending=N. A clip is one
+  signature line, a track a header over its clips:
 
     clip #<id> '<uri>' <from>-<to> @ <at> [gain=..] [fade_in=..] ...
     track <n> '<name>'|untitled vol=.. end=.. [muted]
@@ -509,9 +533,10 @@ CLIP SPEC
 EXAMPLES
   bo put bed.wav,00:00:00-00:00:30
   bo put voice.wav,00:00:00-00:00:30 1@00:00:00
-  bo set track.0.volume 0.4  # duck the bed under the voice
-  bo apply                 # make the change audible now
   bo play
+  bo set track.0.volume 0.4  # duck the bed; lands as it is set
+  bo put outro.wav,0-10 0@00:00:30   # keep queueing while it plays
+  bo apply                 # for what a running mix cannot take itself
   bo ls
   bo stop                  # end the session; daemon cleans up
 ";
@@ -862,6 +887,9 @@ fn dispatch(a: &mut Arrangement, command: Command, cwd: &str) -> Result<Output, 
             a.player.reset();
             a.player.set_volume(volume);
             a.player.tracks_mut().extend(tracks);
+            // A loaded arrangement is a different mix entirely: whatever was
+            // playing has nothing to do with it.
+            a.player.changed(Change::Structure);
             Ok(Output::Loaded { file })
         }
         Command::Reset => reset_command(a),
@@ -916,6 +944,7 @@ fn arrangement_view(a: &Arrangement) -> Ls {
         backend: p.backend().name(),
         volume: p.volume(),
         idle_timeout: a.idle_timeout,
+        pending: p.pending().len(),
         tracks: p
             .tracks()
             .iter()
@@ -993,20 +1022,26 @@ fn take_command(
         )));
     };
     match id.and_then(|id| t.remove(id)) {
-        Some(clip) => Ok(Output::Removed {
-            track: track_index,
-            id: clip.id,
-            uri: clip.source.uri.clone(),
-            at: clip.at,
-            from: clip.from,
-            to: clip.to,
-            gain: clip.gain,
-            fade_in: clip.fade.fade_in,
-            fade_in_from: clip.fade.fade_in_from,
-            fade_out: clip.fade.fade_out,
-            fade_out_to: clip.fade.fade_out_to,
-            fade_shape: clip.fade.shape,
-        }),
+        Some(clip) => {
+            // A queue that is already sounding cannot have one of its clips
+            // taken out of the middle: this waits for an `apply`.
+            let landed = a.player.changed(Change::Structure);
+            Ok(Output::Removed {
+                track: track_index,
+                id: clip.id,
+                uri: clip.source.uri.clone(),
+                at: clip.at,
+                from: clip.from,
+                to: clip.to,
+                gain: clip.gain,
+                fade_in: clip.fade.fade_in,
+                fade_in_from: clip.fade.fade_in_from,
+                fade_out: clip.fade.fade_out,
+                fade_out_to: clip.fade.fade_out_to,
+                fade_shape: clip.fade.shape,
+                landed: noting(a, Some(landed)),
+            })
+        }
         None => Err(fail(format!("no clip {track_index}#{clip_arg}"))),
     }
 }
@@ -1099,6 +1134,8 @@ fn move_command(
             .expect("pre-checked: the destination is free")
     };
     moved.id = id;
+    // Moving a clip re-orders a queue, which a running graph cannot do.
+    let landed = a.player.changed(Change::Structure);
     Ok(Output::Moved {
         from_track: track_index,
         to_track: dest_index,
@@ -1115,6 +1152,7 @@ fn move_command(
             fade_out_to: moved.fade.fade_out_to,
             fade_shape: moved.fade.shape,
         },
+        landed: noting(a, Some(landed)),
     })
 }
 
@@ -1252,9 +1290,16 @@ fn put_command(
             fade_shape: placed.fade.shape,
         });
     }
+    // A clip placed past the end of what a track has already queued joins the
+    // running graph as it is placed, which is what makes a live show
+    // extensible without interrupting it. One placed into a gap *before*
+    // queued material cannot — a queue can be extended, not re-ordered — so
+    // it waits for an `apply`.
+    let landed = a.player.changed(Change::Appended(track_index));
     Ok(Output::Put {
         track: track_index,
         clips: placed_clips,
+        landed: noting(a, Some(landed)),
     })
 }
 
@@ -1286,16 +1331,45 @@ fn play_command(a: &mut Arrangement) -> Result<Output, (i32, String)> {
     })
 }
 
-/// `apply`: rebuild the running transport from the current playhead, so
-/// pending mix changes (volume, mute) take effect now.
+/// `apply`: make every pending arrangement edit audible.
+///
+/// Most edits land as they are made — a gain or a fade goes into the chain
+/// that is playing it, a clip placed past a track's queue is appended to it.
+/// This is for the rest: a clip taken or moved, an arrangement loaded. What
+/// still cannot be taken live is what forces a graph rebuilt from where the
+/// audio really is, so the rebuild picks up what the listener is hearing
+/// rather than jumping ahead of it.
 fn apply_command(a: &mut Arrangement) -> Result<Output, (i32, String)> {
-    if !a.player.is_playing() {
-        return Ok(Output::Applied { rebuilt: None });
+    if !a.player.is_playing() && a.player.state() != State::Paused {
+        return Ok(Output::Applied(ApplyReport {
+            live: 0,
+            rebuilt: None,
+            stopped: true,
+        }));
     }
-    a.player.apply().map_err(|e| fail(e.to_string()))?;
-    Ok(Output::Applied {
-        rebuilt: Some(a.player.playhead()),
-    })
+    let report = match a.player.apply().map_err(|e| fail(e.to_string()))? {
+        Applied::Nothing => ApplyReport {
+            live: 0,
+            rebuilt: None,
+            stopped: false,
+        },
+        Applied::Live(live) => ApplyReport {
+            live,
+            rebuilt: None,
+            stopped: false,
+        },
+        Applied::Rebuilt { live, at } => ApplyReport {
+            live,
+            rebuilt: Some(at),
+            stopped: false,
+        },
+        Applied::NotPlaying => ApplyReport {
+            live: 0,
+            rebuilt: None,
+            stopped: true,
+        },
+    };
+    Ok(Output::Applied(report))
 }
 
 /// `reset`: drop every track and stop the transport — the daemon is back to
@@ -1306,9 +1380,21 @@ fn reset_command(a: &mut Arrangement) -> Result<Output, (i32, String)> {
     Ok(Output::Reset { tracks })
 }
 
-/// `set <var> <value>`: set an attribute. `master` is real-time — the backend
-/// is told immediately. `track.N.volume` / `track.N.muted` / `track.N.name`
-/// are arrangement data that land on the next `play` or `apply`.
+/// Whether an edit's landing is worth a line in the reply.
+///
+/// Only a pending edit made while something is playing: one that landed needs
+/// no report, and with nothing playing every edit lands at the next `play`,
+/// which is the default rather than news.
+fn noting(a: &Arrangement, landed: Option<Landed>) -> Option<Landed> {
+    landed.filter(|l| *l == Landed::Pending && a.player.state() != State::Stopped)
+}
+
+/// `set <var> <value>`: set an attribute, and land it on whatever is playing.
+///
+/// `master` has always been real-time. The rest is arrangement data that the
+/// running graph is asked to take as it is — a track's gain, a clip's gain and
+/// fades — and only what a graph cannot express waits for an `apply`. A name
+/// is a label rather than part of the mix, so there is nothing to land.
 fn set_command(a: &mut Arrangement, var: &str, value: &str) -> Result<Output, (i32, String)> {
     match var {
         "master" => {
@@ -1316,7 +1402,10 @@ fn set_command(a: &mut Arrangement, var: &str, value: &str) -> Result<Output, (i
                 .parse()
                 .map_err(|_| usage(format!("bad gain {value:?}")))?;
             a.player.set_volume(v);
-            Ok(Output::Set(SetResult::Master { v: a.player.volume() }))
+            Ok(Output::Set {
+                result: SetResult::Master { v: a.player.volume() },
+                landed: None,
+            })
         }
         _ => {
             if let Some(rest) = var.strip_prefix("clip.") {
@@ -1329,40 +1418,50 @@ fn set_command(a: &mut Arrangement, var: &str, value: &str) -> Result<Output, (i
             let index: usize = index
                 .parse()
                 .map_err(|_| usage(format!("bad track {index:?}")))?;
-            let t = a
-                .player
-                .tracks_mut()
-                .get_mut(index)
-                .ok_or_else(|| fail(format!("no track {index}")))?;
-            match prop {
-                "volume" => {
-                    let v: f32 = value
-                        .parse()
-                        .map_err(|_| usage(format!("bad gain {value:?}")))?;
-                    t.set_volume(v);
-                    Ok(Output::Set(SetResult::TrackVolume { i: index, v: t.volume() }))
+            let result = {
+                let t = a
+                    .player
+                    .tracks_mut()
+                    .get_mut(index)
+                    .ok_or_else(|| fail(format!("no track {index}")))?;
+                match prop {
+                    "volume" => {
+                        let v: f32 = value
+                            .parse()
+                            .map_err(|_| usage(format!("bad gain {value:?}")))?;
+                        t.set_volume(v);
+                        Ok(SetResult::TrackVolume { i: index, v: t.volume() })
+                    }
+                    "muted" => {
+                        let b = parse_bool(value).map_err(usage)?;
+                        t.set_muted(b);
+                        Ok(SetResult::TrackMuted { i: index, muted: b })
+                    }
+                    "name" => {
+                        t.set_name(value.to_string());
+                        Ok(SetResult::TrackName {
+                            i: index,
+                            name: value.to_string(),
+                        })
+                    }
+                    _ => Err(usage(format!("unknown property {prop:?} on a track"))),
                 }
-                "muted" => {
-                    let b = parse_bool(value).map_err(usage)?;
-                    t.set_muted(b);
-                    Ok(Output::Set(SetResult::TrackMuted { i: index, muted: b }))
-                }
-                "name" => {
-                    t.set_name(value.to_string());
-                    Ok(Output::Set(SetResult::TrackName {
-                        i: index,
-                        name: value.to_string(),
-                    }))
-                }
-                _ => Err(usage(format!("unknown property {prop:?} on a track"))),
-            }
+            }?;
+            let landed = match &result {
+                SetResult::TrackName { .. } => None,
+                _ => Some(a.player.changed(Change::TrackGain(index))),
+            };
+            Ok(Output::Set {
+                result,
+                landed: noting(a, landed),
+            })
         }
     }
 }
 
 /// `set clip.<track>.<id>.<prop>`: set a clip attribute (`gain`, `fade_in`,
-/// `fade_out`, `fade_shape`). Arrangement data that lands on the next `play`
-/// or `apply`.
+/// `fade_out`, `fade_shape`) and land it on the clip's own source chain, which
+/// reads its gain and envelope as it plays.
 fn set_clip_command(
     a: &mut Arrangement,
     rest: &str,
@@ -1382,69 +1481,76 @@ fn set_clip_command(
         .parse()
         .map_err(|_| usage(format!("bad track {track:?}")))?;
     let id: u64 = id.parse().map_err(|_| usage(format!("bad clip id {id:?}")))?;
-    let t = a
-        .player
-        .tracks_mut()
-        .get_mut(track_i)
-        .ok_or_else(|| fail(format!("no track {track_i}")))?;
-    let c = t
-        .clip_mut(id)
-        .ok_or_else(|| fail(format!("no clip {track_i}#{id}")))?;
-    match prop {
-        "gain" => {
-            let v: f32 = value
-                .parse()
-                .map_err(|_| usage(format!("bad gain {value:?}")))?;
-            c.gain = v.clamp(0.0, 1.0);
-            Ok(Output::Set(SetResult::ClipGain {
-                track: track_i,
-                id,
-                gain: c.gain,
-            }))
+    let result = {
+        let t = a
+            .player
+            .tracks_mut()
+            .get_mut(track_i)
+            .ok_or_else(|| fail(format!("no track {track_i}")))?;
+        let c = t
+            .clip_mut(id)
+            .ok_or_else(|| fail(format!("no clip {track_i}#{id}")))?;
+        match prop {
+            "gain" => {
+                let v: f32 = value
+                    .parse()
+                    .map_err(|_| usage(format!("bad gain {value:?}")))?;
+                c.gain = v.clamp(0.0, 1.0);
+                Ok(SetResult::ClipGain {
+                    track: track_i,
+                    id,
+                    gain: c.gain,
+                })
+            }
+            "fade_in" => {
+                let d = parse_timecode(value).map_err(usage)?;
+                c.fade.fade_in = d;
+                Ok(SetResult::ClipFadeIn { track: track_i, id, d })
+            }
+            "fade_in_from" => {
+                let level: f32 = value
+                    .parse()
+                    .map_err(|_| usage(format!("bad gain {value:?}")))?;
+                c.fade.fade_in_from = level.clamp(0.0, 1.0);
+                Ok(SetResult::ClipFadeInFrom {
+                    track: track_i,
+                    id,
+                    level: c.fade.fade_in_from,
+                })
+            }
+            "fade_out" => {
+                let d = parse_timecode(value).map_err(usage)?;
+                c.fade.fade_out = d;
+                Ok(SetResult::ClipFadeOut { track: track_i, id, d })
+            }
+            "fade_out_to" => {
+                let level: f32 = value
+                    .parse()
+                    .map_err(|_| usage(format!("bad gain {value:?}")))?;
+                c.fade.fade_out_to = level.clamp(0.0, 1.0);
+                Ok(SetResult::ClipFadeOutTo {
+                    track: track_i,
+                    id,
+                    level: c.fade.fade_out_to,
+                })
+            }
+            "fade_shape" => {
+                let shape = value.parse::<FadeShape>().map_err(usage)?;
+                c.fade.shape = shape;
+                Ok(SetResult::ClipFadeShape {
+                    track: track_i,
+                    id,
+                    shape,
+                })
+            }
+            _ => Err(usage(format!("unknown property {prop:?} on a clip"))),
         }
-        "fade_in" => {
-            let d = parse_timecode(value).map_err(usage)?;
-            c.fade.fade_in = d;
-            Ok(Output::Set(SetResult::ClipFadeIn { track: track_i, id, d }))
-        }
-        "fade_in_from" => {
-            let level: f32 = value
-                .parse()
-                .map_err(|_| usage(format!("bad gain {value:?}")))?;
-            c.fade.fade_in_from = level.clamp(0.0, 1.0);
-            Ok(Output::Set(SetResult::ClipFadeInFrom {
-                track: track_i,
-                id,
-                level: c.fade.fade_in_from,
-            }))
-        }
-        "fade_out" => {
-            let d = parse_timecode(value).map_err(usage)?;
-            c.fade.fade_out = d;
-            Ok(Output::Set(SetResult::ClipFadeOut { track: track_i, id, d }))
-        }
-        "fade_out_to" => {
-            let level: f32 = value
-                .parse()
-                .map_err(|_| usage(format!("bad gain {value:?}")))?;
-            c.fade.fade_out_to = level.clamp(0.0, 1.0);
-            Ok(Output::Set(SetResult::ClipFadeOutTo {
-                track: track_i,
-                id,
-                level: c.fade.fade_out_to,
-            }))
-        }
-        "fade_shape" => {
-            let shape = value.parse::<FadeShape>().map_err(usage)?;
-            c.fade.shape = shape;
-            Ok(Output::Set(SetResult::ClipFadeShape {
-                track: track_i,
-                id,
-                shape,
-            }))
-        }
-        _ => Err(usage(format!("unknown property {prop:?} on a clip"))),
-    }
+    }?;
+    let landed = a.player.changed(Change::ClipParams(track_i, id));
+    Ok(Output::Set {
+        result,
+        landed: noting(a, Some(landed)),
+    })
 }
 
 /// Parse a boolean value: `true`/`false` (or `1`/`0`).
@@ -2538,38 +2644,108 @@ mod tests {
         assert_eq!(code, 2);
     }
 
+    /// How many times the backend was asked to plan a mix.
+    fn plays(a: &Arrangement) -> usize {
+        match a.player.backend() {
+            AnyBackend::Silent(s, _) => s
+                .events
+                .iter()
+                .filter(|e| **e == BackendEvent::Play)
+                .count(),
+            AnyBackend::Rodio(_) => unreachable!("tests use the silent backend"),
+        }
+    }
+
     #[test]
-    fn apply_rebuilds_a_running_transport_only() {
+    fn apply_rebuilds_only_what_a_running_mix_cannot_take() {
         let mut a = Arrangement::default();
         run_ok(&mut a, &["put", "a.wav,00:00:00-00:00:10"]);
-        let plays = |a: &Arrangement| -> usize {
-            match a.player.backend() {
-                AnyBackend::Silent(s, _) => s
-                    .events
-                    .iter()
-                    .filter(|e| **e == BackendEvent::Play)
-                    .count(),
-                AnyBackend::Rodio(_) => unreachable!("tests use the silent backend"),
-            }
-        };
 
-        // Stopped: a note, and nothing is rebuilt.
+        // Stopped: nothing is sounding, so nothing can land yet.
         let out = run_ok(&mut a, &["apply"]);
         assert!(out.contains("not playing"), "{out}");
         assert_eq!(plays(&a), 0);
 
-        // Playing: rebuild from the current playhead; playhead untouched.
         run_ok(&mut a, &["play"]);
         run_ok(&mut a, &["seek", "00:00:04"]);
-        run_ok(&mut a, &["set", "track.0.volume", "0.5"]);
+        assert_eq!(plays(&a), 2, "play and seek each plan a mix");
+
+        // A gain lands on the mix as it is set: no note in the reply, and no
+        // re-plan. That is the point of `apply` no longer being the only way
+        // to make a change audible.
+        let out = run_ok(&mut a, &["set", "track.0.volume", "0.5"]);
+        assert!(out.contains("ok: `track.0.volume` set to `0.50`"), "{out}");
+        assert!(!out.contains("note:"), "a live landing needs no note: {out}");
+        assert_eq!(plays(&a), 2, "setting a gain does not re-plan");
+        let out = run_ok(&mut a, &["apply"]);
+        assert!(out.contains("ok: nothing pending"), "{out}");
+        assert_eq!(plays(&a), 2);
+
+        // Taking a clip out of a queue that is sounding is the one edit a
+        // running graph cannot make: the reply says it waits, `ls` counts it,
+        // and `apply` rebuilds for it — from where the audio is.
+        let out = run_ok(&mut a, &["take", "0", "0"]);
+        assert!(out.contains("note: lands at next apply"), "{out}");
+        let out = run_ok(&mut a, &["ls"]);
+        assert!(out.contains("pending=1"), "{out}");
         let out = run_ok(&mut a, &["apply"]);
         assert!(out.contains("rebuilt from 00:00:04.000"), "{out}");
-        assert_eq!(plays(&a), 3, "play + seek + apply");
+        assert_eq!(plays(&a), 3, "one rebuild for the structural edit");
         assert_eq!(
             a.player.playhead(),
             Duration::from_secs(4),
             "apply does not move the playhead"
         );
+        let out = run_ok(&mut a, &["ls"]);
+        assert!(!out.contains("pending="), "nothing left waiting: {out}");
+    }
+
+    #[test]
+    fn a_put_extends_a_running_mix_without_rebuilding_it() {
+        let mut a = Arrangement::default();
+        run_ok(&mut a, &["put", "a.wav,00:00:00-00:00:10"]);
+        run_ok(&mut a, &["play"]);
+        assert_eq!(plays(&a), 1);
+
+        // The live-show move: queue the next item while the current one
+        // plays. It joins the running queue instead of waiting for a rebuild.
+        let out = run_ok(&mut a, &["put", "b.wav,00:00:00-00:00:05", "0@00:00:10"]);
+        assert!(out.contains("ok: 1 clip on track 0"), "{out}");
+        assert!(!out.contains("note:"), "it landed as it was placed: {out}");
+        assert_eq!(plays(&a), 1, "appending to a queue is not a re-plan");
+
+        let out = run_ok(&mut a, &["apply"]);
+        assert!(out.contains("ok: nothing pending"), "{out}");
+        assert_eq!(plays(&a), 1);
+    }
+
+    #[test]
+    fn edits_made_while_paused_land_without_a_rebuild_on_resume() {
+        let mut a = Arrangement::default();
+        run_ok(&mut a, &["put", "a.wav,00:00:00-00:00:10"]);
+        run_ok(&mut a, &["put", "a.wav,00:00:00-00:00:10", "0@00:00:10"]);
+        run_ok(&mut a, &["play"]);
+        run_ok(&mut a, &["pause"]);
+
+        // Pausing holds the sound, not the graph: a gain still lands, and
+        // saying so is not the reply's business.
+        let out = run_ok(&mut a, &["set", "track.0.volume", "0.5"]);
+        assert!(!out.contains("note:"), "a paused graph takes a gain: {out}");
+        let out = run_ok(&mut a, &["apply"]);
+        assert!(out.contains("ok: nothing pending"), "{out}");
+        let out = run_ok(&mut a, &["resume"]);
+        assert!(out.contains("ok: playing from"), "{out}");
+        assert_eq!(plays(&a), 1, "nothing was rebuilt on the way back");
+
+        // A structural edit while paused cannot land, and resume must not
+        // drop it: the old trap was an `ok:` that never took effect.
+        run_ok(&mut a, &["pause"]);
+        let out = run_ok(&mut a, &["take", "0", "1"]);
+        assert!(out.contains("note: lands at next apply"), "{out}");
+        let out = run_ok(&mut a, &["resume"]);
+        assert!(out.contains("ok: playing from"), "{out}");
+        assert_eq!(plays(&a), 2, "resume gave the edit its graph");
+        assert!(a.player.pending().is_empty());
     }
 
     #[test]
