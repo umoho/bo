@@ -1926,6 +1926,41 @@ mod tests {
     }
 
     #[test]
+    fn a_rebuild_that_cannot_be_built_leaves_the_sound_alone() {
+        // A rebuild used to tear the graph down first, so a source that could
+        // not be opened silenced a transport that went on reporting itself
+        // playing. The graph is built before the old one is let go, so a
+        // build that fails leaves what is sounding untouched.
+        let dir = std::env::temp_dir().join(format!("bo-graph-atomic-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tone = dir.join("tone.wav");
+        write_wav(&tone, 4.0, 440.0, 0.5);
+        let mut track = Track::named("a");
+        track.insert(clip_at(tone.to_str().unwrap(), 0, 4)).unwrap();
+
+        let (mut graph, mut output) = graph_on_a_mixer();
+        graph.play(&[track.clone()], Duration::ZERO).unwrap();
+        let _ = pull(&mut output, 4_410);
+
+        // A second clip whose file is not there: the next rebuild cannot be
+        // built at all.
+        let mut broken = track.clone();
+        let gone = dir.join("gone.wav");
+        broken.insert(clip_at(gone.to_str().unwrap(), 4, 4)).unwrap();
+        assert!(
+            graph.play(&[broken], graph.position()).is_err(),
+            "a source that cannot be opened refuses the rebuild"
+        );
+        let after = pull(&mut output, 4_410);
+        assert!(
+            peak(&after) > 0.1,
+            "and the graph that was sounding keeps sounding"
+        );
+        assert_eq!(graph.voices.len(), 1, "the old voice is still the one");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn seeking_lands_on_the_same_sample_as_decoding_forward() {
         // An in-point is promised sample-accurate, so the fast way in is only
         // worth taking if it lands exactly where the slow way would. Both are
