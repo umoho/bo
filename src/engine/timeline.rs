@@ -22,6 +22,7 @@ pub struct Timeline {
 /// One track's contribution to the mix: gain and the clips that actually play.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TrackPlan {
+    index: usize,
     gain: f32,
     muted: bool,
     clips: Vec<ClipPlan>,
@@ -31,6 +32,9 @@ pub struct TrackPlan {
 /// and how much silence comes before it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ClipPlan {
+    /// The clip's stable id, so a running mix can be told which of its voices
+    /// a later edit (`set clip.T.ID.gain`) means.
+    pub id: u64,
     /// Address of the source.
     pub uri: String,
     /// The slice's in-point, measured into the source: reading starts at
@@ -54,11 +58,14 @@ impl Timeline {
     /// Resolve an arrangement into a schedule from playhead `at`.
     ///
     /// Every clip already has a known finite length (the put command probes
-    /// sources with no out-point), so planning cannot fail.
+    /// sources with no out-point), so planning cannot fail. Empty tracks are
+    /// dropped, so a [`TrackPlan`]'s index is its position in `tracks`, not
+    /// in the plan — planning one track at a time (to extend a running
+    /// queue) still addresses it correctly.
     pub fn plan(tracks: &[Track], at: Duration) -> Self {
         let mut planned_tracks = Vec::new();
         let mut end = Duration::ZERO;
-        for track in tracks {
+        for (index, track) in tracks.iter().enumerate() {
             if track.clips().is_empty() {
                 continue;
             }
@@ -81,6 +88,7 @@ impl Timeline {
                     None => clip.at.saturating_sub(at),
                 };
                 clips.push(ClipPlan {
+                    id: clip.id,
                     uri: clip.source.uri.clone(),
                     from: clip.from,
                     into,
@@ -96,6 +104,7 @@ impl Timeline {
                 continue;
             }
             planned_tracks.push(TrackPlan {
+                index,
                 gain: track.volume(),
                 muted: track.muted(),
                 clips,
@@ -142,6 +151,13 @@ impl Timeline {
 }
 
 impl TrackPlan {
+    /// Which of the planned tracks this is: its index in the slice `plan`
+    /// was given.
+    #[must_use]
+    pub fn index(&self) -> usize {
+        self.index
+    }
+
     /// Gain of this track in the mix.
     #[must_use]
     pub fn gain(&self) -> f32 {
@@ -236,6 +252,26 @@ mod tests {
         let mut plan = Timeline::plan(&[track_with(vec![Clip::new(src("a.wav"), secs(10))])], secs(3));
         plan.truncate(secs(4));
         assert_eq!(plan.tracks()[0].clips()[0].length, secs(4), "entered 3s in, keep 4s");
+    }
+
+    #[test]
+    fn plan_carries_the_identity_of_what_it_scheduled() {
+        // A live mix must be able to tell which track and which clip a plan
+        // line came from, or an edit can never be landed on the graph that
+        // is already running. Empty tracks are dropped from the plan, so the
+        // track index has to be the one in the slice `plan` was given; clip
+        // ids are the model's stable handles, never reused.
+        let mut a = track_with(vec![
+            Clip::new(src("a.wav"), secs(5)),
+            Clip::new(src("b.wav"), secs(5)).at(secs(5)),
+            Clip::new(src("c.wav"), secs(5)).at(secs(10)),
+        ]);
+        assert!(a.remove(1).is_some());
+        let plan = Timeline::plan(&[Track::new(), a], Duration::ZERO);
+        assert_eq!(plan.tracks().len(), 1, "the empty track is dropped");
+        assert_eq!(plan.tracks()[0].index(), 1, "…but its index survives");
+        let ids: Vec<u64> = plan.tracks()[0].clips().iter().map(|c| c.id).collect();
+        assert_eq!(ids, vec![0, 2], "clip ids, not positions in the queue");
     }
 
     #[test]
