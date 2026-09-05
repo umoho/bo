@@ -19,6 +19,7 @@ What it is **not** — yet — is a DAW: no pan, no effects, no automation, and 
 - **Arrangement as data** — tracks and clips live in the session, not in files. `save`/`load` serialize them as the very commands that built them.
 - **Built for agents** — one command per invocation, machine-readable replies, stable exit codes: 2 for misuse, 1 for a refused operation.
 - **Play it live, or render it offline** — audition from the playhead mid-edit, play a finished arrangement out end to end (rodio), or mix the whole arrangement — or just a range — to a wav file.
+- **Edit while it plays** — a gain, a fade or a mute lands on the running mix as it is set, and a clip placed past the end of a track's queue joins that queue, so a show can be remixed and extended on air. `apply` is left for what a running mix cannot take itself — a clip taken or moved — and rebuilds it from where the audio really is, not from a wall clock.
 - **Silent fallback** — with no audio device the daemon still runs; set `BO_BACKEND=silent` for deterministic, headless tests and CI.
 - **Self-cleaning** — the daemon exits and removes its socket when playback finishes, on `stop`, or after `BO_IDLE_TIMEOUT` seconds of silence (default 600, `0` disables).
 - **Slicing, not files** — `uri,from-to` places any slice of a source anywhere on the timeline; in-points are sample-accurate in live play and offline render alike; no trimming, no copies.
@@ -53,13 +54,23 @@ ok: 1 clip on track 1
   clip #0 'voice.wav' 00:00:00.000-00:00:30.000 @ 00:00:00.000
 $ bo play
 ok: 2 tracks, 2 clips, ends 00:00:30.000, playing from 00:00:00.000
-$ bo set track.0.volume 0.4   # duck the bed under the voice
+$ bo set track.0.volume 0.4   # duck the bed under the voice, as it plays
 ok: `track.0.volume` set to `0.40`
-$ bo apply                    # make the change audible now
-ok: rebuilt from 00:00:00.000
+$ bo put outro.wav,00:00:00-00:00:10 0@00:00:30   # queue on, mid-playback
+ok: 1 clip on track 0
+  clip #1 'outro.wav' 00:00:00.000-00:00:10.000 @ 00:00:30.000
+$ bo apply                    # nothing was left waiting
+ok: nothing pending
 $ bo stop                     # end the session; the daemon cleans up
 ok: stopped
 ```
+
+Edits take effect as they are made: a gain or a fade goes into the chain that
+is playing it, and a clip placed past the end of a track's queue joins the
+running queue. `apply` is for the edits a running mix cannot take itself — a
+clip taken or moved — and rebuilds the mix from where the audio really is;
+one that has to wait says so on a `note:` line, and `ls` counts what is
+waiting as `pending=N`.
 
 ## License
 
