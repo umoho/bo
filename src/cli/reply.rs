@@ -18,7 +18,7 @@
 use std::fmt;
 use std::time::Duration;
 
-use bo::engine::rodio::SourceLength;
+use bo::engine::rodio::{Probing, SourceLength};
 use bo::engine::{Landed, State};
 use bo::track::FadeShape;
 
@@ -151,7 +151,7 @@ pub(crate) enum SetResult {
 #[derive(Debug)]
 pub(crate) struct ProbeResult {
     pub(crate) uri: String,
-    pub(crate) outcome: Result<SourceLength, String>,
+    pub(crate) outcome: Result<Probing, String>,
 }
 
 /// One clip audible at `at <t>`.
@@ -294,6 +294,8 @@ pub(crate) enum Output {
     Probed {
         uri: String,
         length: SourceLength,
+        /// Interleaved channels of the source, as decoded.
+        channels: u16,
     },
     ProbedMany {
         sources: Vec<ProbeResult>,
@@ -557,12 +559,22 @@ impl fmt::Display for Output {
                 }
                 Ok(())
             }
-            Self::Probed { uri, length } => match length {
+            Self::Probed {
+                uri,
+                length,
+                channels,
+            } => match length {
                 SourceLength::Exact(d) => {
-                    writeln!(f, "ok: {} duration={}", quote(uri), Tc(*d))
+                    writeln!(f, "ok: {} duration={} channels={}", quote(uri), Tc(*d), channels)
                 }
                 SourceLength::Estimated(d) => {
-                    writeln!(f, "ok: {} duration={} estimated", quote(uri), Tc(*d))
+                    writeln!(
+                        f,
+                        "ok: {} duration={} estimated channels={}",
+                        quote(uri),
+                        Tc(*d),
+                        channels
+                    )
                 }
             },
             Self::ProbedMany { sources } => {
@@ -586,12 +598,26 @@ impl fmt::Display for Output {
                 }
                 for s in sources {
                     match &s.outcome {
-                        Ok(SourceLength::Exact(d)) => {
-                            writeln!(f, "  {} duration={}", quote(&s.uri), Tc(*d))?
-                        }
-                        Ok(SourceLength::Estimated(d)) => {
-                            writeln!(f, "  {} duration={} estimated", quote(&s.uri), Tc(*d))?
-                        }
+                        Ok(Probing {
+                            length: SourceLength::Exact(d),
+                            channels,
+                        }) => writeln!(
+                            f,
+                            "  {} duration={} channels={}",
+                            quote(&s.uri),
+                            Tc(*d),
+                            channels
+                        )?,
+                        Ok(Probing {
+                            length: SourceLength::Estimated(d),
+                            channels,
+                        }) => writeln!(
+                            f,
+                            "  {} duration={} estimated channels={}",
+                            quote(&s.uri),
+                            Tc(*d),
+                            channels
+                        )?,
                         Err(e) => writeln!(f, "  {} error={e}", quote(&s.uri))?,
                     }
                 }
@@ -823,6 +849,7 @@ pub(crate) fn example_reply(command: &str) -> Option<String> {
             // Containers that state no length (a vbr mp3 without a Xing/Info
             // frame) are decoded to their end and marked as estimated.
             length: SourceLength::Estimated(s(30)),
+            channels: 2,
         },
         "set" => Output::Set {
             result: SetResult::TrackVolume { i: 0, v: 0.4 },

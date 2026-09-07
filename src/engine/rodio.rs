@@ -651,8 +651,9 @@ impl<I: Source> Iterator for Panner<I> {
                     // 5.1 in L R C LFE Ls Rs order: BS.775 downmix to the
                     // front pair (center and surrounds at −3.01 dB, LFE
                     // dropped), then balanced.
-                    let l = self.buf[0] + 0.70710678 * self.buf[2] + 0.70710678 * self.buf[4];
-                    let r = self.buf[1] + 0.70710678 * self.buf[2] + 0.70710678 * self.buf[5];
+                    let c = std::f32::consts::FRAC_1_SQRT_2;
+                    let l = self.buf[0] + c * self.buf[2] + c * self.buf[4];
+                    let r = self.buf[1] + c * self.buf[2] + c * self.buf[5];
                     (l * gl, r * gr)
                 }
                 _ => {
@@ -1131,15 +1132,27 @@ impl SourceLength {
     }
 }
 
+/// What probing a source learned: its length and its channel layout.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Probing {
+    /// How long the source plays, and how that was learned.
+    pub length: SourceLength,
+    /// Interleaved channels per frame, as decoded. A mono source reads 1, a
+    /// stereo pair 2, a surround file its own count.
+    pub channels: u16,
+}
+
 /// Learn a source's length — from its container when the container states
-/// one, otherwise by decoding to the end. Pure decoding, no device needed,
-/// so it works headless (`bo probe <uri>`, tests, CI). Fails only when the
-/// file cannot be opened or decoded at all.
-pub fn measure(uri: &str) -> Result<SourceLength, String> {
+/// one, otherwise by decoding to the end — and its channel count. Pure
+/// decoding, no device needed, so it works headless (`bo probe <uri>`, tests,
+/// CI). Fails only when the file cannot be opened or decoded at all.
+pub fn measure(uri: &str) -> Result<Probing, String> {
     let file = File::open(uri).map_err(|e| format!("cannot open {uri}: {e}"))?;
     let decoder = Decoder::new(BufReader::new(file))
         .map_err(|e| format!("cannot decode {uri}: {e}"))?;
-    Ok(measure_source(decoder))
+    let channels = decoder.channels().get();
+    let length = measure_source(decoder);
+    Ok(Probing { length, channels })
 }
 
 /// Classify a decoder's length: exact when the container states it, otherwise
@@ -1165,15 +1178,14 @@ fn decode_to_end<D: Source>(mut source: D) -> Duration {
 }
 
 /// Measure a source's length as a plain duration, exact or estimated — the
-/// form put and planning need. `bo probe` reports which kind it got.
+/// form put and planning need.
 pub fn probe(uri: &str) -> Result<Duration, String> {
-    measure(uri).map(SourceLength::duration)
+    measure(uri).map(|p| p.length.duration())
 }
 
-/// Measure every distinct source in the arrangement: the uri plus how its
-/// length was learned, or why it could not be measured. Duplicate uris are
-/// probed once.
-pub fn probe_sources(tracks: &[Track]) -> Vec<(String, Result<SourceLength, String>)> {
+/// Measure every distinct source in the arrangement: the uri plus what was
+/// learned, or why it could not be measured. Duplicate uris are probed once.
+pub fn probe_sources(tracks: &[Track]) -> Vec<(String, Result<Probing, String>)> {
     let mut seen = std::collections::HashSet::new();
     let mut results = Vec::new();
     for track in tracks {
@@ -1360,10 +1372,9 @@ mod tests {
         let decoder = Decoder::new(BufReader::new(File::open(path).unwrap())).unwrap();
         let channels = decoder.channels().get() as usize;
         let mut peaks = vec![0.0f32; channels];
-        let mut n = 0usize;
-        for s in decoder {
-            peaks[n % channels] = peaks[n % channels].max(s.abs());
-            n += 1;
+        for (n, s) in decoder.enumerate() {
+            let ch = n % channels;
+            peaks[ch] = peaks[ch].max(s.abs());
         }
         peaks
     }
@@ -1835,12 +1846,13 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let a = dir.join("a.wav");
         write_wav_full(&a, 1.0, 440.0, 0.5, 44_100, 2, 16);
-        let length = measure(a.to_str().unwrap()).unwrap();
+        let probing = measure(a.to_str().unwrap()).unwrap();
         assert!(
-            matches!(length, SourceLength::Exact(_)),
-            "a wav states its length: {length:?}"
+            matches!(probing.length, SourceLength::Exact(_)),
+            "a wav states its length: {probing:?}"
         );
-        let d = length.duration();
+        assert_eq!(probing.channels, 2, "the probe reports the layout");
+        let d = probing.length.duration();
         assert!((d.as_secs_f64() - 1.0).abs() < 0.05, "{d:?}");
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1866,12 +1878,12 @@ mod tests {
             let w = hound::WavWriter::create(&zero, spec).unwrap();
             w.finalize().unwrap();
         }
-        let length = measure(zero.to_str().unwrap()).unwrap();
+        let probing = measure(zero.to_str().unwrap()).unwrap();
         assert!(
-            matches!(length, SourceLength::Estimated(_)),
-            "no frames in the header, so the length is decoded: {length:?}"
+            matches!(probing.length, SourceLength::Estimated(_)),
+            "no frames in the header, so the length is decoded: {probing:?}"
         );
-        assert_eq!(length.duration(), Duration::ZERO);
+        assert_eq!(probing.length.duration(), Duration::ZERO);
 
         // An infinite source (SineWave) never states a length either; a
         // bounded take lands close to its bound.

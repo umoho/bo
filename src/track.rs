@@ -273,23 +273,12 @@ impl std::error::Error for Overlap {}
 /// A track is content only: what plays, and when. How it sounds in the mix —
 /// its gain, its mute, where it sits — lives on its [`Output`], the edge that
 /// carries this track's signal into the bus layer.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Track {
     name: Option<String>,
     out: Output,
     clips: Vec<Clip>,
     next_id: u64,
-}
-
-impl Default for Track {
-    fn default() -> Self {
-        Self {
-            name: None,
-            out: Output::default(),
-            clips: Vec::new(),
-            next_id: 0,
-        }
-    }
 }
 
 impl Track {

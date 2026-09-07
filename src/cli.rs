@@ -49,10 +49,11 @@
 //!   appended to it. `apply` is for what a running graph cannot take — a clip
 //!   taken or moved — and rebuilds the graph from where the audio really is.
 //! * `set <var> <value>` — set an attribute and land it: `master` (always
-//!   real-time), or `track.N.volume` / `track.N.muted` / `track.N.name` /
+//!   real-time), or `track.N.volume` / `track.N.pan` / `track.N.muted` /
+//!   `track.N.name` /
 //!   `clip.N.N.gain` / `clip.N.N.fade_in` / `clip.N.N.fade_in_from` /
 //!   `clip.N.N.fade_out` / `clip.N.N.fade_out_to` / `clip.N.N.fade_shape`.
-//!   Gains and fades land on the running graph; a name is a label, and an
+//!   Gains, pans and fades land on the running graph; a name is a label, and an
 //!   edit made while nothing plays lands at the next `play`.
 //! * `take <track> <clip>` — remove a clip; the clip is addressed by its
 //!   stable id or an `@timecode` (the clip covering that moment).
@@ -76,10 +77,10 @@
 //!   cannot state rates at most a note, since no clip depends on a measured
 //!   length — open-ended puts probed theirs when placed, and every clip
 //!   carries a finite out-point.
-//! * `probe [uri]` — measure the length of a source, or of every distinct
-//!   source in the arrangement; a bare uri is probed locally, no daemon. A
-//!   source whose container states no length is decoded to its end and the
-//!   reply marks it `estimated`.
+//! * `probe [uri]` — measure the length and channel count of a source, or of
+//!   every distinct source in the arrangement; a bare uri is probed locally,
+//!   no daemon. A source whose container states no length is decoded to its
+//!   end and the reply marks it `estimated`.
 //! * `ls` — dump the arrangement: an `ok:` reply, a session line
 //!   (`stopped, playhead at …, '…' backend, end=…, master=…,
 //!   idle_timeout=…`), then one track block per track with indented
@@ -123,7 +124,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use bo::engine::rodio::{
-    measure, probe, probe_sources, render_and_measure, render_to_file, Rodio, SourceLength,
+    measure, probe, probe_sources, render_and_measure, render_to_file, Probing, Rodio, SourceLength,
 };
 use bo::engine::{Applied, Backend, BackendError, Change, Landed, Player, Silent, State};
 use bo::track::{Clip, Fade, FadeShape, Source, Track};
@@ -467,9 +468,10 @@ Arrangement:
   check                    verify every source is readable; unreadable
                            sources are problems (exit 1), sources with no
                            measurable length rate at most a note
-  probe [uri]              measure a source's length; a length the container
-                           cannot state is decoded and marked estimated;
-                           without a uri, every source in the arrangement
+  probe [uri]              measure a source's length and channels; a length
+                           the container cannot state is decoded and marked
+                           estimated; without a uri, every source in the
+                           arrangement
 
 Mix:
   set master <v>           set the master gain, 0..1
@@ -910,7 +912,15 @@ fn dispatch(a: &mut Arrangement, command: Command, cwd: &str) -> Result<Output, 
             // measured length. It rates at most a note.
             let estimated = outcomes
                 .iter()
-                .filter(|(_, r)| matches!(r, Ok(SourceLength::Estimated(_))))
+                .filter(|(_, r)| {
+                    matches!(
+                        r,
+                        Ok(Probing {
+                            length: SourceLength::Estimated(_),
+                            ..
+                        })
+                    )
+                })
                 .count();
             let has_problem = !problems.is_empty();
             let out = Output::Check {
@@ -1579,9 +1589,10 @@ fn parse_bool(s: &str) -> Result<bool, String> {
 /// the wire.
 fn probe_uri(uri: &str) -> Result<Output, (i32, String)> {
     match measure(uri) {
-        Ok(length) => Ok(Output::Probed {
+        Ok(Probing { length, channels }) => Ok(Output::Probed {
             uri: uri.to_string(),
             length,
+            channels,
         }),
         Err(e) => Err(fail(e)),
     }
@@ -3404,12 +3415,14 @@ mod tests {
         let mut a = Arrangement::default();
         let out = run_ok(&mut a, &["probe", path.as_str()]);
         assert!(out.contains("duration=00:00:00.200"), "{out}");
+        assert!(out.contains("channels=1"), "probe reports the layout: {out}");
         assert_eq!(a.player.tracks().len(), 0, "a bare probe touches nothing");
 
         run_ok(&mut a, &["put", path.as_str()]);
         let out = run_ok(&mut a, &["probe"]);
         assert!(out.contains("ok: 1 source"), "{out}");
         assert!(out.contains("00:00:00.200"), "{out}");
+        assert!(out.contains("channels=1"), "the arrangement probe reports the layout: {out}");
 
         // A source that cannot be opened is reported, and fails the probe.
         run_ok(&mut a, &["put", "/nonexistent.wav,00:00:00-00:00:10"]);

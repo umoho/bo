@@ -194,6 +194,12 @@ fn client_spawns_a_daemon_and_it_cleans_up_when_done() {
     let out = bo(&sp, &["set", "track.0.volume", "0.25"]);
     assert!(out.contains("`track.0.volume` set to `0.25`"), "{out}");
 
+    // Placement rides the same wire, clamps, and shows on ls.
+    let out = bo(&sp, &["set", "track.0.pan", "-1"]);
+    assert!(out.contains("`track.0.pan` set to `-1.00`"), "{out}");
+    let out = bo(&sp, &["ls"]);
+    assert!(out.contains("pan=-1.00"), "{out}");
+
     // Play the 0.4s arrangement: the daemon exits and removes its socket.
     let out = bo(&sp, &["play"]);
     assert!(out.contains("playing from"), "{out}");
