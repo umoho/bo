@@ -12,9 +12,10 @@
 //!   timelines. Content answers *what* plays and *when*; it holds no signal
 //!   state.
 //! * [`bus`] — the signal layer: [`bus::Output`] (a track's edge into the
-//!   mix, carrying gain, mute and placement) and [`bus::Bus`] (the node it
-//!   feeds — master today, groups later). Signal answers *where the sound
-//!   goes*; it holds no content.
+//!   mix, carrying gain, mute and placement) and the bus nodes it feeds —
+//!   the master ([`bus::Bus`]) and the group buses ([`bus::Group`]) several
+//!   tracks can be routed into so one strip ducks them together. Signal
+//!   answers *where the sound goes*; it holds no content.
 //! * [`engine`] — [`engine::Player`]: transport state over stacked tracks,
 //!   with an [`engine::Backend`] seam for whatever actually makes sound.
 
