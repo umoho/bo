@@ -1,13 +1,16 @@
-//! The three data structures that describe sound: [`Source`] (an addressable
-//! audio resource), [`Clip`] (a slice of a source, placed at a timecode on a
-//! track) and [`Track`] (a timeline of non-overlapping clips).
+//! The content layer: the three data structures that describe *what plays and
+//! when* — [`Source`] (an addressable audio resource), [`Clip`] (a slice of a
+//! source, placed at a timecode on a track) and [`Track`] (a container of
+//! clips on one parallel timeline).
 //!
 //! Timecodes are `std::time::Duration` measured from their own origin: a clip's
 //! `from`/`to` count from the start of the source, a clip's `at` and a player's
 //! playhead count from the start of the track.
 //!
-//! Kept deliberately small: no transport, no decoding, no metadata — just the
-//! shape those layers will sit on.
+//! Kept deliberately small, and deliberately apart from the signal layer
+//! ([`crate::bus`]): nothing here says how a sound is *mixed* — that lives on
+//! a track's output edge, not on the content. No transport, no decoding, no
+//! metadata — just the shape those layers will sit on.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -264,15 +267,21 @@ impl std::fmt::Display for Overlap {
 
 impl std::error::Error for Overlap {}
 
-/// One timeline: clips sorted by start position, never overlapping.
+/// The content layer's unit: a track is a container of clips on one parallel
+/// timeline — nothing more.
 ///
-/// Non-overlap is this type's invariant — a single track cannot play two
-/// sources at the same timecode. Stacking happens *across* tracks, which is what
-/// [`Player`](crate::engine::Player) mixes.
+/// It answers *what* plays and *when*: clips sorted by start position, never
+/// overlapping (a single track cannot play two sources at the same timecode;
+/// stacking happens *across* tracks, which is what
+/// [`Player`](crate::engine::Player) mixes).
 ///
-/// A track is content only: what plays, and when. How it sounds in the mix —
-/// its gain, its mute, where it sits — lives on its [`Output`], the edge that
-/// carries this track's signal into the bus layer.
+/// How a track *sounds* is not content, and does not live here: its gain,
+/// its mute and where it sits in the mix belong to its [`Output`] — the
+/// signal-layer edge (see [`crate::bus`]) that carries this track's clips
+/// into a bus. Content is what plays; the signal layer is where the sound
+/// goes. Neither borrows the other's concepts, so a track never mixes a
+/// signal input in beside its clips, and the signal layer never grows a
+/// timeline.
 #[derive(Debug, Clone, Default)]
 pub struct Track {
     name: Option<String>,

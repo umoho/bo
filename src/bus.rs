@@ -1,11 +1,12 @@
 //! The signal layer: a track's output edge ([`Output`]) and the bus nodes
 //! ([`Bus`]) it feeds into.
 //!
-//! Kept apart from the content layer on purpose: a [`Track`] is a parallel
-//! timeline of clips — *what* plays, *when*; this module is *where the sound
-//! goes*. Each track has exactly one output edge that carries its strip
-//! (gain, mute, placement) and points at a bus; a bus sums whatever outputs
-//! point at it. Today that is one bus, `Master`; a `Group` bus between the
+//! Kept apart from the content layer ([`crate::track`]) on purpose: a
+//! [`Track`](crate::track::Track) there is a container of clips on a
+//! timeline — *what* plays, *when* — and nothing else; this module is *where
+//! the sound goes*. A track reaches into the signal layer through exactly one
+//! edge, its output, which carries the strip (gain, mute, placement) and
+//! points at a bus. Today that is one bus, `Master`; a `Group` bus between the
 //! tracks and the master is the shape a later "route several tracks into one
 //! strip" feature grows into, and a layout beyond stereo is where 5.1/7.1
 //! would land. None of those exist yet; the enums keep their seams.

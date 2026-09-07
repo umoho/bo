@@ -1,7 +1,7 @@
 //! [`Rodio`]: a real audio [`Backend`] over the system output device.
 //!
 //! The arrangement maps onto rodio's model one to one: each non-empty track
-//! becomes a [`Voice`] — a [`Player`] on the device's mixer, holding a queue
+//! becomes a *voice* — a [`Player`] on the device's mixer, holding a queue
 //! of the clips still to come — at the track's gain times the master; each
 //! clip becomes a decoded source, positioned at its in-point, cut short, and
 //! delayed so it lands at its timecode.
