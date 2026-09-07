@@ -32,12 +32,12 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use rodio::mixer::{self, Mixer};
+use rodio::mixer::{self, Mixer, MixerSource};
 use rodio::math::nz;
 use rodio::source::from_factory;
 use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink, Player, Sample, Source};
 
-use crate::bus::Group;
+use crate::bus::{BusRef, Group};
 use crate::engine::measure::{Measurement, Meter};
 use crate::engine::timeline::{ClipPlan, Timeline};
 use crate::engine::{Backend, BackendError, Change};
@@ -126,6 +126,17 @@ struct Graph {
     /// store to this cell — the running mix never needs rebuilding.
     master: GainCell,
     voices: Vec<Voice>,
+    /// Group buses materialized for the graph that is sounding now: one
+    /// stereo mixer per group that has voices, its output carrying the
+    /// group's baked strip into the master bus. Buses are rebuilt whenever
+    /// the graph is — a fresh mixer and strip per build, the old chain
+    /// ending as the voices it carried are let go.
+    buses: Vec<BusNode>,
+    /// The group table this graph was built from: read to bake strips, and
+    /// to materialize a bus when an appended clip needs one mid-flight. Only
+    /// a rebuild can change a group strip, so this snapshot cannot drift
+    /// from what the graph sounds.
+    groups: Vec<Group>,
     clock: Arc<Clock>,
     /// The timecode the graph was built from, and the clock's reading at that
     /// moment: where the sound is, is `at` plus the frames pulled since.
@@ -135,11 +146,25 @@ struct Graph {
     paused: bool,
 }
 
+/// One materialized group bus in the live graph: the stereo mixer its
+/// members' voices feed, whose output carries the group's baked strip into
+/// the master bus.
+struct BusNode {
+    /// The group id [`crate::bus::BusRef::Group`] names it by.
+    id: u64,
+    /// The mixer this group's voices feed.
+    mixer: Mixer,
+}
+
 /// One track's place in the mix.
 struct Voice {
     /// The track this voice sounds.
     track: usize,
     player: Player,
+    /// The group bus this voice feeds, `None` when it feeds the master
+    /// directly. A voice's attachment must match its track's current target,
+    /// or the graph that built it is stale and needs a rebuild.
+    group: Option<u64>,
     /// The track's own gain as built — its volume, or zero when muted. Kept
     /// so the track's strip can move without a rebuild; the master is not
     /// here, it sits on the bus's output.
@@ -252,6 +277,8 @@ impl Graph {
             bus,
             master,
             voices: Vec::new(),
+            buses: Vec::new(),
+            groups: Vec::new(),
             clock,
             base_at: Duration::ZERO,
             base_frames: 0,
@@ -277,7 +304,10 @@ impl Graph {
     /// pull. Letting go is a drop, not rodio's `clear()`: `clear()` blocks
     /// until the audio thread has drained the queue, which is a device buffer
     /// of silence waiting to happen.
-    fn play(&mut self, tracks: &[Track], _groups: &[Group], at: Duration) -> Result<(), String> {
+    fn play(&mut self, tracks: &[Track], groups: &[Group], at: Duration) -> Result<(), String> {
+        // The table this graph will sound: read to bake strips when voices
+        // are attached, and when an append materializes a bus mid-flight.
+        self.groups = groups.to_vec();
         let built = self.build(tracks, at)?;
         let old = std::mem::replace(&mut self.voices, built);
         self.base_at = at;
@@ -299,7 +329,13 @@ impl Graph {
     /// before any of them is attached, because a half-attached mix is audible
     /// as one — the tracks that arrived early would play alone until the slow
     /// ones caught up.
-    fn build(&self, tracks: &[Track], at: Duration) -> Result<Vec<Voice>, String> {
+    ///
+    /// Voices attach where their track's output points: straight at the
+    /// master bus, or at the group bus the track is routed to. A group bus
+    /// is materialized here — its own stereo mixer whose output, scaled by
+    /// the group's baked strip, joins the master bus — so the buses this
+    /// graph sounds always match the arrangement it was built from.
+    fn build(&mut self, tracks: &[Track], at: Duration) -> Result<Vec<Voice>, String> {
         let timeline = Timeline::plan(tracks, at);
         let mut staged = Vec::new();
         for track in timeline.tracks() {
@@ -315,6 +351,9 @@ impl Graph {
             }
             staged.push((track.index(), gain, pan, queued_until, clips));
         }
+        // The last graph's buses are ending with its voices; this build gets
+        // its own, so a strip set since the last build is the one that lands.
+        self.buses.clear();
         let mut voices = Vec::new();
         for (track, gain, pan, queued_until, clips) in staged {
             // Queue the clips *before* the voice joins the mixer: rodio
@@ -328,17 +367,63 @@ impl Graph {
                 player.pause();
             }
             let queued = Self::attach(&player, clips);
-            self.bus.add(queue);
+            let target = tracks
+                .get(track)
+                .map(Track::bus)
+                .unwrap_or(BusRef::Master);
+            let group = self.attach_voice(target, queue)?;
             voices.push(Voice {
                 track,
                 player,
                 gain,
                 pan,
+                group,
                 queued_until,
                 clips: queued,
             });
         }
         Ok(voices)
+    }
+
+    /// Attach a voice's queue where its track's output points, and say which
+    /// group bus it joined (`None` for the master).
+    fn attach_voice<S: Source + Send + 'static>(
+        &mut self,
+        target: BusRef,
+        queue: S,
+    ) -> Result<Option<u64>, String> {
+        match target {
+            BusRef::Master => {
+                self.bus.add(queue);
+                Ok(None)
+            }
+            BusRef::Group(id) => {
+                let mixer = self.group_bus(id)?;
+                mixer.add(queue);
+                Ok(Some(id))
+            }
+        }
+    }
+
+    /// The group bus for `id`, materializing it — its own stereo mixer, its
+    /// output scaled by the group's baked strip into the master bus — when
+    /// this graph does not have one yet. A group that is not in the table is
+    /// a corrupt arrangement: refuse rather than guess at a level.
+    fn group_bus(&mut self, id: u64) -> Result<Mixer, String> {
+        if let Some(node) = self.buses.iter().find(|b| b.id == id) {
+            return Ok(node.mixer.clone());
+        }
+        let (mixer, out) = mixer::mixer(
+            nz!(2),
+            std::num::NonZeroU32::new(self.rate).expect("a device rate is nonzero"),
+        );
+        let strip = group_strip(&self.groups, id)?;
+        self.bus.add(Gain::new(out, strip));
+        self.buses.push(BusNode {
+            id,
+            mixer: mixer.clone(),
+        });
+        Ok(mixer)
     }
 
     /// Queue staged clips onto `player`, keeping the handles to their
@@ -378,6 +463,7 @@ impl Graph {
             voice.player.set_volume(0.0);
         }
         drop(old);
+        self.buses.clear();
         self.paused = false;
         self.base_at = Duration::ZERO;
         self.base_frames = self.clock.frames.load(Ordering::Relaxed);
@@ -498,7 +584,20 @@ impl Graph {
         let Some(data) = tracks.get(track) else {
             return true;
         };
+        let target = data.bus();
         let existing = self.voices.iter().position(|v| v.track == track);
+        // A voice attached where its track used to point — a re-route is
+        // waiting for its rebuild — cannot take an append: the rebuild that
+        // lands the route will queue this too.
+        if let Some(i) = existing
+            && self.voices[i].group
+                != match target {
+                    BusRef::Master => None,
+                    BusRef::Group(id) => Some(id),
+                }
+        {
+            return false;
+        }
         let from = match existing {
             Some(i) if self.voices[i].queued_until >= at => self.voices[i].queued_until,
             Some(_) => {
@@ -561,12 +660,19 @@ impl Graph {
                     player.pause();
                 }
                 let queued = Self::attach(&player, staged);
-                self.bus.add(queue);
+                // A fresh voice for a grouped track materializes the group's
+                // bus if this graph does not carry it yet; a bus that is not
+                // in the table is refused here and reported by the rebuild
+                // this forces.
+                let Ok(group) = self.attach_voice(target, queue) else {
+                    return false;
+                };
                 self.voices.push(Voice {
                     track,
                     player,
                     gain,
                     pan,
+                    group,
                     queued_until,
                     clips: queued,
                 });
@@ -945,6 +1051,17 @@ impl<I: Source> Source for FadeSource<I> {
     }
 }
 
+/// A group's strip as built into a graph or a render: its gain, or silence
+/// when it is muted. A track routed to a group that is not in the table is a
+/// corrupt arrangement — refuse rather than guess at a level.
+fn group_strip(groups: &[Group], id: u64) -> Result<f32, String> {
+    groups
+        .iter()
+        .find(|g| g.id() == id)
+        .map(|g| if g.muted() { 0.0 } else { g.gain() })
+        .ok_or_else(|| format!("no bus #{id}"))
+}
+
 /// Mix the arrangement down to a wav file, offline — no device needed.
 ///
 /// The same [`Timeline`] as playback, but each track becomes a finite,
@@ -960,12 +1077,13 @@ impl<I: Source> Source for FadeSource<I> {
 /// alive with silence when empty (right for a device, infinite for a render).
 pub fn render_to_file(
     tracks: &[Track],
+    groups: &[Group],
     path: impl AsRef<std::path::Path>,
     from: Duration,
     to: Option<Duration>,
     master: f32,
 ) -> Result<Duration, String> {
-    mix(tracks, Some(path.as_ref()), from, to, master, false, false).map(|(d, _)| d)
+    mix(tracks, groups, Some(path.as_ref()), from, to, master, false, false).map(|(d, _)| d)
 }
 
 /// Render the mix as a mono delivery: every stereo frame folded to
@@ -974,12 +1092,13 @@ pub fn render_to_file(
 /// vanishing. Same staging and frame rules as [`render_to_file`].
 pub fn render_to_file_mono(
     tracks: &[Track],
+    groups: &[Group],
     path: impl AsRef<std::path::Path>,
     from: Duration,
     to: Option<Duration>,
     master: f32,
 ) -> Result<Duration, String> {
-    mix(tracks, Some(path.as_ref()), from, to, master, false, true).map(|(d, _)| d)
+    mix(tracks, groups, Some(path.as_ref()), from, to, master, false, true).map(|(d, _)| d)
 }
 
 /// Render the mix and measure it in the same pass. With `path` `Some` the
@@ -988,24 +1107,26 @@ pub fn render_to_file_mono(
 /// and the file can never disagree.
 pub fn render_and_measure(
     tracks: &[Track],
+    groups: &[Group],
     path: Option<&std::path::Path>,
     from: Duration,
     to: Option<Duration>,
     master: f32,
 ) -> Result<(Duration, Measurement), String> {
-    mix(tracks, path, from, to, master, true, false).map(|(d, m)| (d, m.expect("measured")))
+    mix(tracks, groups, path, from, to, master, true, false).map(|(d, m)| (d, m.expect("measured")))
 }
 
 /// Measure the mono fold of the mix — the numbers a mono delivery is judged
 /// by — without (or with) writing it.
 pub fn render_and_measure_mono(
     tracks: &[Track],
+    groups: &[Group],
     path: Option<&std::path::Path>,
     from: Duration,
     to: Option<Duration>,
     master: f32,
 ) -> Result<(Duration, Measurement), String> {
-    mix(tracks, path, from, to, master, true, true).map(|(d, m)| (d, m.expect("measured")))
+    mix(tracks, groups, path, from, to, master, true, true).map(|(d, m)| (d, m.expect("measured")))
 }
 
 /// One mix pass over the shared [`Timeline`]: build the 44.1 kHz stereo
@@ -1024,8 +1145,13 @@ pub fn render_and_measure_mono(
 /// final ~23µs, possible when a range cuts a stereo source mid-frame — is
 /// dropped, so the writer always finalizes a frame-aligned stream and the
 /// file and the meter can never disagree.
+/// The one mix pass shared by every render entry point: `tracks` and their
+/// routing, the group table, the optional writer, the range, the master
+/// scale, and what to report.
+#[allow(clippy::too_many_arguments)]
 fn mix(
     tracks: &[Track],
+    groups: &[Group],
     path: Option<&std::path::Path>,
     from: Duration,
     to: Option<Duration>,
@@ -1039,6 +1165,11 @@ fn mix(
         timeline.truncate(to.saturating_sub(from));
     }
     let (input, source) = mixer::mixer(nz!(2), nz!(44100));
+    // Group buses, materialized per group id as its tracks appear: each gets
+    // its own mixer, and after the track loop its output joins the master
+    // mixer scaled by the group's strip — the same routing the live graph
+    // builds, so a rendered file sounds like the session.
+    let mut buses: Vec<(u64, Mixer, MixerSource)> = Vec::new();
     for track in timeline.tracks() {
         let gain = if track.muted() { 0.0 } else { track.gain() };
         let pan = GainCell::new(track.pan());
@@ -1050,7 +1181,24 @@ fn mix(
         }
         let mut pending = pending.into_iter();
         let track_source = from_factory(move || pending.next());
-        input.add(Gain::new(track_source, gain));
+        match tracks[track.index()].bus() {
+            BusRef::Master => input.add(Gain::new(track_source, gain)),
+            BusRef::Group(id) => {
+                if !buses.iter().any(|(gid, _, _)| *gid == id) {
+                    let (mixer, out) = mixer::mixer(nz!(2), nz!(44100));
+                    buses.push((id, mixer, out));
+                }
+                let (_, mixer, _) = buses
+                    .iter_mut()
+                    .find(|(gid, _, _)| *gid == id)
+                    .expect("a group bus was just pushed");
+                mixer.add(Gain::new(track_source, gain));
+            }
+        }
+    }
+    for (id, _, out) in buses {
+        let strip = group_strip(groups, id)?;
+        input.add(Gain::new(out, strip));
     }
     // Stage the file next to its target so the final rename stays on one
     // filesystem; `tempfile` also deletes the staging file on any early
@@ -1165,10 +1313,10 @@ impl Backend for Renderer {
     fn play(
         &mut self,
         tracks: &[Track],
-        _groups: &[Group],
+        groups: &[Group],
         at: Duration,
     ) -> Result<(), BackendError> {
-        render_to_file(tracks, &self.path, at, None, self.master)
+        render_to_file(tracks, groups, &self.path, at, None, self.master)
             .map_err(|e| BackendError::new("render", e))?;
         Ok(())
     }
@@ -1528,7 +1676,7 @@ mod tests {
         voice.set_volume(0.5);
 
         let out = dir.join("out.wav");
-        let duration = render_to_file(&[bed, voice], &out, Duration::ZERO, None, 1.0).unwrap();
+        let duration = render_to_file(&[bed, voice], &[], &out, Duration::ZERO, None, 1.0).unwrap();
         assert_eq!(duration, Duration::from_millis(1500), "end of the last clip");
 
         let decoder = Decoder::new(BufReader::new(File::open(&out).unwrap())).unwrap();
@@ -1578,14 +1726,14 @@ mod tests {
         silent.set_muted(true);
 
         let out = dir.join("out.wav");
-        render_to_file(&[loud.clone(), silent.clone()], &out, Duration::ZERO, None, 1.0).unwrap();
+        render_to_file(&[loud.clone(), silent.clone()], &[], &out, Duration::ZERO, None, 1.0).unwrap();
         let decoder = Decoder::new(BufReader::new(File::open(&out).unwrap())).unwrap();
         let (peak, samples) = decoder.fold((0.0f32, 0u64), |(peak, n), s| (peak.max(s.abs()), n + 1));
         assert!(samples > 1000, "rendered a real mix, not a stub");
         assert!(peak > 0.1, "the loud track is audible, peak {peak}");
 
         let out = dir.join("out-muted.wav");
-        render_to_file(&[silent], &out, Duration::ZERO, None, 1.0).unwrap();
+        render_to_file(&[silent], &[], &out, Duration::ZERO, None, 1.0).unwrap();
         let decoder = Decoder::new(BufReader::new(File::open(&out).unwrap())).unwrap();
         let (peak, _) = decoder.fold((0.0f32, 0u64), |(peak, n), s| (peak.max(s.abs()), n + 1));
         assert!(peak < 1e-6, "a muted track contributes nothing, peak {peak}");
@@ -1605,7 +1753,7 @@ mod tests {
         track.insert(clip_at(a.to_str().unwrap(), 0, 1)).unwrap();
 
         let out = dir.join("out.wav");
-        render_to_file(&[track], &out, Duration::ZERO, None, 1.0).unwrap();
+        render_to_file(&[track], &[], &out, Duration::ZERO, None, 1.0).unwrap();
         let peaks = channel_peaks(&out);
         assert_eq!(peaks.len(), 2, "stereo render");
         let want = 0.5 * std::f32::consts::FRAC_1_SQRT_2;
@@ -1627,7 +1775,7 @@ mod tests {
         left.insert(clip_at(uri, 0, 1)).unwrap();
         left.set_pan(-1.0);
         let lout = dir.join("left.wav");
-        render_to_file(&[left], &lout, Duration::ZERO, None, 1.0).unwrap();
+        render_to_file(&[left], &[], &lout, Duration::ZERO, None, 1.0).unwrap();
         let lp = channel_peaks(&lout);
         assert!((lp[0] - 0.5).abs() < 0.02, "left side full, got {}", lp[0]);
         assert!(lp[1] < 0.01, "right side silent, got {}", lp[1]);
@@ -1636,7 +1784,7 @@ mod tests {
         right.insert(clip_at(uri, 0, 1)).unwrap();
         right.set_pan(1.0);
         let rout = dir.join("right.wav");
-        render_to_file(&[right], &rout, Duration::ZERO, None, 1.0).unwrap();
+        render_to_file(&[right], &[], &rout, Duration::ZERO, None, 1.0).unwrap();
         let rp = channel_peaks(&rout);
         assert!(rp[0] < 0.01, "left side silent, got {}", rp[0]);
         assert!((rp[1] - 0.5).abs() < 0.02, "right side full, got {}", rp[1]);
@@ -1657,7 +1805,7 @@ mod tests {
         let mut center = Track::named("center");
         center.insert(clip_at(uri, 0, 1)).unwrap();
         let cout = dir.join("center.wav");
-        render_to_file(&[center], &cout, Duration::ZERO, None, 1.0).unwrap();
+        render_to_file(&[center], &[], &cout, Duration::ZERO, None, 1.0).unwrap();
         let cp = channel_peaks(&cout);
         assert!((cp[0] - 0.5).abs() < 0.02 && (cp[1] - 0.25).abs() < 0.02,
                 "center leaves the pair alone: {cp:?}");
@@ -1666,7 +1814,7 @@ mod tests {
         right.insert(clip_at(uri, 0, 1)).unwrap();
         right.set_pan(1.0);
         let rout = dir.join("right.wav");
-        render_to_file(&[right], &rout, Duration::ZERO, None, 1.0).unwrap();
+        render_to_file(&[right], &[], &rout, Duration::ZERO, None, 1.0).unwrap();
         let rp = channel_peaks(&rout);
         assert!(rp[0] < 0.01, "left dropped at hard right: {}", rp[0]);
         assert!((rp[1] - 0.25).abs() < 0.02, "right untouched: {}", rp[1]);
@@ -1687,7 +1835,7 @@ mod tests {
         track.insert(clip_at(a.to_str().unwrap(), 0, 1)).unwrap();
 
         let out = dir.join("out.wav");
-        render_to_file(&[track], &out, Duration::ZERO, None, 1.0).unwrap();
+        render_to_file(&[track], &[], &out, Duration::ZERO, None, 1.0).unwrap();
         let peaks = channel_peaks(&out);
         let want = 0.5 * std::f32::consts::FRAC_1_SQRT_2;
         assert!((peaks[0] - want).abs() < 0.02, "center reached the left side: {}", peaks[0]);
@@ -1708,9 +1856,9 @@ mod tests {
         track.insert(clip_at(a.to_str().unwrap(), 0, 1)).unwrap();
 
         let stereo = dir.join("stereo.wav");
-        render_to_file(&[track.clone()], &stereo, Duration::ZERO, None, 1.0).unwrap();
+        render_to_file(&[track.clone()], &[], &stereo, Duration::ZERO, None, 1.0).unwrap();
         let mono = dir.join("mono.wav");
-        render_to_file_mono(&[track], &mono, Duration::ZERO, None, 1.0).unwrap();
+        render_to_file_mono(&[track], &[], &mono, Duration::ZERO, None, 1.0).unwrap();
 
         let peak = |p: &std::path::Path| {
             let d = Decoder::new(BufReader::new(File::open(p).unwrap())).unwrap();
@@ -1750,8 +1898,8 @@ mod tests {
 
         let full = dir.join("full.wav");
         let quarter = dir.join("quarter.wav");
-        render_to_file(&[track.clone()], &full, Duration::ZERO, None, 1.0).unwrap();
-        render_to_file(&[track], &quarter, Duration::ZERO, None, 0.25).unwrap();
+        render_to_file(&[track.clone()], &[], &full, Duration::ZERO, None, 1.0).unwrap();
+        render_to_file(&[track], &[], &quarter, Duration::ZERO, None, 0.25).unwrap();
 
         let peak = |path: &std::path::Path| {
             let decoder = Decoder::new(BufReader::new(File::open(path).unwrap())).unwrap();
@@ -1796,7 +1944,7 @@ mod tests {
             ))
             .unwrap();
             let out = dir.join(format!("out-{rate}-{channels}-{bits}.wav"));
-            render_to_file(&[track], &out, Duration::ZERO, None, 1.0).unwrap();
+            render_to_file(&[track], &[], &out, Duration::ZERO, None, 1.0).unwrap();
             let decoder = Decoder::new(BufReader::new(File::open(&out).unwrap())).unwrap();
             let total = decoder.total_duration().unwrap();
             assert!(
@@ -1833,7 +1981,7 @@ mod tests {
             )
             .unwrap();
         let out = dir.join("out.wav");
-        render_to_file(&[track], &out, Duration::ZERO, None, 1.0).unwrap();
+        render_to_file(&[track], &[], &out, Duration::ZERO, None, 1.0).unwrap();
         let f = freq_of(&out, 0.5);
         assert!(
             (f - 1760.0).abs() < 40.0,
@@ -1868,7 +2016,7 @@ mod tests {
             .unwrap();
         let out = dir.join("out.wav");
         // Playhead 1 s into a clip that spans 0..2 s of the track.
-        render_to_file(&[track], &out, Duration::from_secs(1), None, 1.0).unwrap();
+        render_to_file(&[track], &[], &out, Duration::from_secs(1), None, 1.0).unwrap();
         let f = freq_of(&out, 0.5);
         assert!(
             (f - 1760.0).abs() < 40.0,
@@ -1912,7 +2060,7 @@ mod tests {
                 )
                 .unwrap();
             let out = dir.join(format!("out-{n}a.wav"));
-            render_to_file(&[track], &out, Duration::ZERO, None, 1.0).unwrap();
+            render_to_file(&[track], &[], &out, Duration::ZERO, None, 1.0).unwrap();
             let f = freq_of(&out, 0.5);
             assert!(
                 (f - 1760.0).abs() < 40.0,
@@ -1932,7 +2080,7 @@ mod tests {
                 )
                 .unwrap();
             let out = dir.join(format!("out-{n}b.wav"));
-            render_to_file(&[track], &out, Duration::from_secs(1), None, 1.0).unwrap();
+            render_to_file(&[track], &[], &out, Duration::from_secs(1), None, 1.0).unwrap();
             let f = freq_of(&out, 0.5);
             assert!(
                 (f - 1760.0).abs() < 40.0,
@@ -1955,7 +2103,7 @@ mod tests {
 
         // Measure only: no file appears.
         let (duration, m) =
-            render_and_measure(&[track.clone()], None, Duration::ZERO, None, 1.0).unwrap();
+            render_and_measure(&[track.clone()], &[], None, Duration::ZERO, None, 1.0).unwrap();
         assert!((duration.as_secs_f64() - 10.0).abs() < 0.05);
         assert!((m.peak_db - (-6.02)).abs() < 0.05, "peak {}", m.peak_db);
         assert!((m.rms_db - (-9.03)).abs() < 0.05, "rms {}", m.rms_db);
@@ -1967,14 +2115,8 @@ mod tests {
 
         // Measure while writing: same numbers, plus a real file.
         let out = dir.join("out.wav");
-        let (_, m2) = render_and_measure(
-            &[track],
-            Some(&out),
-            Duration::ZERO,
-            None,
-            1.0,
-        )
-        .unwrap();
+        let (_, m2) = render_and_measure(&[track], &[], Some(&out), Duration::ZERO, None, 1.0)
+            .unwrap();
         assert!((m2.peak_db - m.peak_db).abs() < 1e-6, "file and measure agree");
         assert!(out.exists());
         std::fs::remove_dir_all(&dir).ok();
@@ -2067,6 +2209,7 @@ mod tests {
         let out = dir.join("out.wav");
         render_to_file(
             &[track],
+            &[],
             &out,
             Duration::ZERO,
             Some(Duration::from_millis(500)),
@@ -2095,8 +2238,8 @@ mod tests {
         let out = dir.join("out.wav");
         // First render creates the file; the second renames over it. Neither
         // may leave a `.bo-render-*` staging file behind.
-        render_to_file(&[track.clone()], &out, Duration::ZERO, None, 1.0).unwrap();
-        render_to_file(&[track], &out, Duration::ZERO, None, 1.0).unwrap();
+        render_to_file(&[track.clone()], &[], &out, Duration::ZERO, None, 1.0).unwrap();
+        render_to_file(&[track], &[], &out, Duration::ZERO, None, 1.0).unwrap();
 
         let staging: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
@@ -2370,7 +2513,7 @@ mod tests {
         track.set_pan(1.0); // everything right, except the fixed clip
 
         let out = dir.join("out.wav");
-        render_to_file(&[track], &out, Duration::ZERO, None, 1.0).unwrap();
+        render_to_file(&[track], &[], &out, Duration::ZERO, None, 1.0).unwrap();
         let d = Decoder::new(BufReader::new(File::open(&out).unwrap())).unwrap();
         let samples: Vec<f32> = d.collect();
         let half = samples.len() / 2; // one second of stereo samples
@@ -2582,6 +2725,138 @@ mod tests {
                 "sample {i} at {target:?}: seeked {seeked}, decoded {decoded}"
             );
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn render_routes_grouped_tracks_through_their_strip() {
+        // A track routed to a group bus sums through that group's strip
+        // before the master hears it, exactly as the live graph routes it:
+        // unity passes the track, a half strip halves it, a muted group is
+        // silence — and a route to a group that is not in the table is a
+        // corrupt arrangement, refused rather than guessed at.
+        let dir = std::env::temp_dir().join(format!("bo-group-render-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tone = dir.join("tone.wav");
+        write_wav_full(&tone, 1.0, 440.0, 1.0, 44_100, 2, 16);
+        let mut track = Track::named("bed");
+        track.insert(clip_at(tone.to_str().unwrap(), 0, 1)).unwrap();
+        track.set_bus(BusRef::Group(0));
+
+        let mut half = Group::new(0);
+        half.set_gain(0.5);
+        let mut muted = Group::new(0);
+        muted.set_muted(true);
+
+        let out = dir.join("out.wav");
+        let render_peak = |groups: &[Group]| -> f32 {
+            render_to_file(&[track.clone()], groups, &out, Duration::ZERO, None, 1.0).unwrap();
+            let decoder = Decoder::new(BufReader::new(File::open(&out).unwrap())).unwrap();
+            let samples: Vec<Sample> = decoder.collect();
+            samples.iter().step_by(2).fold(0.0, |m, s| m.max(s.abs()))
+        };
+
+        assert!(
+            render_to_file(&[track.clone()], &[], &out, Duration::ZERO, None, 1.0).is_err(),
+            "a track routed to a missing group must refuse to render"
+        );
+        assert!(
+            (render_peak(&[Group::new(0)]) - 1.0).abs() < 2e-3,
+            "a unity strip passes the member through"
+        );
+        assert!(
+            (render_peak(&[half]) - 0.5).abs() < 2e-3,
+            "a half strip halves the member"
+        );
+        assert!(render_peak(&[muted]) < 1e-6, "a muted group renders silence");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_group_strip_lands_on_the_next_build() {
+        // A group strip is baked when the graph is built; a strip changed
+        // since then lands on the next rebuild — which is exactly what an
+        // `apply` does for a pending group edit.
+        let dir = std::env::temp_dir().join(format!("bo-group-live-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tone = dir.join("tone.wav");
+        write_wav(&tone, 2.0, 440.0, 0.5);
+        let mut track = Track::named("bed");
+        track.insert(clip_at(tone.to_str().unwrap(), 0, 2)).unwrap();
+        track.set_bus(BusRef::Group(0));
+        // Mono hard left reads at its full amplitude on the left channel.
+        track.set_pan(-1.0);
+        let tracks = [track];
+
+        let (mut graph, mut output) = graph_on_a_mixer();
+        let mut group = Group::new(0);
+        graph.play(&tracks, &[group.clone()], Duration::ZERO).unwrap();
+        let loud = pull(&mut output, 2_205);
+        group.set_gain(0.25);
+        graph.play(&tracks, &[group.clone()], graph.position()).unwrap();
+        let quiet = pull(&mut output, 2_205);
+        let mut muted = Group::new(0);
+        muted.set_muted(true);
+        graph.play(&tracks, &[muted], graph.position()).unwrap();
+        let silent = pull(&mut output, 2_205);
+
+        // Loudest left-channel sample past the few milliseconds an old voice
+        // takes to let go of the mixer.
+        let left_peak = |samples: &[Sample]| {
+            samples[500..]
+                .iter()
+                .step_by(2)
+                .fold(0.0f32, |m, s| m.max(s.abs()))
+        };
+        assert!(
+            (left_peak(&loud) - 0.5).abs() < 5e-3,
+            "the member plays at its own strip: {}",
+            left_peak(&loud)
+        );
+        assert!(
+            (left_peak(&quiet) - 0.125).abs() < 5e-3,
+            "the rebuilt strip halves twice: {}",
+            left_peak(&quiet)
+        );
+        assert!(left_peak(&silent) < 1e-4, "a muted group sounds as silence");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_appended_clip_materializes_the_group_bus_it_is_routed_to() {
+        // A clip placed on a grouped track that had no voice yet creates one
+        // mid-flight: the graph materializes the group's bus — its strip
+        // baked from the table it was built with — and the voice joins it.
+        let dir = std::env::temp_dir().join(format!("bo-group-append-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tone = dir.join("tone.wav");
+        write_wav(&tone, 1.0, 440.0, 0.5);
+        let mut track = Track::named("bed");
+        track.insert(clip_at(tone.to_str().unwrap(), 0, 1)).unwrap();
+        track.set_bus(BusRef::Group(0));
+        track.set_pan(-1.0);
+        let tracks = [track];
+
+        let (mut graph, mut output) = graph_on_a_mixer();
+        graph.play(&[], &[Group::new(0)], Duration::ZERO).unwrap();
+        assert!(
+            graph.land(&tracks, Duration::ZERO, &Change::Appended(0)),
+            "the append lands live"
+        );
+        assert_eq!(
+            graph.voices[0].group,
+            Some(0),
+            "the fresh voice joined the group bus"
+        );
+        let samples = pull(&mut output, 2_205);
+        let left_peak = samples[500..]
+            .iter()
+            .step_by(2)
+            .fold(0.0f32, |m, s| m.max(s.abs()));
+        assert!(
+            (left_peak - 0.5).abs() < 5e-3,
+            "the appended clip sounds through the group at its strip: {left_peak}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

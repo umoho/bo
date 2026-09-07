@@ -831,9 +831,9 @@ fn dispatch(a: &mut Arrangement, command: Command, cwd: &str) -> Result<Output, 
                         return Err(fail("no clips: nothing to measure"));
                     }
                     let (duration, stats) = if mono {
-                        render_and_measure_mono(a.player.tracks(), None, from, to, volume)
+                        render_and_measure_mono(a.player.tracks(), a.player.groups(), None, from, to, volume)
                     } else {
-                        render_and_measure(a.player.tracks(), None, from, to, volume)
+                        render_and_measure(a.player.tracks(), a.player.groups(), None, from, to, volume)
                     }
                     .map_err(|e| fail(format!("render failed: {e}")))?;
                     Ok(Output::Rendered {
@@ -854,16 +854,16 @@ fn dispatch(a: &mut Arrangement, command: Command, cwd: &str) -> Result<Output, 
                     }
                     let path = std::path::Path::new(path);
                     let (duration, stats) = if mono && measure {
-                        render_and_measure_mono(a.player.tracks(), Some(path), from, to, volume)
+                        render_and_measure_mono(a.player.tracks(), a.player.groups(), Some(path), from, to, volume)
                             .map(|(d, m)| (d, Some(m)))
                     } else if mono {
-                        render_to_file_mono(a.player.tracks(), path, from, to, volume)
+                        render_to_file_mono(a.player.tracks(), a.player.groups(), path, from, to, volume)
                             .map(|d| (d, None))
                     } else if measure {
-                        render_and_measure(a.player.tracks(), Some(path), from, to, volume)
+                        render_and_measure(a.player.tracks(), a.player.groups(), Some(path), from, to, volume)
                             .map(|(d, m)| (d, Some(m)))
                     } else {
-                        render_to_file(a.player.tracks(), path, from, to, volume).map(|d| (d, None))
+                        render_to_file(a.player.tracks(), a.player.groups(), path, from, to, volume).map(|d| (d, None))
                     }
                     .map_err(|e| fail(format!("render failed: {e}")))?;
                     Ok(Output::Rendered {
