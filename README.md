@@ -56,6 +56,8 @@ $ bo play
 ok: 2 tracks, 2 clips, ends 00:00:30.000, playing from 00:00:00.000
 $ bo set track.0.volume 0.4   # duck the bed under the voice, as it plays
 ok: `track.0.volume` set to `0.40`
+$ bo set track.1.pan -0.6      # place the voice left of center, as it plays
+ok: `track.1.pan` set to `-0.60`
 $ bo put outro.wav,00:00:00-00:00:10 0@00:00:30   # queue on, mid-playback
 ok: 1 clip on track 0
   clip #1 'outro.wav' 00:00:00.000-00:00:10.000 @ 00:00:30.000
