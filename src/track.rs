@@ -573,6 +573,19 @@ mod tests {
     }
 
     #[test]
+    fn tracks_carry_their_own_placement() {
+        let mut t = Track::named("bed");
+        assert_eq!(t.pan(), 0.0, "center by default");
+        assert_eq!(t.out().placement.position(), 0.0);
+        t.set_pan(-0.5);
+        assert_eq!(t.pan(), -0.5);
+        t.set_pan(2.0);
+        assert_eq!(t.pan(), 1.0, "clamped to hard right");
+        t.set_pan(-3.0);
+        assert_eq!(t.pan(), -1.0, "clamped to hard left");
+    }
+
+    #[test]
     fn push_appends_after_the_tail() {
         let mut t = Track::new();
         assert_eq!(t.duration(), Duration::ZERO);

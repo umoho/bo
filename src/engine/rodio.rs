@@ -1321,6 +1321,53 @@ mod tests {
         std::fs::write(path, wav).unwrap();
     }
 
+    /// A wav whose channels carry different amplitudes of the same sine, so
+    /// a render can be told which channels still carry signal. Written in
+    /// the order of `amps` (L R C LFE Ls Rs when six are given).
+    fn write_split_wav(path: &std::path::Path, seconds: u32, rate: u32, amps: &[f32]) {
+        let channels = amps.len() as u16;
+        let frames = (rate * seconds) as usize;
+        let mut data = Vec::with_capacity(frames * amps.len());
+        for i in 0..frames {
+            let v = (2.0 * std::f32::consts::PI * 440.0 * i as f32 / rate as f32).sin();
+            for amp in amps {
+                data.extend_from_slice(&((v * amp * 32767.0) as i16).to_le_bytes());
+            }
+        }
+        let bytes = 2u32;
+        let block_align = channels * bytes as u16;
+        let byte_rate = rate * u32::from(block_align);
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data.len() as u32).to_le_bytes());
+        wav.extend_from_slice(b"WAVE");
+        wav.extend_from_slice(b"fmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        wav.extend_from_slice(&channels.to_le_bytes());
+        wav.extend_from_slice(&rate.to_le_bytes());
+        wav.extend_from_slice(&byte_rate.to_le_bytes());
+        wav.extend_from_slice(&block_align.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        wav.extend_from_slice(&data);
+        std::fs::write(path, wav).unwrap();
+    }
+
+    /// Peak of each channel of a rendered wav, in order.
+    fn channel_peaks(path: &std::path::Path) -> Vec<f32> {
+        let decoder = Decoder::new(BufReader::new(File::open(path).unwrap())).unwrap();
+        let channels = decoder.channels().get() as usize;
+        let mut peaks = vec![0.0f32; channels];
+        let mut n = 0usize;
+        for s in decoder {
+            peaks[n % channels] = peaks[n % channels].max(s.abs());
+            n += 1;
+        }
+        peaks
+    }
+
     fn clip_at(uri: &str, at: u64, len: u64) -> Clip {
         Clip::new(
             Arc::new(Source {
@@ -1419,6 +1466,109 @@ mod tests {
         let decoder = Decoder::new(BufReader::new(File::open(&out).unwrap())).unwrap();
         let (peak, _) = decoder.fold((0.0f32, 0u64), |(peak, n), s| (peak.max(s.abs()), n + 1));
         assert!(peak < 1e-6, "a muted track contributes nothing, peak {peak}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_centered_mono_source_shares_its_energy_across_the_pair() {
+        // A mono source used to be copied to both sides at full gain, which
+        // made it 3 dB louder than the file itself. Placed at center it now
+        // shares its energy: each side carries √½ of the sample.
+        let dir = std::env::temp_dir().join(format!("bo-pan-center-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.wav");
+        write_wav(&a, 0.5, 440.0, 0.5);
+        let mut track = Track::named("a");
+        track.insert(clip_at(a.to_str().unwrap(), 0, 1)).unwrap();
+
+        let out = dir.join("out.wav");
+        render_to_file(&[track], &out, Duration::ZERO, None, 1.0).unwrap();
+        let peaks = channel_peaks(&out);
+        assert_eq!(peaks.len(), 2, "stereo render");
+        let want = 0.5 * std::f32::consts::FRAC_1_SQRT_2;
+        for (i, p) in peaks.iter().enumerate() {
+            assert!((p - want).abs() < 0.02, "channel {i} peaked at {p}, want {want}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn pan_sends_a_mono_source_hard_to_one_side() {
+        let dir = std::env::temp_dir().join(format!("bo-pan-side-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.wav");
+        write_wav(&a, 0.5, 440.0, 0.5);
+        let uri = a.to_str().unwrap();
+
+        let mut left = Track::named("left");
+        left.insert(clip_at(uri, 0, 1)).unwrap();
+        left.set_pan(-1.0);
+        let lout = dir.join("left.wav");
+        render_to_file(&[left], &lout, Duration::ZERO, None, 1.0).unwrap();
+        let lp = channel_peaks(&lout);
+        assert!((lp[0] - 0.5).abs() < 0.02, "left side full, got {}", lp[0]);
+        assert!(lp[1] < 0.01, "right side silent, got {}", lp[1]);
+
+        let mut right = Track::named("right");
+        right.insert(clip_at(uri, 0, 1)).unwrap();
+        right.set_pan(1.0);
+        let rout = dir.join("right.wav");
+        render_to_file(&[right], &rout, Duration::ZERO, None, 1.0).unwrap();
+        let rp = channel_peaks(&rout);
+        assert!(rp[0] < 0.01, "left side silent, got {}", rp[0]);
+        assert!((rp[1] - 0.5).abs() < 0.02, "right side full, got {}", rp[1]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn balance_moves_a_stereo_source_keeping_its_width() {
+        // A stereo source is balanced, not panned: the far side is
+        // attenuated to silence while the near side is untouched, so the
+        // signal's own left/right shape survives.
+        let dir = std::env::temp_dir().join(format!("bo-pan-balance-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.wav");
+        write_split_wav(&a, 1, 44_100, &[0.5, 0.25]);
+        let uri = a.to_str().unwrap();
+
+        let mut center = Track::named("center");
+        center.insert(clip_at(uri, 0, 1)).unwrap();
+        let cout = dir.join("center.wav");
+        render_to_file(&[center], &cout, Duration::ZERO, None, 1.0).unwrap();
+        let cp = channel_peaks(&cout);
+        assert!((cp[0] - 0.5).abs() < 0.02 && (cp[1] - 0.25).abs() < 0.02,
+                "center leaves the pair alone: {cp:?}");
+
+        let mut right = Track::named("right");
+        right.insert(clip_at(uri, 0, 1)).unwrap();
+        right.set_pan(1.0);
+        let rout = dir.join("right.wav");
+        render_to_file(&[right], &rout, Duration::ZERO, None, 1.0).unwrap();
+        let rp = channel_peaks(&rout);
+        assert!(rp[0] < 0.01, "left dropped at hard right: {}", rp[0]);
+        assert!((rp[1] - 0.25).abs() < 0.02, "right untouched: {}", rp[1]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_surround_center_channel_survives_the_stereo_downmix() {
+        // The fault this guards: a >2ch source used to be cut to its first
+        // two channels, and in 5.1 the voice lives on the center channel —
+        // the third one. The BS.775 downmix keeps it, at −3.01 dB on each
+        // side of the stereo pair.
+        let dir = std::env::temp_dir().join(format!("bo-pan-surround-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.wav");
+        write_split_wav(&a, 1, 44_100, &[0.0, 0.0, 0.5, 0.0, 0.0, 0.0]); // L R C LFE Ls Rs
+        let mut track = Track::named("a");
+        track.insert(clip_at(a.to_str().unwrap(), 0, 1)).unwrap();
+
+        let out = dir.join("out.wav");
+        render_to_file(&[track], &out, Duration::ZERO, None, 1.0).unwrap();
+        let peaks = channel_peaks(&out);
+        let want = 0.5 * std::f32::consts::FRAC_1_SQRT_2;
+        assert!((peaks[0] - want).abs() < 0.02, "center reached the left side: {}", peaks[0]);
+        assert!((peaks[1] - want).abs() < 0.02, "center reached the right side: {}", peaks[1]);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -2032,6 +2182,38 @@ mod tests {
         assert!(
             peak(&after[2_000..]) < 1e-6,
             "a muted track contributes nothing"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_pan_lands_on_the_running_graph() {
+        // A placement is read from a shared cell, so panning a track that is
+        // sounding is one store — no rebuild, same voice.
+        let dir = std::env::temp_dir().join(format!("bo-graph-pan-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tone = dir.join("tone.wav");
+        write_wav(&tone, 8.0, 440.0, 0.5);
+        let uri = tone.to_str().unwrap();
+        let mut track = Track::named("a");
+        track.insert(clip_at(uri, 0, 8)).unwrap();
+        track.set_pan(-1.0); // hard left: channel 0 at full written amplitude
+
+        let (mut graph, mut output) = graph_on_a_mixer();
+        graph.play(&[track.clone()], Duration::ZERO).unwrap();
+        let full = peak(&pull(&mut output, 4_410));
+        assert!((full - 0.5).abs() < 0.02, "hard left, peak {full}");
+
+        let mut centered = track.clone();
+        centered.set_pan(0.0);
+        assert!(graph.land(&[centered], graph.position(), &Change::TrackPan(0)));
+        assert_eq!(graph.voices.len(), 1, "the same voice, re-placed");
+        let after = pull(&mut output, 4_410);
+        let tail = peak(&after[2_000..]);
+        let want = 0.5 * std::f32::consts::FRAC_1_SQRT_2;
+        assert!(
+            (tail - want).abs() < 0.02,
+            "centered mono shares its energy: {tail} against {want}"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

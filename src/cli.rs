@@ -255,12 +255,14 @@ enum Command {
         /// Source uri to measure; omit to probe the arrangement's sources.
         uri: Option<String>,
     },
-    /// Set an attribute: `master`, or `track.N.volume` / `track.N.muted` /
-    /// `track.N.name`.
+    /// Set an attribute: `master`, or `track.N.volume` / `track.N.pan` /
+    /// `track.N.muted` / `track.N.name`.
     Set {
         /// Attribute path.
         var: String,
-        /// Value: a gain, `true`/`false`, or a name.
+        /// Value: a gain, a pan, `true`/`false`, or a name. A pan may lead
+        /// with `-`, so values are read as-is rather than as flags.
+        #[arg(allow_hyphen_values = true)]
         value: String,
     },
     /// Start playback from the current playhead.
@@ -2556,6 +2558,21 @@ mod tests {
         assert!(msg.contains("no track 9"), "{msg}");
         assert!(run_ok(&mut a, &["ls"]).contains("vol=1.00"), "ls shows the gain");
 
+        // Placement: set, clamped to the field, shown on ls, landed live.
+        let out = run_ok(&mut a, &["set", "track.0.pan", "-0.5"]);
+        assert!(out.contains("`track.0.pan` set to `-0.50`"), "{out}");
+        assert_eq!(a.player.tracks()[0].pan(), -0.5);
+        run_ok(&mut a, &["set", "track.0.pan", "2.5"]);
+        assert_eq!(a.player.tracks()[0].pan(), 1.0, "clamped to the field");
+        run_ok(&mut a, &["set", "track.0.pan", "-3"]);
+        assert_eq!(a.player.tracks()[0].pan(), -1.0);
+        assert!(
+            run_ok(&mut a, &["ls"]).contains("pan=-1.00"),
+            "ls shows the placement"
+        );
+        let (code, _) = run_err(&mut a, &["set", "track.0.pan", "abc"]);
+        assert_eq!(code, 2);
+
         // Master is real-time and clamped too.
         let out = run_ok(&mut a, &["set", "master", "0.78"]);
         assert!(out.contains("`master` set to `0.78`"), "{out}");
@@ -3121,12 +3138,14 @@ mod tests {
         run_ok(&mut a, &["put", "ding.wav,00:00:01-00:00:02", "1@00:00:00"]);
         run_ok(&mut a, &["set", "track.0.name", "bed"]);
         run_ok(&mut a, &["set", "track.0.volume", "0.5"]);
+        run_ok(&mut a, &["set", "track.0.pan", "-0.5"]);
         run_ok(&mut a, &["set", "track.1.muted", "true"]);
         run_ok(&mut a, &["set", "master", "0.78"]);
 
         let script = serialize(&a);
         assert!(script.contains("set track.0.name bed"), "{script}");
         assert!(script.contains("set track.0.volume 0.5"), "{script}");
+        assert!(script.contains("set track.0.pan -0.5"), "{script}");
         assert!(script.contains("set track.1.muted true"), "{script}");
         assert!(script.contains("set master 0.78"), "master is saved: {script}");
         let mut fresh = Arrangement::default();

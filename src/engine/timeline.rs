@@ -289,11 +289,14 @@ mod tests {
         bed.set_volume(0.4);
         let mut voice = track_with(vec![Clip::new(src("v.wav"), secs(5))]);
         voice.set_muted(true);
+        voice.set_pan(-1.0);
         let plan = Timeline::plan(&[bed, voice], Duration::ZERO);
         assert_eq!(plan.tracks().len(), 2);
         assert_eq!(plan.tracks()[0].gain(), 0.4);
+        assert_eq!(plan.tracks()[0].pan(), 0.0, "center by default");
         assert!(!plan.tracks()[0].muted());
         assert!(plan.tracks()[1].muted());
+        assert_eq!(plan.tracks()[1].pan(), -1.0, "the placement comes along");
         // Empty tracks are dropped from the plan.
         let plan = Timeline::plan(&[Track::new()], Duration::ZERO);
         assert!(plan.tracks().is_empty());
