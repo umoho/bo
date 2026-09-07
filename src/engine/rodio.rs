@@ -37,6 +37,7 @@ use rodio::math::nz;
 use rodio::source::from_factory;
 use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink, Player, Sample, Source};
 
+use crate::bus::Group;
 use crate::engine::measure::{Measurement, Meter};
 use crate::engine::timeline::{ClipPlan, Timeline};
 use crate::engine::{Backend, BackendError, Change};
@@ -77,8 +78,8 @@ impl Rodio {
 }
 
 impl Backend for Rodio {
-    fn play(&mut self, tracks: &[Track], at: Duration) -> Result<(), BackendError> {
-        self.graph.play(tracks, at).map_err(Self::berr)
+    fn play(&mut self, tracks: &[Track], groups: &[Group], at: Duration) -> Result<(), BackendError> {
+        self.graph.play(tracks, groups, at).map_err(Self::berr)
     }
 
     fn pause(&mut self) {
@@ -276,7 +277,7 @@ impl Graph {
     /// pull. Letting go is a drop, not rodio's `clear()`: `clear()` blocks
     /// until the audio thread has drained the queue, which is a device buffer
     /// of silence waiting to happen.
-    fn play(&mut self, tracks: &[Track], at: Duration) -> Result<(), String> {
+    fn play(&mut self, tracks: &[Track], _groups: &[Group], at: Duration) -> Result<(), String> {
         let built = self.build(tracks, at)?;
         let old = std::mem::replace(&mut self.voices, built);
         self.base_at = at;
@@ -401,6 +402,9 @@ impl Graph {
             Change::ClipPan(track, id) => self.land_clip_pan(tracks, *track, *id),
             Change::Appended(track) => self.land_appended(tracks, at, *track),
             Change::Structure => false,
+            // A group strip is baked into the graph when it is built; a
+            // running graph cannot retune it, only a rebuild can.
+            Change::GroupGain(_) => false,
         }
     }
 
@@ -1158,7 +1162,12 @@ impl Renderer {
 }
 
 impl Backend for Renderer {
-    fn play(&mut self, tracks: &[Track], at: Duration) -> Result<(), BackendError> {
+    fn play(
+        &mut self,
+        tracks: &[Track],
+        _groups: &[Group],
+        at: Duration,
+    ) -> Result<(), BackendError> {
         render_to_file(tracks, &self.path, at, None, self.master)
             .map_err(|e| BackendError::new("render", e))?;
         Ok(())
@@ -2182,13 +2191,13 @@ mod tests {
         let tracks = [track];
 
         let (mut graph, mut output) = graph_on_a_mixer();
-        graph.play(&tracks, Duration::ZERO).unwrap();
+        graph.play(&tracks, &[], Duration::ZERO).unwrap();
         let mut quietest = f32::MAX;
         for _ in 0..20 {
             // A tenth of a second of sound, then a rebuild from where the
             // audio really is — exactly what `apply` does.
             let samples = pull(&mut output, 4_410);
-            graph.play(&tracks, graph.position()).unwrap();
+            graph.play(&tracks, &[], graph.position()).unwrap();
             for window in samples.chunks(512) {
                 quietest = quietest.min(peak(window));
             }
@@ -2220,7 +2229,7 @@ mod tests {
         let tracks = [track];
 
         let (mut graph, mut output) = graph_on_a_mixer();
-        graph.play(&tracks, Duration::ZERO).unwrap();
+        graph.play(&tracks, &[], Duration::ZERO).unwrap();
         let first = pull(&mut output, 4_410);
         // Within the quantization of 16-bit audio: frame zero is stored as
         // -32767, which reads back a hair above the bottom of the sawtooth.
@@ -2235,7 +2244,7 @@ mod tests {
             graph.position()
         );
 
-        graph.play(&tracks, graph.position()).unwrap();
+        graph.play(&tracks, &[], graph.position()).unwrap();
         let next = pull(&mut output, 4_410);
         // Past the few milliseconds an old voice takes to let go, the frames
         // must continue where they left off: nothing lost, nothing repeated.
@@ -2261,7 +2270,7 @@ mod tests {
         let tracks = [track];
 
         let (mut graph, mut output) = graph_on_a_mixer();
-        graph.play(&tracks, Duration::ZERO).unwrap();
+        graph.play(&tracks, &[], Duration::ZERO).unwrap();
         let _ = pull(&mut output, 4_410);
         graph.pause();
         let held = graph.position();
@@ -2301,7 +2310,7 @@ mod tests {
         track.set_pan(-1.0);
 
         let (mut graph, mut output) = graph_on_a_mixer();
-        graph.play(&[track.clone()], Duration::ZERO).unwrap();
+        graph.play(&[track.clone()], &[], Duration::ZERO).unwrap();
         let full = peak(&pull(&mut output, 4_410));
         assert!(full > 0.4, "the tone is audible, peak {full}");
 
@@ -2399,7 +2408,7 @@ mod tests {
         track.set_pan(-1.0); // hard left: channel 0 at full written amplitude
 
         let (mut graph, mut output) = graph_on_a_mixer();
-        graph.play(&[track.clone()], Duration::ZERO).unwrap();
+        graph.play(&[track.clone()], &[], Duration::ZERO).unwrap();
         let full = peak(&pull(&mut output, 4_410));
         assert!((full - 0.5).abs() < 0.02, "hard left, peak {full}");
 
@@ -2433,7 +2442,7 @@ mod tests {
         track.set_pan(-1.0); // full amplitude on channel 0
 
         let (mut graph, mut output) = graph_on_a_mixer();
-        graph.play(&[track], Duration::ZERO).unwrap();
+        graph.play(&[track], &[], Duration::ZERO).unwrap();
         let full = peak(&pull(&mut output, 4_410));
         assert!((full - 0.5).abs() < 0.02, "full master, peak {full}");
 
@@ -2461,7 +2470,7 @@ mod tests {
         track.insert(clip_at(uri, 0, 1)).unwrap();
 
         let (mut graph, mut output) = graph_on_a_mixer();
-        graph.play(&[track.clone()], Duration::ZERO).unwrap();
+        graph.play(&[track.clone()], &[], Duration::ZERO).unwrap();
         let _ = pull(&mut output, 2_205); // half a second in
 
         let mut extended = track.clone();
@@ -2495,7 +2504,7 @@ mod tests {
         track.insert(clip_at(uri, 5, 1)).unwrap();
 
         let (mut graph, mut output) = graph_on_a_mixer();
-        graph.play(&[track.clone()], Duration::ZERO).unwrap();
+        graph.play(&[track.clone()], &[], Duration::ZERO).unwrap();
         let _ = pull(&mut output, 2_205);
 
         let mut filled = track.clone();
@@ -2505,7 +2514,7 @@ mod tests {
             "a clip ahead of queued material cannot be appended"
         );
         // The rebuild it forces does land it.
-        graph.play(std::slice::from_ref(&filled), graph.position()).unwrap();
+        graph.play(std::slice::from_ref(&filled), &[], graph.position()).unwrap();
         assert!(peak(&pull(&mut output, 4_410)) > 0.1);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2524,7 +2533,7 @@ mod tests {
         track.insert(clip_at(tone.to_str().unwrap(), 0, 4)).unwrap();
 
         let (mut graph, mut output) = graph_on_a_mixer();
-        graph.play(&[track.clone()], Duration::ZERO).unwrap();
+        graph.play(&[track.clone()], &[], Duration::ZERO).unwrap();
         let _ = pull(&mut output, 4_410);
 
         // A second clip whose file is not there: the next rebuild cannot be
@@ -2533,7 +2542,7 @@ mod tests {
         let gone = dir.join("gone.wav");
         broken.insert(clip_at(gone.to_str().unwrap(), 4, 4)).unwrap();
         assert!(
-            graph.play(&[broken], graph.position()).is_err(),
+            graph.play(&[broken], &[], graph.position()).is_err(),
             "a source that cannot be opened refuses the rebuild"
         );
         let after = pull(&mut output, 4_410);

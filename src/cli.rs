@@ -124,6 +124,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use bo::bus::Group;
 use bo::engine::rodio::{
     measure, probe, probe_sources, render_and_measure, render_and_measure_mono, render_to_file,
     render_to_file_mono, Probing, Rodio, SourceLength,
@@ -379,10 +380,10 @@ impl AnyBackend {
 }
 
 impl Backend for AnyBackend {
-    fn play(&mut self, tracks: &[Track], at: Duration) -> Result<(), BackendError> {
+    fn play(&mut self, tracks: &[Track], groups: &[Group], at: Duration) -> Result<(), BackendError> {
         match self {
-            Self::Silent(backend, _) => backend.play(tracks, at),
-            Self::Rodio(backend) => backend.play(tracks, at),
+            Self::Silent(backend, _) => backend.play(tracks, groups, at),
+            Self::Rodio(backend) => backend.play(tracks, groups, at),
         }
     }
 

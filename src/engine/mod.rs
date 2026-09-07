@@ -13,7 +13,7 @@ pub mod measure;
 pub mod rodio;
 pub mod timeline;
 
-use crate::bus::Bus;
+use crate::bus::{Bus, Group};
 use crate::track::{Clip, Track};
 
 /// Why a backend could not do what it was told.
@@ -60,6 +60,10 @@ pub enum Change {
     /// The arrangement's shape changed: a clip was removed or moved, or the
     /// whole arrangement was replaced. Nothing running can express that.
     Structure,
+    /// A group bus's gain or mute changed. A running graph cannot take it —
+    /// the group strip is baked when the graph is built — so it waits for an
+    /// `apply`, which rebuilds.
+    GroupGain(u64),
 }
 
 /// How an edit reached the sound.
@@ -96,7 +100,14 @@ pub trait Backend {
     ///
     /// `at` is a track timecode; an implementation reads each clip from
     /// `clip.from + (at - clip.at)` and skips clips that have already passed.
-    fn play(&mut self, tracks: &[Track], at: Duration) -> Result<(), BackendError>;
+    /// `groups` is the bus table: the strips tracks routed to a group bus feed
+    /// through, read when a graph is built exactly like the tracks themselves.
+    fn play(
+        &mut self,
+        tracks: &[Track],
+        groups: &[Group],
+        at: Duration,
+    ) -> Result<(), BackendError>;
 
     /// Suspend output, keeping position.
     fn pause(&mut self);
@@ -134,6 +145,9 @@ pub trait Backend {
 pub struct Silent {
     /// Last `play` request, as `(track count, start timecode)`.
     pub last_play: Option<(usize, Duration)>,
+    /// Group count in the last `play` request; lets a test assert the bus
+    /// table travels with the tracks.
+    pub last_groups: Option<usize>,
     /// Requests so far, in order. Lets a test assert "seek re-planned".
     pub events: Vec<BackendEvent>,
     /// The edits offered to [`Backend::land`], in order.
@@ -153,8 +167,14 @@ pub enum BackendEvent {
 }
 
 impl Backend for Silent {
-    fn play(&mut self, tracks: &[Track], at: Duration) -> Result<(), BackendError> {
+    fn play(
+        &mut self,
+        tracks: &[Track],
+        groups: &[Group],
+        at: Duration,
+    ) -> Result<(), BackendError> {
         self.last_play = Some((tracks.len(), at));
+        self.last_groups = Some(groups.len());
         self.events.push(BackendEvent::Play);
         Ok(())
     }
@@ -182,7 +202,7 @@ impl Backend for Silent {
     fn land(&mut self, _tracks: &[Track], _at: Duration, change: &Change) -> bool {
         self.events.push(BackendEvent::Land);
         self.landed.push(change.clone());
-        !matches!(change, Change::Structure)
+        !matches!(change, Change::Structure | Change::GroupGain(_))
     }
 }
 
@@ -214,14 +234,20 @@ impl fmt::Display for State {
     }
 }
 
-/// A playhead over a set of simultaneously mixed tracks, and the bus their
-/// outputs feed.
+/// A playhead over a set of simultaneously mixed tracks, and the buses their
+/// outputs feed — the master and any group buses.
 #[derive(Debug)]
 pub struct Player<B: Backend = Silent> {
     tracks: Vec<Track>,
     playhead: Duration,
     state: State,
     bus: Bus,
+    /// The group buses (shown to users as plain buses): summing points
+    /// several tracks' outputs can be routed into, each carrying its own
+    /// strip before its sum feeds the master.
+    groups: Vec<Group>,
+    /// Next id for a group; ids are never reused while the group lives.
+    next_group_id: u64,
     backend: B,
     /// Arrangement edits the running graph could not take, waiting for the
     /// next `apply`, `play` or `resume`.
@@ -242,6 +268,8 @@ impl<B: Backend> Player<B> {
             playhead: Duration::ZERO,
             state: State::Stopped,
             bus: Bus::master(),
+            groups: Vec::new(),
+            next_group_id: 0,
             backend,
             pending: Vec::new(),
         }
@@ -349,6 +377,8 @@ impl<B: Backend> Player<B> {
             tracks,
             playhead,
             bus,
+            groups,
+            next_group_id,
             pending,
             ..
         } = self;
@@ -357,6 +387,8 @@ impl<B: Backend> Player<B> {
             playhead,
             state: State::Stopped,
             bus,
+            groups,
+            next_group_id,
             backend,
             pending,
         }
@@ -367,6 +399,48 @@ impl<B: Backend> Player<B> {
     pub fn pending(&self) -> &[Change] {
         &self.pending
     }
+
+    /// The group buses: summing points several tracks' outputs can be routed
+    /// into, each carrying its own strip before its sum feeds the master.
+    #[must_use]
+    pub fn groups(&self) -> &[Group] {
+        &self.groups
+    }
+
+    /// The group bus with `id`, if it exists.
+    #[must_use]
+    pub fn group(&self, id: u64) -> Option<&Group> {
+        self.groups.iter().find(|g| g.id() == id)
+    }
+
+    /// The group bus with `id`, mutably, if it exists.
+    #[must_use]
+    pub fn group_mut(&mut self, id: u64) -> Option<&mut Group> {
+        self.groups.iter_mut().find(|g| g.id() == id)
+    }
+
+    /// Add a group bus and return its stable id — the handle
+    /// [`crate::bus::BusRef`]'s `Group` variant addresses it by. Names are
+    /// labels, not identity, so nothing checks them here.
+    pub fn add_group(&mut self, name: Option<String>) -> u64 {
+        let id = self.next_group_id;
+        self.next_group_id += 1;
+        let mut group = Group::new(id);
+        if let Some(name) = name {
+            group.set_name(name);
+        }
+        self.groups.push(group);
+        id
+    }
+
+    /// Replace the whole group table, e.g. committing a loaded arrangement.
+    /// The id counter is advanced past the tallest id, so a later
+    /// [`Player::add_group`] can never collide with a loaded group.
+    pub fn set_groups(&mut self, groups: Vec<Group>) {
+        let next = groups.iter().map(Group::id).max().map_or(0, |id| id + 1);
+        self.next_group_id = self.next_group_id.max(next);
+        self.groups = groups;
+    }
 }
 
 impl<B: Backend> Player<B> {
@@ -374,7 +448,7 @@ impl<B: Backend> Player<B> {
     /// edit, so nothing stays pending.
     pub fn play(&mut self) -> Result<(), BackendError> {
         let at = self.playhead();
-        self.backend.play(&self.tracks, at)?;
+        self.backend.play(&self.tracks, &self.groups, at)?;
         self.playhead = at;
         self.pending.clear();
         self.state = State::Playing;
@@ -405,7 +479,7 @@ impl<B: Backend> Player<B> {
                     self.backend.resume();
                 } else {
                     let at = self.playhead();
-                    self.backend.play(&self.tracks, at)?;
+                    self.backend.play(&self.tracks, &self.groups, at)?;
                     self.playhead = at;
                     self.pending.clear();
                     // A graph built while paused comes out paused; this one
@@ -427,11 +501,14 @@ impl<B: Backend> Player<B> {
         self.state = State::Stopped;
     }
 
-    /// Drop every track and reset the transport: stop playback, rewind the
-    /// playhead, and clear the arrangement.
+    /// Drop every track, clear every group bus, and reset the transport:
+    /// back to a fresh session. Group ids restart from zero, like clip ids
+    /// after a track clears.
     pub fn reset(&mut self) {
         self.stop();
         self.tracks.clear();
+        self.groups.clear();
+        self.next_group_id = 0;
         self.pending.clear();
     }
 
@@ -441,7 +518,7 @@ impl<B: Backend> Player<B> {
     pub fn seek(&mut self, at: Duration) -> Result<(), BackendError> {
         self.playhead = at;
         if self.state == State::Playing {
-            self.backend.play(&self.tracks, at)?;
+            self.backend.play(&self.tracks, &self.groups, at)?;
             self.pending.clear();
         }
         Ok(())
@@ -510,7 +587,7 @@ impl<B: Backend> Player<B> {
         // the rest may have taken a moment, and the entry point should be
         // where the sound is now.
         let at = self.playhead();
-        if let Err(e) = self.backend.play(&self.tracks, at) {
+        if let Err(e) = self.backend.play(&self.tracks, &self.groups, at) {
             // The rebuild did not happen, so those edits are still waiting;
             // what landed live stays landed.
             self.pending = rest;
@@ -757,7 +834,12 @@ mod tests {
     }
 
     impl Backend for Refuses {
-        fn play(&mut self, _tracks: &[Track], _at: Duration) -> Result<(), BackendError> {
+        fn play(
+            &mut self,
+            _tracks: &[Track],
+            _groups: &[Group],
+            _at: Duration,
+        ) -> Result<(), BackendError> {
             if self.refuse {
                 return Err(BackendError::new("refuses", "no graph for you"));
             }
@@ -890,5 +972,65 @@ mod tests {
         assert_eq!(p.state(), State::Stopped);
         assert_eq!(p.playhead(), Duration::ZERO);
         assert!(p.backend().events.contains(&BackendEvent::Stop));
+    }
+
+    #[test]
+    fn the_group_table_lives_on_the_player_and_travels_with_play() {
+        let mut p: Player<Silent> = Player::default();
+        p.add_track(track_with("a.wav", 10));
+        assert_eq!(p.add_group(Some("music".into())), 0);
+        assert_eq!(p.add_group(Some("voice".into())), 1);
+        assert_eq!(p.groups().len(), 2);
+        assert_eq!(p.group(0).map(|g| g.name()), Some(Some("music")));
+        assert!(p.group(9).is_none());
+
+        // The bus table rides along on a plan, so a graph can bake its strips.
+        p.play().unwrap();
+        assert_eq!(p.backend().last_groups, Some(2));
+        assert_eq!(p.backend().last_play, Some((1, Duration::ZERO)));
+
+        // group_mut edits the strip the next plan will read.
+        p.group_mut(1).expect("voice").set_muted(true);
+        assert!(p.group(1).unwrap().muted());
+    }
+
+    #[test]
+    fn a_group_gain_waits_for_apply_and_rebuilds() {
+        let mut p: Player<Silent> = Player::default();
+        p.add_track(track_with("a.wav", 10));
+        let id = p.add_group(Some("music".into()));
+        let plays = |p: &Player<Silent>| {
+            p.backend()
+                .events
+                .iter()
+                .filter(|e| **e == BackendEvent::Play)
+                .count()
+        };
+        p.play().unwrap();
+        assert_eq!(plays(&p), 1);
+
+        // No running graph can retune a group strip live: the edit waits,
+        // and apply gives it a rebuilt graph, exactly like a clip move.
+        assert_eq!(p.changed(Change::GroupGain(id)), Landed::Pending);
+        assert_eq!(p.pending(), &[Change::GroupGain(id)]);
+        assert_eq!(
+            p.apply().unwrap(),
+            Applied::Rebuilt {
+                live: 0,
+                at: Duration::ZERO
+            }
+        );
+        assert_eq!(plays(&p), 2);
+        assert!(p.pending().is_empty());
+    }
+
+    #[test]
+    fn reset_clears_the_group_table_and_ids_restart() {
+        let mut p: Player<Silent> = Player::default();
+        p.add_group(Some("music".into()));
+        p.add_group(Some("voice".into()));
+        p.reset();
+        assert!(p.groups().is_empty());
+        assert_eq!(p.add_group(None), 0, "a fresh session starts its ids at zero");
     }
 }
