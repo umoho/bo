@@ -15,7 +15,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::bus::{Output, Placement};
+use crate::bus::{BusRef, Output, Placement};
 
 /// An audio resource: something that can be decoded and played.
 ///
@@ -365,6 +365,19 @@ impl Track {
         self.out.placement.set_position(pan);
     }
 
+    /// Which bus this track's output feeds: the master, or a group bus by
+    /// its id. The master is the default.
+    #[must_use]
+    pub fn bus(&self) -> BusRef {
+        self.out.target
+    }
+
+    /// Route this track's output to a bus — the master, or a group bus.
+    /// Routing is structure: only a rebuilt graph sounds it.
+    pub fn set_bus(&mut self, target: BusRef) {
+        self.out.target = target;
+    }
+
     /// The clips, ordered by track position.
     #[must_use]
     pub fn clips(&self) -> &[Clip] {
@@ -624,6 +637,20 @@ mod tests {
         assert_eq!(t.next_free_start(secs(15), secs(5)), secs(15));
         // Butt-joining a's end is not free while b occupies 10..15.
         assert_eq!(t.next_free_start(secs(10), secs(5)), secs(15));
+    }
+
+    #[test]
+    fn tracks_can_be_routed_to_a_group_bus() {
+        let mut t = Track::new();
+        assert_eq!(t.bus(), BusRef::Master, "the master is the default");
+        t.set_bus(BusRef::Group(2));
+        assert_eq!(t.bus(), BusRef::Group(2));
+        // Routing is signal, not content: the timeline does not move.
+        t.insert(Clip::new(src("a"), secs(10))).unwrap();
+        assert_eq!(t.duration(), secs(10));
+        assert_eq!(t.bus(), BusRef::Group(2));
+        t.set_bus(BusRef::Master);
+        assert_eq!(t.bus(), BusRef::Master);
     }
 
     #[test]
