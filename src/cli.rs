@@ -124,7 +124,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use bo::bus::Group;
+use bo::bus::{BusRef, Group};
 use bo::engine::rodio::{
     measure, probe, probe_sources, render_and_measure, render_and_measure_mono, render_to_file,
     render_to_file_mono, Probing, Rodio, SourceLength,
@@ -137,7 +137,8 @@ use clap::{Parser, Subcommand};
 mod reply;
 
 use reply::{
-    ApplyReport, AtLine, Ls, LsClip, LsTrack, Output, PlacedClip, ProbeResult, SetResult, Tc,
+    ApplyReport, AtLine, BusLabel, Ls, LsBus, LsClip, LsTrack, Output, PlacedClip, ProbeResult,
+    RoutedBus, SetResult, Tc,
 };
 
 /// bo — edit and mix audio, one command at a time.
@@ -213,6 +214,18 @@ enum Command {
         /// Destination: `[track]@[pos]`. An omitted track means the source
         /// track; an omitted pos means the playhead.
         dest: String,
+    },
+    /// Route a track's output into a group bus — several tracks share one
+    /// strip (its volume, its mute) before the master hears them, a radio
+    /// "music bus" or "voice bus". The bus is created by its first mention
+    /// and named by it; bus names are unique; `master` routes the track back
+    /// out. Routing is structure: a running mix takes it on the next apply.
+    Route {
+        /// Track index.
+        track: usize,
+        /// Target: a bus name (created on first mention), or `master`.
+        #[arg(allow_hyphen_values = true)]
+        bus: String,
     },
     /// Show the whole arrangement.
     Ls,
@@ -460,6 +473,14 @@ Arrangement:
                            (when free on the destination) its id. dest =
                            [track]@[pos] — track omitted: the same track,
                            pos omitted: the playhead
+  route <track> <bus>      route a track's output into a group bus — several
+                           tracks share one strip (its volume, its mute)
+                           before the master hears them, a radio music bus
+                           or voice bus. The bus is created by its first
+                           mention and named by it; bus names are unique;
+                           'master' routes the track back out. Routing is
+                           structure: a running mix takes it on the next
+                           apply
   ls                       dump the arrangement: an ok: reply, a session
                            line, then one track block per track with clip
                            signature lines
@@ -490,6 +511,9 @@ Mix:
                            hard right, 0 center); lands as it is set
   set track.N.muted <b>    mute (true) or restore (false) a track
   set track.N.name <name>  label a track
+  set bus.N.volume <v>     set a group bus's gain, 0..1 (lands on an apply)
+  set bus.N.muted <b>      mute (true) or restore (false) a group bus
+  set bus.N.name <name>    relabel a group bus; names are unique
   set clip.N.N.gain <v>    set a clip's gain, 0..1
   set clip.N.N.fade_in <t> set a clip's fade-in
   set clip.N.N.fade_in_from <v>  set the fade-in's start level, 0..1
@@ -527,7 +551,8 @@ OUTPUT
   signature line, a track a header over its clips:
 
     clip #<id> '<uri>' <from>-<to> @ <at> [gain=..] [fade_in=..] ...
-    track <n> '<name>'|untitled vol=.. pan=.. end=.. [muted]
+    track <n> '<name>'|untitled vol=.. pan=.. end=.. [muted] [bus=#<id> '<name>']
+    bus #<id> '<name>'|untitled vol=.. tracks=.. [muted]   # group buses
 
   bo help <command> shows that command's reply shape with a real example.
 
@@ -553,6 +578,9 @@ EXAMPLES
   bo put voice.wav,00:00:00-00:00:30 1@00:00:00
   bo play
   bo set track.0.volume 0.4  # duck the bed; lands as it is set
+  bo route 0 music           # bed under one strip: route a track into a bus
+  bo route 1 music
+  bo set bus.0.volume 0.4    # duck the whole music bus (on the next apply)
   bo put outro.wav,0-10 0@00:00:30   # keep queueing while it plays
   bo apply                 # for what a running mix cannot take itself
   bo ls
@@ -561,9 +589,9 @@ EXAMPLES
 
 /// Names of the user-facing subcommands: `bo <name> --help` must keep
 /// clap's own per-command help, while `bo --help` shows the grouped [`HELP`].
-const SUBCOMMAND_NAMES: [&str; 18] = [
-    "put", "take", "move", "ls", "at", "render", "save", "load", "reset", "check", "probe", "play",
-    "pause", "resume", "stop", "seek", "apply", "set",
+const SUBCOMMAND_NAMES: [&str; 19] = [
+    "put", "take", "move", "route", "ls", "at", "render", "save", "load", "reset", "check",
+    "probe", "play", "pause", "resume", "stop", "seek", "apply", "set",
 ];
 
 /// Tokenize a wire or script line: whitespace-separated words with
@@ -812,6 +840,7 @@ fn dispatch(a: &mut Arrangement, command: Command, cwd: &str) -> Result<Output, 
         Command::Set { var, value } => set_command(a, &var, &value),
         Command::Take { track, clip } => take_command(a, track, &clip),
         Command::Move { track, clip, dest } => move_command(a, track, &clip, &dest),
+        Command::Route { track, bus } => route_command(a, track, &bus),
         Command::Render {
             file,
             range,
@@ -897,12 +926,16 @@ fn dispatch(a: &mut Arrangement, command: Command, cwd: &str) -> Result<Output, 
             run_script(&mut staged, &text, &file, cwd).map_err(fail)?;
             let volume = staged.player.volume();
             let tracks: Vec<Track> = staged.player.tracks().to_vec();
+            let groups: Vec<Group> = staged.player.groups().to_vec();
             a.player.reset();
             a.player.set_volume(volume);
             a.player.tracks_mut().extend(tracks);
             // A loaded arrangement is a different mix entirely: whatever was
             // playing has nothing to do with it.
             a.player.changed(Change::Structure);
+            // The group buses come across with the tracks that are routed
+            // into them — strips and all, ids preserved.
+            a.player.set_groups(groups);
             Ok(Output::Loaded { file })
         }
         Command::Reset => reset_command(a),
@@ -966,6 +999,21 @@ fn arrangement_view(a: &Arrangement) -> Ls {
         volume: p.volume(),
         idle_timeout: a.idle_timeout,
         pending: p.pending().len(),
+        buses: p
+            .groups()
+            .iter()
+            .map(|g| LsBus {
+                id: g.id(),
+                name: g.name().map(str::to_string),
+                volume: g.gain(),
+                muted: g.muted(),
+                tracks: p
+                    .tracks()
+                    .iter()
+                    .filter(|t| t.bus() == BusRef::Group(g.id()))
+                    .count(),
+            })
+            .collect(),
         tracks: p
             .tracks()
             .iter()
@@ -974,6 +1022,13 @@ fn arrangement_view(a: &Arrangement) -> Ls {
                 volume: t.volume(),
                 pan: t.pan(),
                 muted: t.muted(),
+                bus: match t.bus() {
+                    BusRef::Master => None,
+                    BusRef::Group(id) => Some(BusLabel {
+                        id,
+                        name: p.group(id).and_then(|g| g.name().map(str::to_string)),
+                    }),
+                },
                 end: t.duration(),
                 clips: t
                     .clips()
@@ -1412,6 +1467,64 @@ fn noting(a: &Arrangement, landed: Option<Landed>) -> Option<Landed> {
     landed.filter(|l| *l == Landed::Pending && a.player.state() != State::Stopped)
 }
 
+/// `route <track> <bus>`: point a track's output at a group bus, or back at
+/// the master. A bus is created by its first mention and named by it — bus
+/// names are unique — so `route 0 music` twice routes the same bus, and a
+/// typo becomes a new (empty, visible) bus rather than silence.
+///
+/// Routing is structure, like taking or moving a clip: the graph has to be
+/// rebuilt for it to sound, so a running mix takes it on the next `apply`.
+fn route_command(a: &mut Arrangement, track: usize, bus: &str) -> Result<Output, (i32, String)> {
+    let bus = bus.trim();
+    if bus.is_empty() {
+        return Err(usage("route needs a bus name"));
+    }
+    // Resolve the track first, so a bad index creates no stray bus.
+    if track >= a.player.tracks().len() {
+        return Err(fail(format!("no track {track}")));
+    }
+    let target = match bus {
+        "master" => BusRef::Master,
+        _ => match group_named(&a.player, bus) {
+            Some(id) => BusRef::Group(id),
+            None => BusRef::Group(a.player.add_group(Some(bus.to_string()))),
+        },
+    };
+    a.player.tracks_mut()[track].set_bus(target);
+    let landed = a.player.changed(Change::Structure);
+    let to = match target {
+        BusRef::Master => None,
+        BusRef::Group(id) => {
+            let name = a.player.group(id).and_then(|g| g.name().map(str::to_string));
+            let members = a
+                .player
+                .tracks()
+                .iter()
+                .filter(|t| t.bus() == BusRef::Group(id))
+                .count();
+            Some(RoutedBus {
+                id,
+                name,
+                tracks: members,
+            })
+        }
+    };
+    Ok(Output::Routed {
+        track,
+        to,
+        landed: noting(a, Some(landed)),
+    })
+}
+
+/// The id of the group bus named `name`, when one exists.
+fn group_named(player: &Player<AnyBackend>, name: &str) -> Option<u64> {
+    player
+        .groups()
+        .iter()
+        .find(|g| g.name() == Some(name))
+        .map(Group::id)
+}
+
 /// `set <var> <value>`: set an attribute, and land it on whatever is playing.
 ///
 /// `master` has always been real-time. The rest is arrangement data that the
@@ -1431,6 +1544,9 @@ fn set_command(a: &mut Arrangement, var: &str, value: &str) -> Result<Output, (i
             })
         }
         _ => {
+            if let Some(rest) = var.strip_prefix("bus.") {
+                return set_bus_command(a, rest, value);
+            }
             if let Some(rest) = var.strip_prefix("clip.") {
                 return set_clip_command(a, rest, value);
             }
@@ -1488,6 +1604,75 @@ fn set_command(a: &mut Arrangement, var: &str, value: &str) -> Result<Output, (i
             })
         }
     }
+}
+
+/// `set bus.<id>.<prop>`: set a group bus's strip (`volume`, `muted`) or
+/// its `name`. A strip change is a group edit: no running graph can take it
+/// (the strip is baked when a graph is built), so it waits for an `apply`'s
+/// rebuild. A name is a label, and must be unique among buses — it is what
+/// `route` addresses — and never `master`, which is the master bus's own.
+fn set_bus_command(
+    a: &mut Arrangement,
+    rest: &str,
+    value: &str,
+) -> Result<Output, (i32, String)> {
+    let (id, prop) = rest.split_once('.').ok_or_else(|| {
+        usage(format!("bad bus var bus.{rest:?}: expected bus.ID.PROP"))
+    })?;
+    let id: u64 = id
+        .parse()
+        .map_err(|_| usage(format!("bad bus {id:?}")))?;
+    // A rename must be checked against the table before the bus is touched;
+    // the other properties only need the bus to exist.
+    if prop == "name" {
+        if value == "master" {
+            return Err(usage("'master' is reserved for the master bus"));
+        }
+        if let Some(other) = a
+            .player
+            .groups()
+            .iter()
+            .find(|g| g.id() != id && g.name() == Some(value))
+        {
+            return Err(fail(format!(
+                "a bus named {value:?} already exists as #{}",
+                other.id()
+            )));
+        }
+    }
+    let result = {
+        let bus = a
+            .player
+            .group_mut(id)
+            .ok_or_else(|| fail(format!("no bus {id}")))?;
+        match prop {
+            "volume" => {
+                let v: f32 = value
+                    .parse()
+                    .map_err(|_| usage(format!("bad gain {value:?}")))?;
+                bus.set_gain(v);
+                Ok(SetResult::BusVolume { id, v: bus.gain() })
+            }
+            "muted" => {
+                let b = parse_bool(value).map_err(usage)?;
+                bus.set_muted(b);
+                Ok(SetResult::BusMuted { id, muted: b })
+            }
+            "name" => {
+                bus.set_name(value.to_string());
+                Ok(SetResult::BusName { id, name: value.to_string() })
+            }
+            _ => Err(usage(format!("unknown property {prop:?} on a bus"))),
+        }
+    }?;
+    let landed = match &result {
+        SetResult::BusName { .. } => None,
+        _ => Some(a.player.changed(Change::GroupGain(id))),
+    };
+    Ok(Output::Set {
+        result,
+        landed: noting(a, landed),
+    })
 }
 
 /// `set clip.<track>.<id>.<prop>`: set a clip attribute (`gain`, `fade_in`,
@@ -1728,6 +1913,7 @@ fn command_line(command: &Command) -> String {
             clip,
             dest,
         } => format!("move {track} {} {}", quote_arg(clip), quote_arg(dest)),
+        Command::Route { track, bus } => format!("route {track} {}", quote_arg(bus)),
         Command::Render {
             file,
             range,
@@ -1810,10 +1996,36 @@ fn serialize(a: &Arrangement) -> String {
         if let Some(name) = t.name() {
             let _ = writeln!(out, "set track.{ti}.name {}", quote_arg(name));
         }
+        // A grouped track routes out of the master; the first route line in
+        // the file is what creates the bus, named by it.
+        if let BusRef::Group(id) = t.bus()
+            && let Some(name) = a.player.group(id).and_then(|g| g.name())
+        {
+            let _ = writeln!(out, "route {ti} {}", quote_arg(name));
+        }
         let _ = writeln!(out, "set track.{ti}.volume {}", t.volume());
         let _ = writeln!(out, "set track.{ti}.pan {}", t.pan());
         if t.muted() {
             let _ = writeln!(out, "set track.{ti}.muted true");
+        }
+    }
+    // Bus strips come after every track block: a bus exists in the rebuilt
+    // session from the first route that mentioned it, so only then can its
+    // strip be set. A bus no track was routed to — empty, or its tracks
+    // emptied of clips — is not recreated (empty tracks are not saved either)
+    // and carries no lines.
+    for g in a.player.groups() {
+        let has_member = a
+            .player
+            .tracks()
+            .iter()
+            .any(|t| t.bus() == BusRef::Group(g.id()));
+        if !has_member {
+            continue;
+        }
+        let _ = writeln!(out, "set bus.{}.volume {}", g.id(), g.gain());
+        if g.muted() {
+            let _ = writeln!(out, "set bus.{}.muted true", g.id());
         }
     }
     out
@@ -1907,6 +2119,7 @@ fn help_topic(topic: &str) -> Option<String> {
         "reset" => "bo reset",
         "check" => "bo check",
         "probe" => "bo probe [uri]",
+        "route" => "bo route <track> <bus>     # bus: a name (created by its first\n                              # mention), or master to route back out",
         "set" => "bo set <var> <value>",
         "play" => "bo play",
         "pause" => "bo pause",
@@ -3607,6 +3820,156 @@ mod tests {
         assert!(reply.contains("playing from"), "{reply}");
         wait_until("cleanup", || !socket.exists());
         assert_eq!(handle.join().unwrap(), 0);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A track holding one clip of `len` seconds, with no file behind it —
+    /// enough to route, list and set against, since none of those decode.
+    fn seed_track(uri: &str, len: u64) -> Track {
+        let mut t = Track::new();
+        t.insert(Clip::new(
+            Arc::new(Source {
+                uri: uri.to_string(),
+            }),
+            Duration::from_secs(len),
+        ))
+        .unwrap();
+        t
+    }
+
+    #[test]
+    fn route_creates_and_joins_buses_and_ls_shows_them() {
+        let mut a = Arrangement::default();
+        a.player.add_track(seed_track("bed.wav", 10));
+        a.player.add_track(seed_track("voice.wav", 8));
+
+        assert_eq!(
+            run_ok(&mut a, &["route", "0", "music"]),
+            "ok: track 0 routed to bus #0 'music' (1 track)\n"
+        );
+        assert_eq!(
+            run_ok(&mut a, &["route", "1", "music"]),
+            "ok: track 1 routed to bus #0 'music' (2 tracks)\n"
+        );
+        assert_eq!(a.player.groups().len(), 1, "the second route joined, not created");
+
+        let ls = run_ok(&mut a, &["ls"]);
+        assert!(ls.contains("bus #0 'music' vol=1.00 tracks=2\n"), "{ls}");
+        assert!(
+            ls.contains("track 0 untitled vol=1.00 pan=0.00 end=00:00:10.000 bus=#0 'music'\n"),
+            "{ls}"
+        );
+        assert!(
+            ls.contains("track 1 untitled vol=1.00 pan=0.00 end=00:00:08.000 bus=#0 'music'\n"),
+            "{ls}"
+        );
+
+        // Back to the master: the bus stays, its membership drops.
+        assert_eq!(
+            run_ok(&mut a, &["route", "1", "master"]),
+            "ok: track 1 routed to master\n"
+        );
+        let ls = run_ok(&mut a, &["ls"]);
+        assert!(ls.contains("bus #0 'music' vol=1.00 tracks=1\n"), "{ls}");
+        assert!(
+            !ls.contains("end=00:00:08.000 bus="),
+            "the second track no longer names a bus: {ls}"
+        );
+    }
+
+    #[test]
+    fn route_refuses_what_it_cannot_route() {
+        let mut a = Arrangement::default();
+        a.player.add_track(seed_track("a.wav", 1));
+        let (code, msg) = run_err(&mut a, &["route", "5", "music"]);
+        assert_eq!(code, 1);
+        assert!(msg.contains("no track 5"), "{msg}");
+        assert!(a.player.groups().is_empty(), "a bad track created no stray bus");
+        let (_, msg) = run_err(&mut a, &["route", "0", "   "]);
+        assert!(msg.contains("bus name"), "{msg}");
+    }
+
+    #[test]
+    fn set_bus_edits_the_strip_and_guards_the_name() {
+        let mut a = Arrangement::default();
+        a.player.add_track(seed_track("a.wav", 10));
+        run_ok(&mut a, &["route", "0", "music"]);
+
+        assert_eq!(
+            run_ok(&mut a, &["set", "bus.0.volume", "0.4"]),
+            "ok: `bus.0.volume` set to `0.40`\n"
+        );
+        assert_eq!(run_ok(&mut a, &["set", "bus.0.muted", "true"]), "ok: `bus.0.muted` set to `true`\n");
+        assert_eq!(
+            run_ok(&mut a, &["set", "bus.0.name", "voice"]),
+            "ok: `bus.0.name` set to `voice`\n"
+        );
+        let g = a.player.group(0).unwrap();
+        assert_eq!(g.gain(), 0.4);
+        assert!(g.muted());
+        assert_eq!(g.name(), Some("voice"));
+
+        // Names are what `route` addresses, so they must stay unique.
+        a.player.add_group(Some("music".to_string()));
+        let (code, msg) = run_err(&mut a, &["set", "bus.0.name", "music"]);
+        assert_eq!(code, 1);
+        assert!(msg.contains("already exists as #1"), "{msg}");
+        let (_, msg) = run_err(&mut a, &["set", "bus.0.name", "master"]);
+        assert!(msg.contains("reserved"), "{msg}");
+        let (code, msg) = run_err(&mut a, &["set", "bus.9.volume", "0.5"]);
+        assert_eq!(code, 1);
+        assert!(msg.contains("no bus 9"), "{msg}");
+    }
+
+    #[test]
+    fn a_bus_strip_change_waits_for_apply_while_playing() {
+        let mut a = Arrangement::default();
+        a.player.add_track(seed_track("a.wav", 10));
+        run_ok(&mut a, &["route", "0", "music"]);
+        run_ok(&mut a, &["play"]);
+
+        // A group strip cannot land on the running graph: it waits, and an
+        // apply rebuilds for it — the same note a clip move would give.
+        let reply = run_ok(&mut a, &["set", "bus.0.volume", "0.5"]);
+        assert!(reply.contains("note:"), "{reply}");
+        assert_eq!(a.player.pending(), &[Change::GroupGain(0)]);
+        let reply = run_ok(&mut a, &["apply"]);
+        assert!(reply.contains("rebuilt"), "{reply}");
+        assert!(a.player.pending().is_empty());
+    }
+
+    #[test]
+    fn save_and_load_round_trips_buses_and_routing() {
+        let dir = temp_dir();
+        let file = dir.join("prog.bo");
+        let path = file.to_string_lossy().into_owned();
+        let mut a = Arrangement::default();
+        run_ok(&mut a, &["put", "bed.wav,00:00:00-00:00:10"]);
+        run_ok(&mut a, &["put", "voice.wav,00:00:00-00:00:08", "1@00:00:00"]);
+        run_ok(&mut a, &["route", "0", "music"]);
+        run_ok(&mut a, &["route", "1", "music"]);
+        run_ok(&mut a, &["set", "bus.0.volume", "0.6"]);
+        run_ok(&mut a, &["set", "bus.0.muted", "true"]);
+
+        let script = serialize(&a);
+        assert!(script.contains("route 0 'music'") || script.contains("route 0 music"), "{script}");
+        assert!(script.contains("set bus.0.volume 0.6"), "{script}");
+        assert!(script.contains("set bus.0.muted true"), "{script}");
+        run_ok(&mut a, &["save", &path]);
+
+        let mut b = Arrangement::default();
+        run_ok(&mut b, &["load", &path]);
+        assert_eq!(serialize(&b), script, "buses and routing round trip");
+        assert_eq!(b.player.groups().len(), 1);
+        let g = b.player.group(0).unwrap();
+        assert_eq!(g.gain(), 0.6);
+        assert!(g.muted());
+        assert_eq!(
+            b.player.tracks().iter().filter(|t| t.bus() == BusRef::Group(0)).count(),
+            2,
+            "both tracks came back routed"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

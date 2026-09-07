@@ -135,6 +135,16 @@ pub(crate) struct PlacedClip {
     pub(crate) fade_shape: FadeShape,
 }
 
+/// Where a `route` landed, when it was a group bus: enough to name the
+/// destination and say how many tracks share it.
+#[derive(Debug)]
+pub(crate) struct RoutedBus {
+    pub(crate) id: u64,
+    pub(crate) name: Option<String>,
+    /// Tracks routed into this bus, after the move.
+    pub(crate) tracks: usize,
+}
+
 /// The four shapes of `set`.
 #[derive(Debug)]
 pub(crate) enum SetResult {
@@ -143,6 +153,9 @@ pub(crate) enum SetResult {
     TrackPan { i: usize, v: f32 },
     TrackMuted { i: usize, muted: bool },
     TrackName { i: usize, name: String },
+    BusVolume { id: u64, v: f32 },
+    BusMuted { id: u64, muted: bool },
+    BusName { id: u64, name: String },
     ClipGain { track: usize, id: u64, gain: f32 },
     ClipPan {
         track: usize,
@@ -188,7 +201,29 @@ pub(crate) struct Ls {
     pub(crate) idle_timeout: u64,
     /// Edits a running graph could not take, waiting for the next `apply`.
     pub(crate) pending: usize,
+    /// The group buses (shown to users as plain buses), each with the number
+    /// of tracks routed into it.
+    pub(crate) buses: Vec<LsBus>,
     pub(crate) tracks: Vec<LsTrack>,
+}
+
+/// One group bus as `ls` shows it: its strip, and how many tracks share it.
+#[derive(Debug)]
+pub(crate) struct LsBus {
+    pub(crate) id: u64,
+    pub(crate) name: Option<String>,
+    pub(crate) volume: f32,
+    pub(crate) muted: bool,
+    /// Tracks routed into this bus.
+    pub(crate) tracks: usize,
+}
+
+/// Where a track's output points when it feeds a group bus: enough to name
+/// the bus on the track's own line.
+#[derive(Debug)]
+pub(crate) struct BusLabel {
+    pub(crate) id: u64,
+    pub(crate) name: Option<String>,
 }
 
 #[derive(Debug)]
@@ -197,6 +232,8 @@ pub(crate) struct LsTrack {
     pub(crate) volume: f32,
     pub(crate) pan: f32,
     pub(crate) muted: bool,
+    /// The group bus this track feeds, when it does not feed the master.
+    pub(crate) bus: Option<BusLabel>,
     pub(crate) end: Duration,
     pub(crate) clips: Vec<LsClip>,
 }
@@ -280,6 +317,12 @@ pub(crate) enum Output {
         from_track: usize,
         to_track: usize,
         clip: PlacedClip,
+        landed: Option<Landed>,
+    },
+    Routed {
+        track: usize,
+        /// Where the track's output now points; `None` is the master.
+        to: Option<RoutedBus>,
         landed: Option<Landed>,
     },
     Rendered {
@@ -418,6 +461,9 @@ impl fmt::Display for Output {
                         (format!("track.{i}.muted"), muted.to_string())
                     }
                     SetResult::TrackName { i, name } => (format!("track.{i}.name"), name.clone()),
+                    SetResult::BusVolume { id, v } => (format!("bus.{id}.volume"), Gain(*v).to_string()),
+                    SetResult::BusMuted { id, muted } => (format!("bus.{id}.muted"), muted.to_string()),
+                    SetResult::BusName { id, name } => (format!("bus.{id}.name"), name.clone()),
                     SetResult::ClipGain { track, id, gain } => {
                         (format!("clip.{track}.{id}.gain"), Gain(*gain).to_string())
                     }
@@ -506,6 +552,25 @@ impl fmt::Display for Output {
                         clip.fade_shape,
                     )
                 )?;
+                pending_note(f, *landed)
+            }
+            Self::Routed { track, to, landed } => {
+                match to {
+                    None => writeln!(f, "ok: track {track} routed to master")?,
+                    Some(bus) => {
+                        let name = match &bus.name {
+                            Some(name) => quote(name),
+                            None => "untitled".to_string(),
+                        };
+                        writeln!(
+                            f,
+                            "ok: track {track} routed to bus #{} {name} ({} track{})",
+                            bus.id,
+                            bus.tracks,
+                            plural(bus.tracks)
+                        )?;
+                    }
+                }
                 pending_note(f, *landed)
             }
             Self::Rendered {
@@ -672,20 +737,43 @@ impl fmt::Display for Output {
                     Tc(Duration::from_secs(ls.idle_timeout)),
                     pending
                 )?;
+                for bus in &ls.buses {
+                    let name = match &bus.name {
+                        Some(name) => quote(name),
+                        None => "untitled".to_string(),
+                    };
+                    let muted = if bus.muted { " muted" } else { "" };
+                    writeln!(
+                        f,
+                        "bus #{} {name} vol={} tracks={}{}",
+                        bus.id,
+                        Gain(bus.volume),
+                        bus.tracks,
+                        muted
+                    )?;
+                }
                 for (ti, t) in ls.tracks.iter().enumerate() {
                     let name = match &t.name {
                         Some(name) => quote(name),
                         None => "untitled".to_string(),
                     };
-                    let muted = if t.muted { " muted" } else { "" };
-                    writeln!(
+                    write!(
                         f,
-                        "track {ti} {name} vol={} pan={} end={}{}",
+                        "track {ti} {name} vol={} pan={} end={}",
                         Gain(t.volume),
                         Gain(t.pan),
-                        Tc(t.end),
-                        muted
+                        Tc(t.end)
                     )?;
+                    if t.muted {
+                        write!(f, " muted")?;
+                    }
+                    if let Some(bus) = &t.bus {
+                        write!(f, " bus=#{}", bus.id)?;
+                        if let Some(name) = &bus.name {
+                            write!(f, " {}", quote(name))?;
+                        }
+                    }
+                    writeln!(f)?;
                     for c in &t.clips {
                         writeln!(
                             f,
@@ -781,6 +869,15 @@ pub(crate) fn example_reply(command: &str) -> Option<String> {
             clip: clip(3, "/srv/voice.wav", s(5), D::ZERO, s(10), 0.5),
             landed: None,
         },
+        "route" => Output::Routed {
+            track: 0,
+            to: Some(RoutedBus {
+                id: 0,
+                name: Some("music".into()),
+                tracks: 2,
+            }),
+            landed: None,
+        },
         "ls" => Output::Ls(Ls {
             state: State::Stopped,
             playhead: D::ZERO,
@@ -789,12 +886,23 @@ pub(crate) fn example_reply(command: &str) -> Option<String> {
             volume: 1.0,
             idle_timeout: 600,
             pending: 0,
+            buses: vec![LsBus {
+                id: 0,
+                name: Some("music".into()),
+                volume: 0.7,
+                muted: false,
+                tracks: 1,
+            }],
             tracks: vec![
                 LsTrack {
                     name: Some("bed".into()),
                     volume: 0.4,
                     pan: 0.0,
                     muted: false,
+                    bus: Some(BusLabel {
+                        id: 0,
+                        name: Some("music".into()),
+                    }),
                     end: s(30),
                     clips: vec![LsClip {
                         id: 0,
@@ -816,6 +924,7 @@ pub(crate) fn example_reply(command: &str) -> Option<String> {
                     volume: 0.8,
                     pan: 0.0,
                     muted: true,
+                    bus: None,
                     end: s(8),
                     clips: vec![LsClip {
                         id: 0,
