@@ -136,6 +136,7 @@ pub(crate) struct PlacedClip {
 pub(crate) enum SetResult {
     Master { v: f32 },
     TrackVolume { i: usize, v: f32 },
+    TrackPan { i: usize, v: f32 },
     TrackMuted { i: usize, muted: bool },
     TrackName { i: usize, name: String },
     ClipGain { track: usize, id: u64, gain: f32 },
@@ -185,6 +186,7 @@ pub(crate) struct Ls {
 pub(crate) struct LsTrack {
     pub(crate) name: Option<String>,
     pub(crate) volume: f32,
+    pub(crate) pan: f32,
     pub(crate) muted: bool,
     pub(crate) end: Duration,
     pub(crate) clips: Vec<LsClip>,
@@ -394,6 +396,9 @@ impl fmt::Display for Output {
                     SetResult::Master { v } => ("master".into(), Gain(*v).to_string()),
                     SetResult::TrackVolume { i, v } => {
                         (format!("track.{i}.volume"), Gain(*v).to_string())
+                    }
+                    SetResult::TrackPan { i, v } => {
+                        (format!("track.{i}.pan"), Gain(*v).to_string())
                     }
                     SetResult::TrackMuted { i, muted } => {
                         (format!("track.{i}.muted"), muted.to_string())
@@ -628,8 +633,9 @@ impl fmt::Display for Output {
                     let muted = if t.muted { " muted" } else { "" };
                     writeln!(
                         f,
-                        "track {ti} {name} vol={} end={}{}",
+                        "track {ti} {name} vol={} pan={} end={}{}",
                         Gain(t.volume),
+                        Gain(t.pan),
                         Tc(t.end),
                         muted
                     )?;
@@ -739,6 +745,7 @@ pub(crate) fn example_reply(command: &str) -> Option<String> {
                 LsTrack {
                     name: Some("bed".into()),
                     volume: 0.4,
+                    pan: 0.0,
                     muted: false,
                     end: s(30),
                     clips: vec![LsClip {
@@ -758,6 +765,7 @@ pub(crate) fn example_reply(command: &str) -> Option<String> {
                 LsTrack {
                     name: Some("voice".into()),
                     volume: 0.8,
+                    pan: 0.0,
                     muted: true,
                     end: s(8),
                     clips: vec![LsClip {

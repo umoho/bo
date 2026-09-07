@@ -13,5 +13,6 @@
 //! * [`engine`] — [`engine::Player`]: transport state over stacked tracks, with a
 //!   [`engine::Backend`] seam for whatever actually makes sound.
 
+pub mod bus;
 pub mod engine;
 pub mod track;

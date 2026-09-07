@@ -472,6 +472,8 @@ Arrangement:
 Mix:
   set master <v>           set the master gain, 0..1
   set track.N.volume <v>   set a track's gain, 0..1
+  set track.N.pan <v>      set a track's placement, -1..1 (hard left ..
+                           hard right, 0 center); lands as it is set
   set track.N.muted <b>    mute (true) or restore (false) a track
   set track.N.name <name>  label a track
   set clip.N.N.gain <v>    set a clip's gain, 0..1
@@ -509,7 +511,7 @@ OUTPUT
   signature line, a track a header over its clips:
 
     clip #<id> '<uri>' <from>-<to> @ <at> [gain=..] [fade_in=..] ...
-    track <n> '<name>'|untitled vol=.. end=.. [muted]
+    track <n> '<name>'|untitled vol=.. pan=.. end=.. [muted]
 
   bo help <command> shows that command's reply shape with a real example.
 
@@ -951,6 +953,7 @@ fn arrangement_view(a: &Arrangement) -> Ls {
             .map(|t| LsTrack {
                 name: t.name().map(str::to_string),
                 volume: t.volume(),
+                pan: t.pan(),
                 muted: t.muted(),
                 end: t.duration(),
                 clips: t
@@ -1432,6 +1435,13 @@ fn set_command(a: &mut Arrangement, var: &str, value: &str) -> Result<Output, (i
                         t.set_volume(v);
                         Ok(SetResult::TrackVolume { i: index, v: t.volume() })
                     }
+                    "pan" => {
+                        let v: f32 = value
+                            .parse()
+                            .map_err(|_| usage(format!("bad pan {value:?}: -1..1")))?;
+                        t.set_pan(v);
+                        Ok(SetResult::TrackPan { i: index, v: t.pan() })
+                    }
                     "muted" => {
                         let b = parse_bool(value).map_err(usage)?;
                         t.set_muted(b);
@@ -1449,6 +1459,7 @@ fn set_command(a: &mut Arrangement, var: &str, value: &str) -> Result<Output, (i
             }?;
             let landed = match &result {
                 SetResult::TrackName { .. } => None,
+                SetResult::TrackPan { .. } => Some(a.player.changed(Change::TrackPan(index))),
                 _ => Some(a.player.changed(Change::TrackGain(index))),
             };
             Ok(Output::Set {
@@ -1746,6 +1757,7 @@ fn serialize(a: &Arrangement) -> String {
             let _ = writeln!(out, "set track.{ti}.name {}", quote_arg(name));
         }
         let _ = writeln!(out, "set track.{ti}.volume {}", t.volume());
+        let _ = writeln!(out, "set track.{ti}.pan {}", t.pan());
         if t.muted() {
             let _ = writeln!(out, "set track.{ti}.muted true");
         }
@@ -2875,7 +2887,7 @@ mod tests {
 
         send(&socket, "put a.wav,00:00:00-00:00:10");
         let reply = send(&socket, "ls");
-        assert!(reply.contains("track 0 untitled vol=1.00 end=00:00:10.000") && reply.contains("a.wav"), "{reply}");
+        assert!(reply.contains("track 0 untitled vol=1.00 pan=0.00 end=00:00:10.000") && reply.contains("a.wav"), "{reply}");
 
         let reply = send(&socket, "set track.0.volume 0.5");
         assert!(reply.contains("`track.0.volume` set to `0.50`"), "{reply}");
@@ -3278,9 +3290,11 @@ mod tests {
         let render = parse_command(&["render".to_string(), "--measure".to_string()]).unwrap();
         let reply = dispatch(&mut a, render, "").unwrap().to_string();
         assert!(reply.starts_with("ok: measured 00:00:01.000"), "{reply}");
-        assert!(reply.contains("peak_db=-6.0"), "{reply}");
-        assert!(reply.contains("rms_db=-9.0"), "{reply}");
-        assert!(reply.contains("true_peak_db=-6.0"), "{reply}");
+        // A centered mono source shares its energy across the pair at −3.01
+        // dB, so a 0.5-amplitude sine reads 9 dB under full scale.
+        assert!(reply.contains("peak_db=-9.0"), "{reply}");
+        assert!(reply.contains("rms_db=-12.0"), "{reply}");
+        assert!(reply.contains("true_peak_db=-9.0"), "{reply}");
         assert!(reply.contains("loudest_1s=00:00:00.000"), "{reply}");
         assert!(reply.contains("note: span under 3s"), "under 3 s, no LUFS: {reply}");
         assert!(!reply.contains("integrated_lufs="), "no LUFS under 3 s: {reply}");

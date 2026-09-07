@@ -132,6 +132,9 @@ struct Voice {
     /// The track's gain as built — its volume, or zero when muted — before
     /// the master. Kept so the master can move without a rebuild.
     gain: f32,
+    /// The placement every queued clip of this voice reads, shared so a pan
+    /// set while playing lands on the whole queue as one store.
+    pan: GainCell,
     /// The track timecode this voice's queue runs to: a clip placed at or
     /// past it can be appended, one placed before it cannot.
     queued_until: Duration,
@@ -146,23 +149,27 @@ struct ClipVoice {
 }
 
 /// The parameters a clip's source chain reads while it plays, shared with the
-/// graph that built it: setting a clip's gain or fade is a store into these,
-/// not a rebuild.
+/// graph that built it: setting a clip's gain, fade or pan is a store into
+/// these, not a rebuild.
 #[derive(Debug, Clone)]
 struct ClipParams {
     gain: GainCell,
     fade: Arc<Mutex<Fade>>,
+    /// The track's placement, shared by every clip of one voice: panning the
+    /// track writes one cell, and every queued clip's panner hears it.
+    pan: GainCell,
     /// How far into the clip the graph entered it, so a fade-in edited later
     /// is still measured from the clip's own start.
     into: Duration,
 }
 
 impl ClipParams {
-    /// Parameters holding a plan's values.
-    fn new(plan: &ClipPlan) -> Self {
+    /// Parameters holding a plan's values, placed by the track's shared cell.
+    fn new(plan: &ClipPlan, pan: &GainCell) -> Self {
         Self {
             gain: GainCell::new(plan.gain),
             fade: Arc::new(Mutex::new(plan.fade)),
+            pan: pan.clone(),
             into: plan.into,
         }
     }
@@ -269,18 +276,19 @@ impl Graph {
         let mut staged = Vec::new();
         for track in timeline.tracks() {
             let gain = if track.muted() { 0.0 } else { track.gain() };
+            let pan = GainCell::new(track.pan());
             let mut clips = Vec::new();
             let mut queued_until = at;
             for clip in track.clips() {
-                let params = ClipParams::new(clip);
+                let params = ClipParams::new(clip, &pan);
                 let source = make_source(clip, &params)?;
                 queued_until += clip.delay + clip.length;
                 clips.push((clip.id, params, source));
             }
-            staged.push((track.index(), gain, queued_until, clips));
+            staged.push((track.index(), gain, pan, queued_until, clips));
         }
         let mut voices = Vec::new();
-        for (track, gain, queued_until, clips) in staged {
+        for (track, gain, pan, queued_until, clips) in staged {
             // Queue the clips *before* the voice joins the mixer: rodio
             // bootstraps a new input by pulling it, and an empty queue
             // answers that pull with a few hundred samples of anti-spinlock
@@ -297,6 +305,7 @@ impl Graph {
                 track,
                 player,
                 gain,
+                pan,
                 queued_until,
                 clips: queued,
             });
@@ -360,6 +369,7 @@ impl Graph {
     fn land(&mut self, tracks: &[Track], at: Duration, change: &Change) -> bool {
         match change {
             Change::TrackGain(track) => self.land_track_gain(tracks, *track),
+            Change::TrackPan(track) => self.land_track_pan(tracks, *track),
             Change::ClipParams(track, id) => self.land_clip_params(tracks, *track, *id),
             Change::Appended(track) => self.land_appended(tracks, at, *track),
             Change::Structure => false,
@@ -380,6 +390,22 @@ impl Graph {
         };
         voice.gain = gain;
         voice.player.set_volume(gain * self.master);
+        true
+    }
+
+    /// A track's placement: one store to the pan cell every queued clip of
+    /// its voice reads.
+    fn land_track_pan(&mut self, tracks: &[Track], track: usize) -> bool {
+        let Some(voice) = self.voices.iter_mut().find(|v| v.track == track) else {
+            // No voice: the track is empty or its clips have all finished, so
+            // there is nothing sounding for a pan to act on.
+            return true;
+        };
+        let pan = match tracks.get(track) {
+            Some(t) => t.pan(),
+            None => 0.0,
+        };
+        voice.pan.set(pan);
         true
     }
 
@@ -447,10 +473,17 @@ impl Graph {
             return true; // nothing out there to queue
         };
         let gain = if planned.muted() { 0.0 } else { planned.gain() };
+        // Pan new clips with the voice's own cell when there is one, so a pan
+        // set later still lands on what is appended now; a fresh voice takes
+        // the planned value.
+        let pan = match existing {
+            Some(i) => self.voices[i].pan.clone(),
+            None => GainCell::new(planned.pan()),
+        };
         let mut staged = Vec::new();
         let mut queued_until = from;
         for clip in planned.clips() {
-            let params = ClipParams::new(clip);
+            let params = ClipParams::new(clip, &pan);
             // A source that cannot be built is not this command's problem to
             // report: refuse the live landing, and the rebuild it forces will
             // say why.
@@ -479,6 +512,7 @@ impl Graph {
                     track,
                     player,
                     gain,
+                    pan,
                     queued_until,
                     clips: queued,
                 });
@@ -529,8 +563,133 @@ impl Source for ClockTap {
     }
 }
 
-/// One planned clip as a rodio source chain: positioned at its in-point, cut
-/// to its scheduled length, enveloped, scaled, and delayed to its timecode.
+/// Places one clip's signal on the stereo bus. How it places depends on the
+/// source's own channel layout, which is fixed for the whole clip:
+///
+/// * mono — a point source. It moves with a constant-power law: the two
+///   gains are the cosine and sine of the angle the position maps to, so
+///   their squares always sum to one and the source neither gains nor loses
+///   loudness as it travels between the speakers (or, at center, against a
+///   plain mono file).
+/// * stereo — a sound with width. It is *balanced*: the far side is
+///   attenuated down to silence while the near side is untouched, so its
+///   width is kept as the center of gravity moves.
+/// * wider — downmixed to the front pair first (5.1 by the BS.775 center
+///   and surround coefficients, so a voice on the center channel survives;
+///   other layouts by keeping the first two channels), then balanced.
+///
+/// The position is read from a shared cell, so a pan set while playing
+/// lands on the running chain as one store.
+struct Panner<I> {
+    input: I,
+    pan: GainCell,
+    /// Channels per input frame; fixed by the clip's own layout.
+    ch: usize,
+    /// Samples of the input frame being assembled.
+    buf: Vec<Sample>,
+    /// Output samples ready to hand out — at most one stereo frame.
+    out: [Option<Sample>; 2],
+    out_at: usize,
+    done: bool,
+}
+
+impl<I: Source> Panner<I> {
+    fn new(input: I, pan: GainCell) -> Self {
+        let ch = input.channels().get() as usize;
+        Self {
+            input,
+            pan,
+            ch: ch.max(1),
+            buf: Vec::with_capacity(ch),
+            out: [None, None],
+            out_at: 2,
+            done: false,
+        }
+    }
+}
+
+impl<I: Source> Iterator for Panner<I> {
+    type Item = Sample;
+
+    fn next(&mut self) -> Option<Sample> {
+        loop {
+            if self.out_at < 2 {
+                let s = self.out[self.out_at];
+                self.out_at += 1;
+                if s.is_some() {
+                    return s;
+                }
+                continue;
+            }
+            if self.done {
+                return None;
+            }
+            while self.buf.len() < self.ch {
+                match self.input.next() {
+                    Some(s) => self.buf.push(s),
+                    None => {
+                        // A trailing half frame is dropped.
+                        self.done = true;
+                        return None;
+                    }
+                }
+            }
+            let p = self.pan.get().clamp(-1.0, 1.0);
+            let (gl, gr) = if p <= 0.0 {
+                (1.0, 1.0 + p)
+            } else {
+                (1.0 - p, 1.0)
+            };
+            let (l, r) = match self.ch {
+                1 => {
+                    // A point source, constant power across the speakers:
+                    // -1→(1,0), 0→(√½,√½), +1→(0,1).
+                    let a = (p + 1.0) * std::f32::consts::FRAC_PI_4;
+                    (self.buf[0] * a.cos(), self.buf[0] * a.sin())
+                }
+                6 => {
+                    // 5.1 in L R C LFE Ls Rs order: BS.775 downmix to the
+                    // front pair (center and surrounds at −3.01 dB, LFE
+                    // dropped), then balanced.
+                    let l = self.buf[0] + 0.70710678 * self.buf[2] + 0.70710678 * self.buf[4];
+                    let r = self.buf[1] + 0.70710678 * self.buf[2] + 0.70710678 * self.buf[5];
+                    (l * gl, r * gr)
+                }
+                _ => {
+                    // Stereo, or a layout we cannot place: the front pair,
+                    // balanced (a stereo pair untouched at center).
+                    (self.buf[0] * gl, self.buf[1] * gr)
+                }
+            };
+            self.buf.clear();
+            self.out = [Some(l), Some(r)];
+            self.out_at = 0;
+        }
+    }
+}
+
+impl<I: Source> Source for Panner<I> {
+    fn current_span_len(&self) -> Option<usize> {
+        None
+    }
+
+    fn channels(&self) -> rodio::ChannelCount {
+        nz!(2)
+    }
+
+    fn sample_rate(&self) -> rodio::SampleRate {
+        self.input.sample_rate()
+    }
+
+    fn total_duration(&self) -> Option<Duration> {
+        self.input.total_duration()
+    }
+}
+
+/// Build one clip's source chain, from its in-point in the source to a
+/// placed stereo pair at its timecode, enveloped and scaled by the params
+/// the graph shares.
+///
 /// Shared by playback and render, exactly like the [`Timeline`] it consumes.
 ///
 /// Gain and envelope are read from `params` rather than baked in, so a chain
@@ -539,8 +698,13 @@ impl Source for ClockTap {
 fn make_source(plan: &ClipPlan, params: &ClipParams) -> Result<Box<dyn Source + Send>, String> {
     let decoder = positioned(&plan.uri, plan.from + plan.into)?;
     let faded = apply_fade(decoder.take_duration(plan.length), params, plan.length);
+    // The clip's own silence (its delay) stays in the source's own layout;
+    // the panner after it turns whatever that layout is into the stereo pair
+    // the bus carries. Silence pans to silence, so the gap's timing is
+    // untouched.
+    let placed = Panner::new(faded.delay(plan.delay), params.pan.clone());
     Ok(Box::new(LiveGain::new(
-        faded.delay(plan.delay),
+        placed,
         params.gain.clone(),
     )))
 }
@@ -790,11 +954,12 @@ fn mix(
     let (input, source) = mixer::mixer(nz!(2), nz!(44100));
     for track in timeline.tracks() {
         let gain = if track.muted() { 0.0 } else { track.gain() * master };
+        let pan = GainCell::new(track.pan());
         let mut pending: Vec<Box<dyn Source + Send>> = Vec::new();
         for clip in track.clips() {
             // A render never retunes a clip as it goes, but it builds the same
             // parameters a live graph would, so both sides share one chain.
-            pending.push(make_source(clip, &ClipParams::new(clip))?);
+            pending.push(make_source(clip, &ClipParams::new(clip, &pan))?);
         }
         let mut pending = pending.into_iter();
         let track_source = from_factory(move || pending.next());
@@ -1741,6 +1906,10 @@ mod tests {
         write_index_wav(&ramp, 8);
         let mut track = Track::named("a");
         track.insert(clip_at(ramp.to_str().unwrap(), 0, 8)).unwrap();
+        // A mono source reads back at full amplitude only hard against one
+        // side: centered, the constant-power law shares its energy across the
+        // pair, and the frame index lives in the sample's amplitude.
+        track.set_pan(-1.0);
         let tracks = [track];
 
         let (mut graph, mut output) = graph_on_a_mixer();
@@ -1819,6 +1988,10 @@ mod tests {
         let uri = tone.to_str().unwrap();
         let mut track = Track::named("a");
         let id = track.insert(clip_at(uri, 0, 8)).unwrap();
+        // Hard left, so the mono tone reads back at its written amplitude on
+        // channel 0 (the constant-power law shares it across the pair when
+        // centered).
+        track.set_pan(-1.0);
 
         let (mut graph, mut output) = graph_on_a_mixer();
         graph.play(&[track.clone()], Duration::ZERO).unwrap();

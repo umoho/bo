@@ -12,6 +12,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::bus::{Output, Placement};
+
 /// An audio resource: something that can be decoded and played.
 ///
 /// Shared by reference (`Arc`), because cutting one file into three clips must
@@ -149,6 +151,10 @@ pub struct Clip {
     pub gain: f32,
     /// The fade envelope.
     pub fade: Fade,
+    /// Where this clip sits in the bus space, when it does not follow its
+    /// track's output. `None` (the default) inherits the track's placement;
+    /// the surface for setting a per-clip placement is not open yet.
+    pub placement: Option<Placement>,
 }
 
 impl Clip {
@@ -162,6 +168,7 @@ impl Clip {
             to: length,
             gain: 1.0,
             fade: Fade::default(),
+            placement: None,
         }
     }
 
@@ -175,6 +182,7 @@ impl Clip {
             to,
             gain: 1.0,
             fade: Fade::default(),
+            placement: None,
         }
     }
 
@@ -261,11 +269,14 @@ impl std::error::Error for Overlap {}
 /// Non-overlap is this type's invariant — a single track cannot play two
 /// sources at the same timecode. Stacking happens *across* tracks, which is what
 /// [`Player`](crate::engine::Player) mixes.
+///
+/// A track is content only: what plays, and when. How it sounds in the mix —
+/// its gain, its mute, where it sits — lives on its [`Output`], the edge that
+/// carries this track's signal into the bus layer.
 #[derive(Debug, Clone)]
 pub struct Track {
     name: Option<String>,
-    volume: f32,
-    muted: bool,
+    out: Output,
     clips: Vec<Clip>,
     next_id: u64,
 }
@@ -274,8 +285,7 @@ impl Default for Track {
     fn default() -> Self {
         Self {
             name: None,
-            volume: 1.0,
-            muted: false,
+            out: Output::default(),
             clips: Vec::new(),
             next_id: 0,
         }
@@ -294,8 +304,7 @@ impl Track {
     pub fn named(name: impl Into<String>) -> Self {
         Self {
             name: Some(name.into()),
-            volume: 1.0,
-            muted: false,
+            out: Output::default(),
             clips: Vec::new(),
             next_id: 0,
         }
@@ -312,30 +321,50 @@ impl Track {
         self.name = Some(name.into());
     }
 
-    /// Gain of this track in the mix, `0.0 ..= 1.0`; full gain by default.
+    /// This track's output edge: the strip (gain, mute, placement) and where
+    /// its signal goes.
+    #[must_use]
+    pub fn out(&self) -> &Output {
+        &self.out
+    }
+
+    /// Gain of this track's output in the mix, `0.0 ..= 1.0`; full gain by
+    /// default.
     ///
     /// Volume is arrangement data — the backend reads it from the track when
     /// planning a mix, so gain can never drift from the arrangement.
     #[must_use]
     pub fn volume(&self) -> f32 {
-        self.volume
+        self.out.gain
     }
 
     /// Set the track's gain in the mix, clamped to `0.0 ..= 1.0`.
     pub fn set_volume(&mut self, volume: f32) {
-        self.volume = volume.clamp(0.0, 1.0);
+        self.out.set_gain(volume);
     }
 
     /// Whether the track is muted in the mix.
     #[must_use]
     pub fn muted(&self) -> bool {
-        self.muted
+        self.out.muted
     }
 
     /// Mute or unmute the track. A muted track contributes nothing to the
     /// mix regardless of its volume.
     pub fn set_muted(&mut self, muted: bool) {
-        self.muted = muted;
+        self.out.muted = muted;
+    }
+
+    /// Where this track's output sits on the bus, `-1.0 ..= 1.0` (hard left
+    /// to hard right). Zero — center — is the default.
+    #[must_use]
+    pub fn pan(&self) -> f32 {
+        self.out.placement.position()
+    }
+
+    /// Set the track's placement on the bus, clamped to `-1.0 ..= 1.0`.
+    pub fn set_pan(&mut self, pan: f32) {
+        self.out.placement.set_position(pan);
     }
 
     /// The clips, ordered by track position.

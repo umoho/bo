@@ -19,12 +19,14 @@ pub struct Timeline {
     end: Duration,
 }
 
-/// One track's contribution to the mix: gain and the clips that actually play.
+/// One track's contribution to the mix: its output (gain, placement) and the
+/// clips that actually play.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TrackPlan {
     index: usize,
     gain: f32,
     muted: bool,
+    pan: f32,
     clips: Vec<ClipPlan>,
 }
 
@@ -107,6 +109,7 @@ impl Timeline {
                 index,
                 gain: track.volume(),
                 muted: track.muted(),
+                pan: track.pan(),
                 clips,
             });
         }
@@ -168,6 +171,12 @@ impl TrackPlan {
     #[must_use]
     pub fn muted(&self) -> bool {
         self.muted
+    }
+
+    /// Placement of the track's output on the bus, `-1.0 ..= 1.0`.
+    #[must_use]
+    pub fn pan(&self) -> f32 {
+        self.pan
     }
 
     /// The clips that actually play, in order.

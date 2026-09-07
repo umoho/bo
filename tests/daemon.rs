@@ -190,7 +190,7 @@ fn client_spawns_a_daemon_and_it_cleans_up_when_done() {
 
     // The second command sees the same arrangement over the wire.
     let out = bo(&sp, &["ls"]);
-    assert!(out.contains("track 0 untitled vol=1.00 end=00:00:00.400"), "{out}");
+    assert!(out.contains("track 0 untitled vol=1.00 pan=0.00 end=00:00:00.400"), "{out}");
     let out = bo(&sp, &["set", "track.0.volume", "0.25"]);
     assert!(out.contains("`track.0.volume` set to `0.25`"), "{out}");
 

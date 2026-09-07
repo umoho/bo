@@ -13,6 +13,7 @@ pub mod measure;
 pub mod rodio;
 pub mod timeline;
 
+use crate::bus::Bus;
 use crate::track::{Clip, Track};
 
 /// Why a backend could not do what it was told.
@@ -48,6 +49,8 @@ impl std::error::Error for BackendError {}
 pub enum Change {
     /// A track's gain changed: its volume, or its mute.
     TrackGain(usize),
+    /// A track's placement (pan) changed.
+    TrackPan(usize),
     /// A clip's gain or fade envelope changed.
     ClipParams(usize, u64),
     /// Clips were placed past the end of a track's queued material.
@@ -209,13 +212,14 @@ impl fmt::Display for State {
     }
 }
 
-/// A playhead over a set of simultaneously mixed tracks.
+/// A playhead over a set of simultaneously mixed tracks, and the bus their
+/// outputs feed.
 #[derive(Debug)]
 pub struct Player<B: Backend = Silent> {
     tracks: Vec<Track>,
     playhead: Duration,
     state: State,
-    volume: f32,
+    bus: Bus,
     backend: B,
     /// Arrangement edits the running graph could not take, waiting for the
     /// next `apply`, `play` or `resume`.
@@ -229,13 +233,13 @@ impl Default for Player<Silent> {
 }
 
 impl<B: Backend> Player<B> {
-    /// A stopped player over an empty set of tracks.
+    /// A stopped player over an empty set of tracks and a master bus.
     pub fn new(backend: B) -> Self {
         Self {
             tracks: Vec::new(),
             playhead: Duration::ZERO,
             state: State::Stopped,
-            volume: 1.0,
+            bus: Bus::master(),
             backend,
             pending: Vec::new(),
         }
@@ -289,16 +293,23 @@ impl<B: Backend> Player<B> {
         self.playhead
     }
 
+    /// The master bus: where every track's output lands.
+    #[must_use]
+    pub fn bus(&self) -> &Bus {
+        &self.bus
+    }
+
     /// Master gain, clamped to `0.0 ..= 1.0`.
     #[must_use]
     pub fn volume(&self) -> f32 {
-        self.volume
+        self.bus.gain()
     }
 
     /// Set master gain.
     pub fn set_volume(&mut self, volume: f32) {
-        self.volume = volume.clamp(0.0, 1.0);
-        self.backend.set_volume(self.volume);
+        let v = volume.clamp(0.0, 1.0);
+        self.bus.set_gain(v);
+        self.backend.set_volume(v);
     }
 
     /// The whole arrangement's length: the latest end across tracks.
@@ -335,7 +346,7 @@ impl<B: Backend> Player<B> {
         let Player {
             tracks,
             playhead,
-            volume,
+            bus,
             pending,
             ..
         } = self;
@@ -343,7 +354,7 @@ impl<B: Backend> Player<B> {
             tracks,
             playhead,
             state: State::Stopped,
-            volume,
+            bus,
             backend,
             pending,
         }
