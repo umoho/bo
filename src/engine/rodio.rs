@@ -1,10 +1,12 @@
 //! [`Rodio`]: a real audio [`Backend`] over the system output device.
 //!
 //! The arrangement maps onto rodio's model one to one: each non-empty track
-//! becomes a *voice* — a [`Player`] on the device's mixer, holding a queue
-//! of the clips still to come — at the track's gain times the master; each
-//! clip becomes a decoded source, positioned at its in-point, cut short, and
-//! delayed so it lands at its timecode.
+//! becomes a *voice* — a [`Player`] holding a queue of the clips still to
+//! come — at the track's own gain; each clip becomes a decoded source,
+//! positioned at its in-point, cut short, delayed to its timecode, and
+//! placed on the stereo field. Voices sum into the graph's internal stereo
+//! bus; the master is one gain on that bus's output, and the device's mixer
+//! only ever adapts the one mixed stream to its own channel count.
 //!
 //! A running graph is *edited* where it can be and rebuilt where it cannot.
 //! A clip's gain and fade are read from parameters the graph shares with us,
@@ -51,7 +53,7 @@ impl std::fmt::Debug for Rodio {
         f.debug_struct("Rodio")
             .field("sink", &self.sink)
             .field("voices", &self.graph.voices.len())
-            .field("master", &self.graph.master)
+            .field("master", &self.graph.master.get())
             .finish()
     }
 }
@@ -62,11 +64,10 @@ impl Rodio {
         let mut sink = DeviceSinkBuilder::open_default_sink().map_err(|e| e.to_string())?;
         sink.log_on_drop(false);
         let config = sink.config();
-        let graph = Graph::new(
-            sink.mixer().clone(),
-            config.channel_count().get(),
-            config.sample_rate().get(),
-        );
+        // The graph mixes everything into its own stereo bus and hands the
+        // device's mixer that one stream; the device mixer adapts it to the
+        // output's own channel count.
+        let graph = Graph::new(sink.mixer().clone(), config.sample_rate().get());
         Ok(Self { sink, graph })
     }
 
@@ -105,14 +106,24 @@ impl Backend for Rodio {
     }
 }
 
-/// The live graph: one voice per non-empty track on a mixer, plus the clock
-/// that counts the frames the device has really pulled.
+/// The live graph: voices — one per non-empty track — summing into an
+/// internal stereo bus, whose output carries the master gain into whatever
+/// mixer the device (or a test) pulls.
 ///
+/// The graph owns its own stereo bus instead of adding voices straight to
+/// the device's mixer: every track's placed output is already a stereo pair,
+/// so the bus is the one place they meet, the master is one gain on its
+/// output (a store, not a walk over the voices), and the device side only
+/// ever converts one already-mixed stereo stream to its own channel count.
 /// Kept apart from the device that pulls it, so the whole of it — building a
 /// graph, editing a running one, reading the clock — can be exercised over a
 /// plain mixer with no audio device in sight.
 struct Graph {
-    mixer: Mixer,
+    /// The internal stereo bus every voice feeds.
+    bus: Mixer,
+    /// The master gain, on the bus's output. A live `set master` is one
+    /// store to this cell — the running mix never needs rebuilding.
+    master: GainCell,
     voices: Vec<Voice>,
     clock: Arc<Clock>,
     /// The timecode the graph was built from, and the clock's reading at that
@@ -121,7 +132,6 @@ struct Graph {
     base_frames: u64,
     rate: u32,
     paused: bool,
-    master: f32,
 }
 
 /// One track's place in the mix.
@@ -129,8 +139,9 @@ struct Voice {
     /// The track this voice sounds.
     track: usize,
     player: Player,
-    /// The track's gain as built — its volume, or zero when muted — before
-    /// the master. Kept so the master can move without a rebuild.
+    /// The track's own gain as built — its volume, or zero when muted. Kept
+    /// so the track's strip can move without a rebuild; the master is not
+    /// here, it sits on the bus's output.
     gain: f32,
     /// The placement every queued clip of this voice reads, shared so a pan
     /// set while playing lands on the whole queue as one store.
@@ -207,28 +218,38 @@ struct Clock {
 }
 
 impl Graph {
-    /// An empty graph on `mixer`.
+    /// An empty graph whose bus feeds `device` — the device's mixer, or a
+    /// plain one a test pulls.
     ///
-    /// The clock tap goes on the mixer once and stays. Being infinite, it
-    /// also means the mixer never runs dry: there is always something for the
-    /// device to pull, even between one graph and the next.
-    fn new(mixer: Mixer, channels: u16, rate: u32) -> Self {
+    /// The bus runs at `rate`, the same rate the device pulls, so the
+    /// output needs no resampling on the way out. The clock tap goes on the
+    /// bus once and stays. Being infinite, it also means the bus never runs
+    /// dry: there is always something for the device to pull, even between
+    /// one graph and the next.
+    fn new(device: Mixer, rate: u32) -> Self {
         let clock = Arc::new(Clock::default());
-        mixer.add(ClockTap {
+        let rate_nz = std::num::NonZeroU32::new(rate).expect("a device rate is nonzero");
+        let (bus, bus_out) = mixer::mixer(nz!(2), rate_nz);
+        bus.add(ClockTap {
             clock: clock.clone(),
-            channels: std::num::NonZero::new(channels).unwrap_or(nz!(1)),
-            rate: std::num::NonZero::new(rate).unwrap_or(nz!(1)),
+            channels: nz!(2),
+            rate: rate_nz,
             index: 0,
         });
+        let master = GainCell::new(1.0);
+        // The master sits on the bus's output: whatever the device mixer
+        // (or test) receives is the mixed stereo pair, scaled once. The
+        // device mixer converts that one stream to its own channel count.
+        device.add(LiveGain::new(bus_out, master.clone()));
         Self {
-            mixer,
+            bus,
+            master,
             voices: Vec::new(),
             clock,
             base_at: Duration::ZERO,
             base_frames: 0,
             rate,
             paused: false,
-            master: 1.0,
         }
     }
 
@@ -295,12 +316,12 @@ impl Graph {
             // silence. A voice that arrives already loaded starts on its
             // first frame instead.
             let (player, queue) = Player::new();
-            player.set_volume(gain * self.master);
+            player.set_volume(gain);
             if self.paused {
                 player.pause();
             }
             let queued = Self::attach(&player, clips);
-            self.mixer.add(queue);
+            self.bus.add(queue);
             voices.push(Voice {
                 track,
                 player,
@@ -358,10 +379,10 @@ impl Graph {
     }
 
     fn set_master(&mut self, master: f32) {
-        self.master = master;
-        for voice in &self.voices {
-            voice.player.set_volume(voice.gain * self.master);
-        }
+        // One store to the gain on the bus's output; no voice needs
+        // touching, so a live `set master` costs the same whether one track
+        // or twenty are sounding.
+        self.master.set(master);
     }
 
     /// Take an edit on the running graph; `false` means the graph cannot
@@ -389,7 +410,7 @@ impl Graph {
             _ => 0.0,
         };
         voice.gain = gain;
-        voice.player.set_volume(gain * self.master);
+        voice.player.set_volume(gain);
         true
     }
 
@@ -502,12 +523,12 @@ impl Graph {
             }
             None => {
                 let (player, queue) = Player::new();
-                player.set_volume(gain * self.master);
+                player.set_volume(gain);
                 if self.paused {
                     player.pause();
                 }
                 let queued = Self::attach(&player, staged);
-                self.mixer.add(queue);
+                self.bus.add(queue);
                 self.voices.push(Voice {
                     track,
                     player,
@@ -930,7 +951,12 @@ pub fn render_and_measure(
 
 /// One mix pass over the shared [`Timeline`]: build the 44.1 kHz stereo
 /// mixer with one gain chain per non-empty track, then pull every sample
-/// through an optional wav writer and an optional [`Meter`].
+/// through the master, an optional wav writer and an optional [`Meter`].
+///
+/// The master sits on the bus's output — one scaling of the whole mix —
+/// exactly where it sits in live playback, so a rendered file sounds like
+/// the session. The meter folds the same master-scaled stream the writer
+/// consumes, so the numbers describe what a listener hears.
 ///
 /// The wav is staged in a temporary file next to the target and renamed over
 /// it only after a clean finalize, so a failed render leaves the previous
@@ -954,7 +980,7 @@ fn mix(
     }
     let (input, source) = mixer::mixer(nz!(2), nz!(44100));
     for track in timeline.tracks() {
-        let gain = if track.muted() { 0.0 } else { track.gain() * master };
+        let gain = if track.muted() { 0.0 } else { track.gain() };
         let pan = GainCell::new(track.pan());
         let mut pending: Vec<Box<dyn Source + Send>> = Vec::new();
         for clip in track.clips() {
@@ -1005,6 +1031,9 @@ fn mix(
         None => None,
     };
     let mut meter = measure.then(|| Meter::new(2, 44100));
+    // The master scales the whole mixed stream once, just before it is
+    // written and measured — the render's own bus output.
+    let source = Gain::new(source, master);
     // Consume whole frames: buffer two interleaved samples, feed both the
     // meter and the writer, and drop a trailing half-frame so the stream the
     // file receives is exactly the stream that was measured.
@@ -2017,7 +2046,7 @@ mod tests {
     /// A graph over a plain 44.1 kHz stereo mixer, and the output to pull.
     fn graph_on_a_mixer() -> (Graph, mixer::MixerSource) {
         let (mixer, output) = mixer::mixer(nz!(2), nz!(44100));
-        (Graph::new(mixer, 2, 44_100), output)
+        (Graph::new(mixer, 44_100), output)
     }
 
     #[test]
@@ -2227,6 +2256,37 @@ mod tests {
             (tail - want).abs() < 0.02,
             "centered mono shares its energy: {tail} against {want}"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn master_lands_on_the_running_bus() {
+        // The master used to be multiplied into every voice at build time, so
+        // moving it meant a walk over the voices (cheap, but the wrong place
+        // conceptually — it lives on the bus). Now it is one gain on the
+        // bus's output: a live `set master` is a store, and the whole mix
+        // scales without any voice being touched.
+        let dir = std::env::temp_dir().join(format!("bo-graph-master-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tone = dir.join("tone.wav");
+        write_wav(&tone, 8.0, 440.0, 0.5);
+        let mut track = Track::named("a");
+        track.insert(clip_at(tone.to_str().unwrap(), 0, 8)).unwrap();
+        track.set_pan(-1.0); // full amplitude on channel 0
+
+        let (mut graph, mut output) = graph_on_a_mixer();
+        graph.play(&[track], Duration::ZERO).unwrap();
+        let full = peak(&pull(&mut output, 4_410));
+        assert!((full - 0.5).abs() < 0.02, "full master, peak {full}");
+
+        graph.set_master(0.25);
+        let after = pull(&mut output, 4_410);
+        let tail = peak(&after[2_000..]);
+        assert!(
+            (tail - 0.125).abs() < 0.02,
+            "a quarter master on the bus output: {tail}"
+        );
+        assert_eq!(graph.voices.len(), 1, "no voice was rebuilt or retuned");
         std::fs::remove_dir_all(&dir).ok();
     }
 
