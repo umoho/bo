@@ -12,7 +12,7 @@ Each `bo ...` invocation is one action: place a clip, remove one, move the playh
 
 **bo** is an editing, mixing, and playback tool for agents: slicing sources, placing clips on a timeline, stacking tracks, adjusting gain, fades and mute — auditioning a section while you work, playing a finished arrangement out in full, or rendering it to a file.
 
-What it is **not** — yet — is a DAW: no effects, no automation, and no project files. Clips carry gain and linear fade in/out; tracks carry gain, mute and a placement on the stereo bus (`set track.N.pan`). A placement is a *balance* for a stereo source — the far side is attenuated, keeping its width — and a constant-power *pan* for a mono one: the two sides share its energy, so a voice moved between them never gets louder or quieter (and no longer plays 3 dB hot against the file at center). Wider sources are downmixed to the front pair, so a voice on the center channel of a 5.1 source survives. The data model underneath — `Source` → `Clip` → `Track`, a timeline, a transport — is exactly the spine a CLI DAW is built on. The roadmap is to grow DAW operations onto that spine, not to replace it.
+What it is **not** — yet — is a DAW: no effects, no automation, and no project files. Clips carry gain and linear fade in/out; tracks carry gain, mute and a placement on the stereo bus (`set track.N.pan`). A placement is a *balance* for a stereo source — the far side is attenuated, keeping its width — and a constant-power *pan* for a mono one: the two sides share its energy, so a voice moved between them never gets louder or quieter (and no longer plays 3 dB hot against the file at center). Wider sources are downmixed to the front pair, so a voice on the center channel of a 5.1 source survives. Several tracks can also be routed into one **group bus** (`bo route N name`) — a summing point with a strip of its own over their sum before the master hears it, the radio music bus or voice bus that ducks a whole side of the show with one knob. The data model underneath — `Source` → `Clip` → `Track`, a timeline, a transport, the buses outputs feed — is exactly the spine a CLI DAW is built on. The roadmap is to grow DAW operations onto that spine, not to replace it.
 
 ## Features
 
@@ -20,6 +20,7 @@ What it is **not** — yet — is a DAW: no effects, no automation, and no proje
 - **Built for agents** — one command per invocation, machine-readable replies, stable exit codes: 2 for misuse, 1 for a refused operation.
 - **Play it live, or render it offline** — audition from the playhead mid-edit, play a finished arrangement out end to end (rodio), or mix the whole arrangement — or just a range — to a wav file.
 - **Edit while it plays** — a gain, a fade, a pan or a mute lands on the running mix as it is set, and a clip placed past the end of a track's queue joins that queue, so a show can be remixed and extended on air. `apply` is left for what a running mix cannot take itself — a clip taken or moved — and rebuilds it from where the audio really is, not from a wall clock.
+- **Group buses** — `route` several tracks into one bus and a single strip (volume, mute) controls the whole group, a radio music bus or voice bus; `ls` shows the buses and which track feeds which. Routing and a bus-strip change are structure: they land on the next `apply`, like a clip move.
 - **Silent fallback** — with no audio device the daemon still runs; set `BO_BACKEND=silent` for deterministic, headless tests and CI.
 - **Self-cleaning** — the daemon exits and removes its socket when playback finishes, on `stop`, or after `BO_IDLE_TIMEOUT` seconds of silence (default 600, `0` disables).
 - **Slicing, not files** — `uri,from-to` places any slice of a source anywhere on the timeline; in-points are sample-accurate in live play and offline render alike; no trimming, no copies.
@@ -73,6 +74,33 @@ running queue. `apply` is for the edits a running mix cannot take itself — a
 clip taken or moved — and rebuilds the mix from where the audio really is;
 one that has to wait says so on a `note:` line, and `ls` counts what is
 waiting as `pending=N`.
+
+### Grouping tracks
+
+A set of tracks can share one strip — a radio music bus or voice bus — before the
+master hears them:
+
+```console
+$ bo route 0 music                 # track 0's output joins bus 'music' — created
+ok: track 0 routed to bus #0 'music' (1 track)   # by its first mention, named by it
+$ bo route 1 music
+ok: track 1 routed to bus #0 'music' (2 tracks)
+$ bo set bus.0.volume 0.35         # one knob ducks the whole bus
+ok: `bus.0.volume` set to `0.35`
+$ bo ls
+ok: 2 tracks, 2 clips
+… 'silent' backend, … master=1.00, …
+bus #0 'music' vol=0.35 tracks=2
+  track 0 'bed' vol=1.00 pan=0.00 end=… bus=#0 'music'
+  track 1 'voice' … bus=#0 'music'
+```
+
+A bus strip is baked when a mix is built, so a change to it — and a re-route —
+lands on the next `apply`, the same way a clip taken or moved does. `route
+<track> master` sends a track back out; bus names are unique and are what
+`route` addresses (`master` is reserved); `set bus.N.muted true` mutes the whole
+group. Buses, strips and routing survive `save`/`load`; an empty bus — one no
+track feeds — is not saved (empty tracks are not saved either).
 
 ## License
 
