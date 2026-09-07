@@ -124,7 +124,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use bo::engine::rodio::{
-    measure, probe, probe_sources, render_and_measure, render_to_file, Probing, Rodio, SourceLength,
+    measure, probe, probe_sources, render_and_measure, render_and_measure_mono, render_to_file,
+    render_to_file_mono, Probing, Rodio, SourceLength,
 };
 use bo::engine::{Applied, Backend, BackendError, Change, Landed, Player, Silent, State};
 use bo::track::{Clip, Fade, FadeShape, Source, Track};
@@ -231,6 +232,10 @@ enum Command {
         /// Report peak/RMS/true peak and EBU R128 loudness of the mix.
         #[arg(long)]
         measure: bool,
+        /// Fold the mix to mono (`(L+R)/2`) — a broadcast or single-speaker
+        /// delivery. With `--measure`, the levels describe the mono fold.
+        #[arg(long)]
+        mono: bool,
     },
     /// Write the arrangement as a script of commands.
     Save {
@@ -461,6 +466,9 @@ Arrangement:
                            renders only that span (from- to the end)
                            --measure reports peak/RMS/true peak and EBU
                            R128 loudness; omit the file to measure only
+                           --mono folds the mix to one channel ((L+R)/2),
+                           for broadcast or a single speaker; with
+                           --measure the levels describe the mono fold
   save <file>              write the arrangement as a script
   load <file>              replace the arrangement from a script
   reset                    drop every track and stop; back to a fresh
@@ -804,63 +812,58 @@ fn dispatch(a: &mut Arrangement, command: Command, cwd: &str) -> Result<Output, 
             file,
             range,
             measure,
+            mono,
         } => {
             let file = file.map(|f| absolutize(&f, cwd));
             let (from, to) = match range {
                 Some(r) => parse_range(&r).map_err(usage)?,
                 None => (Duration::ZERO, None),
             };
-            match (file, measure) {
+            let volume = a.player.volume();
+            match (file.as_deref(), measure) {
                 // A bare measure of the whole arrangement.
                 (None, true) => {
                     if a.player.duration() == Duration::ZERO {
                         return Err(fail("no clips: nothing to measure"));
                     }
-                    let (duration, stats) =
-                        render_and_measure(a.player.tracks(), None, from, to, a.player.volume())
-                            .map_err(|e| fail(format!("render failed: {e}")))?;
+                    let (duration, stats) = if mono {
+                        render_and_measure_mono(a.player.tracks(), None, from, to, volume)
+                    } else {
+                        render_and_measure(a.player.tracks(), None, from, to, volume)
+                    }
+                    .map_err(|e| fail(format!("render failed: {e}")))?;
                     Ok(Output::Rendered {
                         file: None,
                         duration,
                         stats: Some(stats),
                     })
                 }
-                (Some(file), measure) => {
+                (Some(path), measure) => {
                     // With --measure, a bare timecode in the file slot is
                     // almost certainly a mistyped range.
-                    if measure
-                        && file.contains('-')
-                        && parse_range(&file).is_ok()
-                    {
+                    if measure && path.contains('-') && parse_range(path).is_ok() {
                         return Err(usage(format!(
-                            "{file:?} looks like a range; `render --measure` measures the whole \
-                             arrangement — to measure a range, write it: `render out.wav {file} \
+                            "{path:?} looks like a range; `render --measure` measures the whole \
+                             arrangement — to measure a range, write it: `render out.wav {path} \
                              --measure`"
                         )));
                     }
-                    let (duration, stats) = if measure {
-                        render_and_measure(
-                            a.player.tracks(),
-                            Some(std::path::Path::new(&file)),
-                            from,
-                            to,
-                            a.player.volume(),
-                        )
-                        .map(|(d, m)| (d, Some(m)))
-                        .map_err(|e| fail(format!("render failed: {e}")))?
+                    let path = std::path::Path::new(path);
+                    let (duration, stats) = if mono && measure {
+                        render_and_measure_mono(a.player.tracks(), Some(path), from, to, volume)
+                            .map(|(d, m)| (d, Some(m)))
+                    } else if mono {
+                        render_to_file_mono(a.player.tracks(), path, from, to, volume)
+                            .map(|d| (d, None))
+                    } else if measure {
+                        render_and_measure(a.player.tracks(), Some(path), from, to, volume)
+                            .map(|(d, m)| (d, Some(m)))
                     } else {
-                        let d = render_to_file(
-                            a.player.tracks(),
-                            &file,
-                            from,
-                            to,
-                            a.player.volume(),
-                        )
-                        .map_err(|e| fail(format!("render failed: {e}")))?;
-                        (d, None)
-                    };
+                        render_to_file(a.player.tracks(), path, from, to, volume).map(|d| (d, None))
+                    }
+                    .map_err(|e| fail(format!("render failed: {e}")))?;
                     Ok(Output::Rendered {
-                        file: Some(file),
+                        file: Some(file.expect("a rendered wav always has a path")),
                         duration,
                         stats,
                     })
@@ -1699,6 +1702,7 @@ fn command_line(command: &Command) -> String {
             file,
             range,
             measure,
+            mono,
         } => {
             let mut line = String::from("render");
             if let Some(f) = file {
@@ -1709,6 +1713,9 @@ fn command_line(command: &Command) -> String {
             }
             if *measure {
                 line.push_str(" --measure");
+            }
+            if *mono {
+                line.push_str(" --mono");
             }
             line
         }
@@ -3330,6 +3337,45 @@ mod tests {
         assert!(!reply.contains("integrated_lufs="), "no LUFS under 3 s: {reply}");
         // Nothing was written.
         assert!(!dir.join("out.wav").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn render_mono_folds_to_one_channel() {
+        // A mono delivery: the file is one channel, and the measured levels
+        // describe that fold. A centered mono source folds back to its own
+        // level (both sides equal, so (L+R)/2 == L), still 9 dB under full
+        // scale for a 0.5-amplitude sine.
+        let dir = temp_dir();
+        let src = dir.join("a.wav");
+        write_test_wav(&src, 1.0, 0.5);
+        let spec = format!("{},00:00:00-00:00:01", src.to_string_lossy());
+        let mut a = Arrangement::default();
+        run_ok(&mut a, &["put", &spec]);
+
+        let out = dir.join("mono.wav");
+        let cmd = parse_command(&[
+            "render".to_string(),
+            out.to_string_lossy().into_owned(),
+            "--mono".to_string(),
+        ])
+        .unwrap();
+        let reply = dispatch(&mut a, cmd, "").unwrap().to_string();
+        assert!(reply.starts_with("ok: rendered"), "{reply}");
+        let decoder =
+            rodio::Decoder::new(std::io::BufReader::new(std::fs::File::open(&out).unwrap()))
+                .unwrap();
+        assert_eq!(decoder.channels().get(), 1, "one channel out");
+        let peak = decoder.fold(0.0f32, |m, s| m.max(s.abs()));
+        assert!(
+            (peak - 0.3535).abs() < 0.02,
+            "centered mono keeps its level when folded: {peak}"
+        );
+
+        let cmd = parse_command(&["render".to_string(), "--measure".to_string(), "--mono".to_string()])
+            .unwrap();
+        let reply = dispatch(&mut a, cmd, "").unwrap().to_string();
+        assert!(reply.contains("peak_db=-9.0"), "{reply}");
         std::fs::remove_dir_all(&dir).ok();
     }
 

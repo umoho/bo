@@ -932,7 +932,21 @@ pub fn render_to_file(
     to: Option<Duration>,
     master: f32,
 ) -> Result<Duration, String> {
-    mix(tracks, Some(path.as_ref()), from, to, master, false).map(|(d, _)| d)
+    mix(tracks, Some(path.as_ref()), from, to, master, false, false).map(|(d, _)| d)
+}
+
+/// Render the mix as a mono delivery: every stereo frame folded to
+/// `(L+R)/2`, so a broadcast / single-speaker audience hears the same
+/// centered energy the stereo mix carries, without opposite-phase content
+/// vanishing. Same staging and frame rules as [`render_to_file`].
+pub fn render_to_file_mono(
+    tracks: &[Track],
+    path: impl AsRef<std::path::Path>,
+    from: Duration,
+    to: Option<Duration>,
+    master: f32,
+) -> Result<Duration, String> {
+    mix(tracks, Some(path.as_ref()), from, to, master, false, true).map(|(d, _)| d)
 }
 
 /// Render the mix and measure it in the same pass. With `path` `Some` the
@@ -946,7 +960,19 @@ pub fn render_and_measure(
     to: Option<Duration>,
     master: f32,
 ) -> Result<(Duration, Measurement), String> {
-    mix(tracks, path, from, to, master, true).map(|(d, m)| (d, m.expect("measured")))
+    mix(tracks, path, from, to, master, true, false).map(|(d, m)| (d, m.expect("measured")))
+}
+
+/// Measure the mono fold of the mix — the numbers a mono delivery is judged
+/// by — without (or with) writing it.
+pub fn render_and_measure_mono(
+    tracks: &[Track],
+    path: Option<&std::path::Path>,
+    from: Duration,
+    to: Option<Duration>,
+    master: f32,
+) -> Result<(Duration, Measurement), String> {
+    mix(tracks, path, from, to, master, true, true).map(|(d, m)| (d, m.expect("measured")))
 }
 
 /// One mix pass over the shared [`Timeline`]: build the 44.1 kHz stereo
@@ -972,6 +998,7 @@ fn mix(
     to: Option<Duration>,
     master: f32,
     measure: bool,
+    mono: bool,
 ) -> Result<(Duration, Option<Measurement>), String> {
     let mut timeline = Timeline::plan(tracks, from);
     if let Some(to) = to {
@@ -1018,7 +1045,7 @@ fn mix(
     let mut writer = match staging.as_ref() {
         Some(tmp) => {
             let spec = hound::WavSpec {
-                channels: 2,
+                channels: if mono { 1 } else { 2 },
                 sample_rate: 44100,
                 bits_per_sample: 32,
                 sample_format: hound::SampleFormat::Float,
@@ -1030,28 +1057,46 @@ fn mix(
         }
         None => None,
     };
-    let mut meter = measure.then(|| Meter::new(2, 44100));
+    let mut meter = measure.then(|| Meter::new(if mono { 1 } else { 2 }, 44100));
     // The master scales the whole mixed stream once, just before it is
     // written and measured — the render's own bus output.
     let source = Gain::new(source, master);
-    // Consume whole frames: buffer two interleaved samples, feed both the
-    // meter and the writer, and drop a trailing half-frame so the stream the
-    // file receives is exactly the stream that was measured.
+    // Consume whole frames: a stereo pair each time (mono folds the pair to
+    // `(L+R)/2`), feed the meter and the writer, and drop a trailing
+    // half-frame so the stream the file receives is exactly the stream that
+    // was measured.
     let mut frame: [f32; 2] = [0.0; 2];
     let mut filled = 0usize;
-    for sample in source {
-        frame[filled] = sample;
-        filled += 1;
-        if filled == 2 {
-            if let Some(m) = meter.as_mut() {
-                m.push(frame[0]);
-                m.push(frame[1]);
+    if mono {
+        for sample in source {
+            frame[filled] = sample;
+            filled += 1;
+            if filled == 2 {
+                let m = (frame[0] + frame[1]) * 0.5;
+                if let Some(meter) = meter.as_mut() {
+                    meter.push(m);
+                }
+                if let Some(w) = writer.as_mut() {
+                    w.write_sample(m).map_err(|e| format!("cannot write wav: {e}"))?;
+                }
+                filled = 0;
             }
-            if let Some(w) = writer.as_mut() {
-                w.write_sample(frame[0]).map_err(|e| format!("cannot write wav: {e}"))?;
-                w.write_sample(frame[1]).map_err(|e| format!("cannot write wav: {e}"))?;
+        }
+    } else {
+        for sample in source {
+            frame[filled] = sample;
+            filled += 1;
+            if filled == 2 {
+                if let Some(m) = meter.as_mut() {
+                    m.push(frame[0]);
+                    m.push(frame[1]);
+                }
+                if let Some(w) = writer.as_mut() {
+                    w.write_sample(frame[0]).map_err(|e| format!("cannot write wav: {e}"))?;
+                    w.write_sample(frame[1]).map_err(|e| format!("cannot write wav: {e}"))?;
+                }
+                filled = 0;
             }
-            filled = 0;
         }
     }
     if let Some(w) = writer {
@@ -1609,6 +1654,48 @@ mod tests {
         let want = 0.5 * std::f32::consts::FRAC_1_SQRT_2;
         assert!((peaks[0] - want).abs() < 0.02, "center reached the left side: {}", peaks[0]);
         assert!((peaks[1] - want).abs() < 0.02, "center reached the right side: {}", peaks[1]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_mono_render_folds_the_stereo_pair() {
+        // Mono delivery folds every frame to (L+R)/2, so a broadcast or a
+        // single speaker hears the centered energy without opposite-phase
+        // content vanishing. A stereo source at L=.5 R=.25 folds to .375.
+        let dir = std::env::temp_dir().join(format!("bo-mono-fold-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.wav");
+        write_split_wav(&a, 1, 44_100, &[0.5, 0.25]);
+        let mut track = Track::named("a");
+        track.insert(clip_at(a.to_str().unwrap(), 0, 1)).unwrap();
+
+        let stereo = dir.join("stereo.wav");
+        render_to_file(&[track.clone()], &stereo, Duration::ZERO, None, 1.0).unwrap();
+        let mono = dir.join("mono.wav");
+        render_to_file_mono(&[track], &mono, Duration::ZERO, None, 1.0).unwrap();
+
+        let peak = |p: &std::path::Path| {
+            let d = Decoder::new(BufReader::new(File::open(p).unwrap())).unwrap();
+            d.fold(0.0f32, |m, s| m.max(s.abs()))
+        };
+        assert_eq!(
+            Decoder::new(BufReader::new(File::open(&mono).unwrap()))
+                .unwrap()
+                .channels()
+                .get(),
+            1,
+            "a mono delivery is one channel"
+        );
+        assert!(
+            (peak(&mono) - 0.375).abs() < 0.02,
+            "fold of (0.5 + 0.25)/2: {}",
+            peak(&mono)
+        );
+        assert!(
+            (peak(&stereo) - 0.5).abs() < 0.02,
+            "the stereo original keeps its left level: {}",
+            peak(&stereo)
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
