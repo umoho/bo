@@ -83,9 +83,10 @@ fn clip_head(id: u64, uri: &str, from: Duration, to: Duration, at: Duration) -> 
     )
 }
 
-/// ` key=value` suffixes for a clip's non-default gain and fades.
+/// ` key=value` suffixes for a clip's non-default gain, placement and fades.
 fn clip_suffix(
     gain: f32,
+    pan: Option<f32>,
     fade_in: Duration,
     fade_in_from: f32,
     fade_out: Duration,
@@ -95,6 +96,9 @@ fn clip_suffix(
     let mut s = String::new();
     if gain != 1.0 {
         s.push_str(&format!(" gain={}", Gain(gain)));
+    }
+    if let Some(p) = pan {
+        s.push_str(&format!(" pan={}", Gain(p)));
     }
     if fade_in > Duration::ZERO {
         s.push_str(&format!(" fade_in={}", Tc(fade_in)));
@@ -140,6 +144,11 @@ pub(crate) enum SetResult {
     TrackMuted { i: usize, muted: bool },
     TrackName { i: usize, name: String },
     ClipGain { track: usize, id: u64, gain: f32 },
+    ClipPan {
+        track: usize,
+        id: u64,
+        pan: Option<f32>,
+    },
     ClipFadeIn { track: usize, id: u64, d: Duration },
     ClipFadeInFrom { track: usize, id: u64, level: f32 },
     ClipFadeOut { track: usize, id: u64, d: Duration },
@@ -200,6 +209,8 @@ pub(crate) struct LsClip {
     pub(crate) from: Duration,
     pub(crate) to: Duration,
     pub(crate) gain: f32,
+    /// The clip's own placement, when it does not follow its track.
+    pub(crate) pan: Option<f32>,
     pub(crate) fade_in: Duration,
     pub(crate) fade_in_from: f32,
     pub(crate) fade_out: Duration,
@@ -330,6 +341,7 @@ impl fmt::Display for Output {
                         clip_head(c.id, &c.uri, c.from, c.to, c.at),
                         clip_suffix(
                             c.gain,
+                            None,
                             c.fade_in,
                             c.fade_in_from,
                             c.fade_out,
@@ -409,6 +421,13 @@ impl fmt::Display for Output {
                     SetResult::ClipGain { track, id, gain } => {
                         (format!("clip.{track}.{id}.gain"), Gain(*gain).to_string())
                     }
+                    SetResult::ClipPan { track, id, pan } => (
+                        format!("clip.{track}.{id}.pan"),
+                        match pan {
+                            Some(v) => Gain(*v).to_string(),
+                            None => "auto".to_string(),
+                        },
+                    ),
                     SetResult::ClipFadeIn { track, id, d } => {
                         (format!("clip.{track}.{id}.fade_in"), Tc(*d).to_string())
                     }
@@ -452,6 +471,7 @@ impl fmt::Display for Output {
                     clip_head(*id, uri, *from, *to, *at),
                     clip_suffix(
                         *gain,
+                        None,
                         *fade_in,
                         *fade_in_from,
                         *fade_out,
@@ -478,6 +498,7 @@ impl fmt::Display for Output {
                     clip_head(clip.id, &clip.uri, clip.from, clip.to, clip.at),
                     clip_suffix(
                         clip.gain,
+                        None,
                         clip.fade_in,
                         clip.fade_in_from,
                         clip.fade_out,
@@ -672,6 +693,7 @@ impl fmt::Display for Output {
                             clip_head(c.id, &c.uri, c.from, c.to, c.at),
                             clip_suffix(
                                 c.gain,
+                                c.pan,
                                 c.fade_in,
                                 c.fade_in_from,
                                 c.fade_out,
@@ -781,6 +803,7 @@ pub(crate) fn example_reply(command: &str) -> Option<String> {
                         from: D::ZERO,
                         to: s(30),
                         gain: 0.5,
+                        pan: None,
                         fade_in: ms(600),
                         fade_in_from: 0.0,
                         fade_out: D::ZERO,
@@ -801,6 +824,7 @@ pub(crate) fn example_reply(command: &str) -> Option<String> {
                         from: D::ZERO,
                         to: s(8),
                         gain: 1.0,
+                        pan: None,
                         fade_in: D::ZERO,
                         fade_in_from: 0.0,
                         fade_out: D::ZERO,

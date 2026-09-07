@@ -54,6 +54,9 @@ pub struct ClipPlan {
     pub gain: f32,
     /// The clip's fade envelope.
     pub fade: crate::track::Fade,
+    /// This clip's own placement, when it does not follow its track: a fixed
+    /// position that overrides the track's pan for the whole clip.
+    pub placement: Option<f32>,
 }
 
 impl Timeline {
@@ -98,6 +101,7 @@ impl Timeline {
                     delay,
                     gain: clip.gain,
                     fade: clip.fade,
+                    placement: clip.placement.map(crate::bus::Placement::position),
                 });
                 previous_end = Some(abs_end);
                 end = end.max(abs_end);

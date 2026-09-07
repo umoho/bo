@@ -175,12 +175,18 @@ struct ClipParams {
 }
 
 impl ClipParams {
-    /// Parameters holding a plan's values, placed by the track's shared cell.
-    fn new(plan: &ClipPlan, pan: &GainCell) -> Self {
+    /// Parameters holding a plan's values, placed by the track's shared cell
+    /// — unless the clip carries its own placement, which gets a fixed cell
+    /// of its own (then panning the track never touches it).
+    fn new(plan: &ClipPlan, track_pan: &GainCell) -> Self {
+        let pan = match plan.placement {
+            Some(pos) => GainCell::new(pos),
+            None => track_pan.clone(),
+        };
         Self {
             gain: GainCell::new(plan.gain),
             fade: Arc::new(Mutex::new(plan.fade)),
-            pan: pan.clone(),
+            pan,
             into: plan.into,
         }
     }
@@ -392,6 +398,7 @@ impl Graph {
             Change::TrackGain(track) => self.land_track_gain(tracks, *track),
             Change::TrackPan(track) => self.land_track_pan(tracks, *track),
             Change::ClipParams(track, id) => self.land_clip_params(tracks, *track, *id),
+            Change::ClipPan(track, id) => self.land_clip_pan(tracks, *track, *id),
             Change::Appended(track) => self.land_appended(tracks, at, *track),
             Change::Structure => false,
         }
@@ -451,6 +458,28 @@ impl Graph {
         queued.params.gain.set(clip.gain);
         if let Ok(mut fade) = queued.params.fade.lock() {
             *fade = clip.fade;
+        }
+        true
+    }
+
+    /// A clip's own placement: a fixed cell of its own, or — when the clip
+    /// has none and follows its track again — the voice's shared cell.
+    fn land_clip_pan(&mut self, tracks: &[Track], track: usize, id: u64) -> bool {
+        let Some(clip) = tracks
+            .get(track)
+            .and_then(|t| t.clips().iter().find(|c| c.id == id))
+        else {
+            return true;
+        };
+        let Some(voice) = self.voices.iter_mut().find(|v| v.track == track) else {
+            return true;
+        };
+        let cell = match clip.placement {
+            Some(p) => GainCell::new(p.position()),
+            None => voice.pan.clone(),
+        };
+        if let Some(queued) = voice.clips.iter_mut().find(|c| c.id == id) {
+            queued.params.pan = cell;
         }
         true
     }
@@ -2312,6 +2341,48 @@ mod tests {
             "a muted track contributes nothing"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_clip_own_placement_overrides_its_track() {
+        // A clip may carry its own placement: then it does not follow the
+        // track's pan. Here the track is hard right, but the second clip
+        // fixes itself hard left.
+        let dir = std::env::temp_dir().join(format!("bo-clip-pan-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.wav");
+        write_wav(&a, 1.0, 440.0, 0.5);
+        let uri = a.to_str().unwrap();
+        let mut track = Track::named("a");
+        track.insert(clip_at(uri, 0, 1)).unwrap();
+        let mut fixed = clip_at(uri, 1, 1);
+        fixed.placement = Some(crate::bus::Placement::Stereo { position: -1.0 });
+        track.insert(fixed).unwrap();
+        track.set_pan(1.0); // everything right, except the fixed clip
+
+        let out = dir.join("out.wav");
+        render_to_file(&[track], &out, Duration::ZERO, None, 1.0).unwrap();
+        let d = Decoder::new(BufReader::new(File::open(&out).unwrap())).unwrap();
+        let samples: Vec<f32> = d.collect();
+        let half = samples.len() / 2; // one second of stereo samples
+        let (l, r) = split_peaks(&samples[..half]);
+        assert!(r > 0.4 && l < 0.01, "first clip follows the track right: {l} {r}");
+        let (l, r) = split_peaks(&samples[half..]);
+        assert!(l > 0.4 && r < 0.01, "the fixed clip sits left: {l} {r}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Peak of the left and right channels of a stereo sample slice.
+    fn split_peaks(samples: &[Sample]) -> (f32, f32) {
+        let (mut l, mut r) = (0.0f32, 0.0f32);
+        for (i, s) in samples.iter().enumerate() {
+            if i % 2 == 0 {
+                l = l.max(s.abs());
+            } else {
+                r = r.max(s.abs());
+            }
+        }
+        (l, r)
     }
 
     #[test]

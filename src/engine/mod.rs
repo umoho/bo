@@ -53,6 +53,8 @@ pub enum Change {
     TrackPan(usize),
     /// A clip's gain or fade envelope changed.
     ClipParams(usize, u64),
+    /// A clip's own placement changed (set, or given back to its track).
+    ClipPan(usize, u64),
     /// Clips were placed past the end of a track's queued material.
     Appended(usize),
     /// The arrangement's shape changed: a clip was removed or moved, or the

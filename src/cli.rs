@@ -52,7 +52,8 @@
 //!   real-time), or `track.N.volume` / `track.N.pan` / `track.N.muted` /
 //!   `track.N.name` /
 //!   `clip.N.N.gain` / `clip.N.N.fade_in` / `clip.N.N.fade_in_from` /
-//!   `clip.N.N.fade_out` / `clip.N.N.fade_out_to` / `clip.N.N.fade_shape`.
+//!   `clip.N.N.fade_out` / `clip.N.N.fade_out_to` / `clip.N.N.fade_shape` /
+//!   `clip.N.N.pan` (a clip's own placement, `auto` to follow the track).
 //!   Gains, pans and fades land on the running graph; a name is a label, and an
 //!   edit made while nothing plays lands at the next `play`.
 //! * `take <track> <clip>` — remove a clip; the clip is addressed by its
@@ -494,6 +495,8 @@ Mix:
   set clip.N.N.fade_out <t> set a clip's fade-out
   set clip.N.N.fade_out_to <v>  set the fade-out's end level, 0..1
   set clip.N.N.fade_shape <s>  set a clip's fade curve (linear)
+  set clip.N.N.pan <v|auto> set a clip's own placement, -1..1 — overrides
+                           the track for that clip; auto follows the track
                            gains and fades land on the mix as they are set,
                            playing or paused; a name is only a label
 
@@ -981,6 +984,7 @@ fn arrangement_view(a: &Arrangement) -> Ls {
                         from: c.from,
                         to: c.to,
                         gain: c.gain,
+                        pan: c.placement.map(bo::bus::Placement::position),
                         fade_in: c.fade.fade_in,
                         fade_in_from: c.fade.fade_in_from,
                         fade_out: c.fade.fade_out,
@@ -1528,6 +1532,27 @@ fn set_clip_command(
                     gain: c.gain,
                 })
             }
+            "pan" => {
+                // A clip's own placement overrides its track for the whole
+                // clip; `auto` gives it back to the track.
+                let pan = match value.trim() {
+                    "auto" => None,
+                    v => {
+                        let p: f32 = v
+                            .parse()
+                            .map_err(|_| usage(format!("bad pan {v:?}: -1..1, or auto")))?;
+                        Some(bo::bus::Placement::Stereo {
+                            position: p.clamp(-1.0, 1.0),
+                        })
+                    }
+                };
+                c.placement = pan;
+                Ok(SetResult::ClipPan {
+                    track: track_i,
+                    id,
+                    pan: pan.map(|pl| pl.position()),
+                })
+            }
             "fade_in" => {
                 let d = parse_timecode(value).map_err(usage)?;
                 c.fade.fade_in = d;
@@ -1572,7 +1597,11 @@ fn set_clip_command(
             _ => Err(usage(format!("unknown property {prop:?} on a clip"))),
         }
     }?;
-    let landed = a.player.changed(Change::ClipParams(track_i, id));
+    let change = match &result {
+        SetResult::ClipPan { track, id, .. } => Change::ClipPan(*track, *id),
+        _ => Change::ClipParams(track_i, id),
+    };
+    let landed = a.player.changed(change);
     Ok(Output::Set {
         result,
         landed: noting(a, Some(landed)),
@@ -1771,6 +1800,10 @@ fn serialize(a: &Arrangement) -> String {
             // as its own set line rather than a put flag.
             if c.fade.shape != FadeShape::Linear {
                 let _ = writeln!(out, "set clip.{ti}.{}.fade_shape {}", c.id, c.fade.shape);
+            }
+            // A clip that carries its own placement serializes the same way.
+            if let Some(p) = c.placement {
+                let _ = writeln!(out, "set clip.{ti}.{}.pan {}", c.id, p.position());
             }
         }
         if let Some(name) = t.name() {
@@ -3258,6 +3291,49 @@ mod tests {
         let mut fresh = Arrangement::default();
         run_script(&mut fresh, &script, "test", "").unwrap();
         assert_eq!(serialize(&fresh), script, "the script rebuilds the same arrangement");
+    }
+
+    #[test]
+    fn a_clips_own_placement_sets_shows_and_round_trips() {
+        let mut a = Arrangement::default();
+        run_ok(&mut a, &["put", "a.wav,0-5"]);
+        run_ok(&mut a, &["put", "b.wav,0-5", "0@00:00:05"]);
+
+        // Set one clip's own placement; the other follows the track.
+        let out = run_ok(&mut a, &["set", "clip.0.1.pan", "-1"]);
+        assert!(out.contains("`clip.0.1.pan` set to `-1.00`"), "{out}");
+        assert_eq!(
+            a.player.tracks()[0].clips()[1].placement.map(|p| p.position()),
+            Some(-1.0)
+        );
+        assert_eq!(a.player.tracks()[0].clips()[0].placement, None, "clip 0 still follows");
+
+        // ls shows the override on the clip line, and the reply clamps.
+        let ls = run_ok(&mut a, &["ls"]);
+        assert!(ls.contains("pan=-1.00"), "ls shows the override: {ls}");
+        run_ok(&mut a, &["set", "clip.0.1.pan", "5"]);
+        assert_eq!(
+            a.player.tracks()[0].clips()[1].placement.map(|p| p.position()),
+            Some(1.0),
+            "clamped to the field"
+        );
+        run_ok(&mut a, &["set", "track.0.pan", "0.5"]);
+        assert_eq!(a.player.tracks()[0].pan(), 0.5);
+
+        // auto gives the clip back to its track.
+        let out = run_ok(&mut a, &["set", "clip.0.1.pan", "auto"]);
+        assert!(out.contains("`clip.0.1.pan` set to `auto`"), "{out}");
+        assert_eq!(a.player.tracks()[0].clips()[1].placement, None);
+        let ls = run_ok(&mut a, &["ls"]);
+        assert!(!ls.contains("pan=-1.00"), "the override is gone: {ls}");
+
+        // A saved arrangement carries the override and rebuilds with it.
+        run_ok(&mut a, &["set", "clip.0.0.pan", "-0.5"]);
+        let script = serialize(&a);
+        assert!(script.contains("set clip.0.0.pan -0.5"), "{script}");
+        let mut fresh = Arrangement::default();
+        run_script(&mut fresh, &script, "test", "").unwrap();
+        assert_eq!(serialize(&fresh), script, "round trip with the override");
     }
 
     #[test]
