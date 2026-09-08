@@ -48,14 +48,15 @@
 //!   playing it, and a clip placed past the end of a track's queue is
 //!   appended to it. `apply` is for what a running graph cannot take — a clip
 //!   taken or moved — and rebuilds the graph from where the audio really is.
-//! * `set <var> <value>` — set an attribute and land it: `master` (always
-//!   real-time), or `track.N.volume` / `track.N.pan` / `track.N.muted` /
-//!   `track.N.name` /
-//!   `clip.N.N.gain` / `clip.N.N.fade_in` / `clip.N.N.fade_in_from` /
-//!   `clip.N.N.fade_out` / `clip.N.N.fade_out_to` / `clip.N.N.fade_shape` /
-//!   `clip.N.N.pan` (a clip's own placement, `auto` to follow the track).
-//!   Gains, pans and fades land on the running graph; a name is a label, and an
-//!   edit made while nothing plays lands at the next `play`.
+//! * `set <var> <value>` — set an attribute and land it; a bare `set`
+//!   lists every current var and value. The key space is one registry:
+//!   `master` (always real-time), `track.N.volume/pan/muted/name`,
+//!   `bus.N.volume/muted/name`, and `clip.N.N.gain/pan/fade_in/fade_in_from/
+//!   fade_out/fade_out_to/fade_shape/pan_control/gain_control`. A plain value
+//!   is a token (a gain, a timecode, a boolean, a name); only the two
+//!   `*_control` properties take a one-line JSON source (`none` unplugs).
+//!   Gains, pans and fades land on the running graph; a name is a label, and
+//!   an edit made while nothing plays lands at the next `play`.
 //! * `take <track> <clip>` — remove a clip; the clip is addressed by its
 //!   stable id or an `@timecode` (the clip covering that moment).
 //! * `move <track> <clip> <dest>` — move a clip to another track, or to a
@@ -139,7 +140,7 @@ mod reply;
 
 use reply::{
     ApplyReport, AtLine, BusLabel, Ls, LsBus, LsClip, LsTrack, Output, PlacedClip, ProbeResult,
-    RoutedBus, SetResult, Tc,
+    RoutedBus, Tc,
 };
 
 /// bo — edit and mix audio, one command at a time.
@@ -277,15 +278,17 @@ enum Command {
         /// Source uri to measure; omit to probe the arrangement's sources.
         uri: Option<String>,
     },
-    /// Set an attribute: `master`, or `track.N.volume` / `track.N.pan` /
-    /// `track.N.muted` / `track.N.name`.
+    /// Set an attribute, or — with no arguments at all — list every
+    /// current var and value. `master`, or `track.N.<prop>` /
+    /// `bus.N.<prop>` / `clip.T.C.<prop>`.
     Set {
-        /// Attribute path.
-        var: String,
-        /// Value: a gain, a pan, `true`/`false`, or a name. A pan may lead
+        /// Attribute path; omit to list every current var and value.
+        var: Option<String>,
+        /// Value: a gain, a pan, `true`/`false`, a name, or (for the two
+        /// `*_control` properties) a one-line JSON source. A pan may lead
         /// with `-`, so values are read as-is rather than as flags.
         #[arg(allow_hyphen_values = true)]
-        value: String,
+        value: Option<String>,
     },
     /// Start playback from the current playhead.
     Play,
@@ -506,38 +509,22 @@ Arrangement:
                            arrangement
 
 Mix:
-  set master <v>           set the master gain, 0..1
-  set track.N.volume <v>   set a track's gain, 0..1
-  set track.N.pan <v>      set a track's placement, -1..1 (hard left ..
-                           hard right, 0 center); lands as it is set
-  set track.N.muted <b>    mute (true) or restore (false) a track
-  set track.N.name <name>  label a track
-  set bus.N.volume <v>     set a group bus's gain, 0..1 (lands on an apply)
-  set bus.N.muted <b>      mute (true) or restore (false) a group bus
-  set bus.N.name <name>    relabel a group bus; names are unique
-  set clip.N.N.gain <v>    set a clip's gain, 0..1
-  set clip.N.N.fade_in <t> set a clip's fade-in
-  set clip.N.N.fade_in_from <v>  set the fade-in's start level, 0..1
-  set clip.N.N.fade_out <t> set a clip's fade-out
-  set clip.N.N.fade_out_to <v>  set the fade-out's end level, 0..1
-  set clip.N.N.fade_shape <s>  set a clip's fade curve (linear)
-  set clip.N.N.pan <v|auto> set a clip's own placement, -1..1 — overrides
-                           the track for that clip; auto follows the track
-  set clip.N.N.pan_control <src>
-                           plug one source into the clip's pan input — a
-                           gesture like a right-to-left sweep is a curve,
-                           '{\"type\":\"curve\",\"0\":1,\"3.2\":-1}' (time=value
-                           points, linear, held flat), or a wobble is an LFO,
-                           '{\"type\":\"lfo\",\"shape\":\"sine\",\"rate\":1,\"depth\":0.5}' —
-                           'none' unplugs. The
-                           source offsets the static pan as the clip plays,
-                           identically live and rendered
-  set clip.N.N.gain_control <src>
-                           the same, into the clip's gain: a source ducks or
-                           swells the clip's own volume as it plays ('none'
-                           unplugs)
-                           gains and fades land on the mix as they are set,
-                           playing or paused; a name is only a label
+  set <var> <value>        set an attribute and land it on the running mix
+                           (playing or paused; a name is only a label). With
+                           no var at all, `bo set` lists every current var
+                           and value — the key space below, one row each:
+                           master, track.N.volume/pan/muted/name,
+                           bus.N.volume/muted/name, and clip.T.C.gain/pan/
+                           fade_in/fade_in_from/fade_out/fade_out_to/
+                           fade_shape/pan_control/gain_control.
+                           A plain value is a token: a gain, a timecode, a
+                           boolean, a name. Only the two *_control properties
+                           take a one-line JSON object — a curve
+                           '{\"type\":\"curve\",\"0\":1,\"3.2\":-1}', an lfo
+                           '{\"type\":\"lfo\",\"shape\":\"sine\",\"rate\":1,\"depth\":0.5}'
+                           or a sidechain '{\"type\":\"sidechain\",\"bus\":\"group.0\"}'
+                           — and \"none\" unplugs. Timecodes may be typed as
+                           bare seconds (3.2, 0.005).
 
 Transport:
   play                     start playback from the current playhead
@@ -833,7 +820,15 @@ fn dispatch(a: &mut Arrangement, command: Command, cwd: &str) -> Result<Output, 
             Ok(Output::Seeked { at: t })
         }
         Command::Apply => apply_command(a),
-        Command::Set { var, value } => set_command(a, &var, &value),
+        Command::Set { var, value } => match (var, value) {
+            (None, None) => set_list(a),
+            (Some(var), None) => Err(usage(format!(
+                "set {var:?} needs a <value>; `bo set` with no var lists the current vars and values"
+            ))),
+            (Some(var), Some(value)) => set_command(a, &var, &value),
+            // <var> comes first positionally, so a value can never arrive alone.
+            (None, Some(_)) => unreachable!(),
+        },
         Command::Take { track, clip } => take_command(a, track, &clip),
         Command::Move { track, clip, dest } => move_command(a, track, &clip, &dest),
         Command::Route { track, bus } => route_command(a, track, &bus),
@@ -1547,79 +1542,60 @@ fn group_named(player: &Player<AnyBackend>, name: &str) -> Option<u64> {
 /// running graph is asked to take as it is — a track's gain, a clip's gain and
 /// fades — and only what a graph cannot express waits for an `apply`. A name
 /// is a label rather than part of the mix, so there is nothing to land.
+///
+/// The key space is the registry below: one property enum per object kind,
+/// each variant knowing its key, how a value is parsed and applied, its
+/// canonical current value, and what a change to it means in the mix. The
+/// set paths (`master`, `track.N.<prop>`, `bus.N.<prop>`,
+/// `clip.T.C.<prop>`) are parsed here; the property names themselves come
+/// from the enums, so the reply, the errors and `bo set`'s listing can never
+/// drift from what `set` accepts.
 fn set_command(a: &mut Arrangement, var: &str, value: &str) -> Result<Output, (i32, String)> {
-    match var {
-        "master" => {
-            let v: f32 = value
-                .parse()
-                .map_err(|_| usage(format!("bad gain {value:?}")))?;
-            a.player.set_volume(v);
-            Ok(Output::Set {
-                result: SetResult::Master { v: a.player.volume() },
-                landed: None,
-            })
-        }
-        _ => {
-            if let Some(rest) = var.strip_prefix("bus.") {
-                return set_bus_command(a, rest, value);
-            }
-            if let Some(rest) = var.strip_prefix("clip.") {
-                return set_clip_command(a, rest, value);
-            }
-            let (index, prop) = var
-                .strip_prefix("track.")
-                .and_then(|rest| rest.split_once('.'))
-                .ok_or_else(|| usage(format!("unknown var {var:?}")))?;
-            let index: usize = index
-                .parse()
-                .map_err(|_| usage(format!("bad track {index:?}")))?;
-            let result = {
-                let t = a
-                    .player
-                    .tracks_mut()
-                    .get_mut(index)
-                    .ok_or_else(|| fail(format!("no track {index}")))?;
-                match prop {
-                    "volume" => {
-                        let v: f32 = value
-                            .parse()
-                            .map_err(|_| usage(format!("bad gain {value:?}")))?;
-                        t.set_volume(v);
-                        Ok(SetResult::TrackVolume { i: index, v: t.volume() })
-                    }
-                    "pan" => {
-                        let v: f32 = value
-                            .parse()
-                            .map_err(|_| usage(format!("bad pan {value:?}: -1..1")))?;
-                        t.set_pan(v);
-                        Ok(SetResult::TrackPan { i: index, v: t.pan() })
-                    }
-                    "muted" => {
-                        let b = parse_bool(value).map_err(usage)?;
-                        t.set_muted(b);
-                        Ok(SetResult::TrackMuted { i: index, muted: b })
-                    }
-                    "name" => {
-                        t.set_name(value.to_string());
-                        Ok(SetResult::TrackName {
-                            i: index,
-                            name: value.to_string(),
-                        })
-                    }
-                    _ => Err(usage(format!("unknown property {prop:?} on a track"))),
-                }
-            }?;
-            let landed = match &result {
-                SetResult::TrackName { .. } => None,
-                SetResult::TrackPan { .. } => Some(a.player.changed(Change::TrackPan(index))),
-                _ => Some(a.player.changed(Change::TrackGain(index))),
-            };
-            Ok(Output::Set {
-                result,
-                landed: noting(a, landed),
-            })
-        }
+    if var == "master" {
+        return set_master(a, value);
     }
+    if let Some(rest) = var.strip_prefix("bus.") {
+        return set_bus_command(a, rest, value);
+    }
+    if let Some(rest) = var.strip_prefix("clip.") {
+        return set_clip_command(a, rest, value);
+    }
+    let (index, prop) = var
+        .strip_prefix("track.")
+        .and_then(|rest| rest.split_once('.'))
+        .ok_or_else(|| usage(unknown_var(var)))?;
+    let index: usize = index
+        .parse()
+        .map_err(|_| usage(format!("bad track {index:?}")))?;
+    let prop = TrackProp::parse(prop).map_err(usage)?;
+    let (value, change) = {
+        let t = a
+            .player
+            .tracks_mut()
+            .get_mut(index)
+            .ok_or_else(|| fail(format!("no track {index}")))?;
+        prop.apply(t, value).map_err(usage)?;
+        (prop.read(t), prop.change(index))
+    };
+    let landed = land(a, change);
+    Ok(Output::Set {
+        var: format!("track.{index}.{}", prop.key()),
+        value,
+        landed,
+    })
+}
+
+/// `set master <v>`: the master bus's gain. Always real-time.
+fn set_master(a: &mut Arrangement, value: &str) -> Result<Output, (i32, String)> {
+    let v: f32 = value
+        .parse()
+        .map_err(|_| usage(format!("bad gain {value:?}")))?;
+    a.player.set_volume(v);
+    Ok(Output::Set {
+        var: "master".into(),
+        value: two(a.player.volume()),
+        landed: None,
+    })
 }
 
 /// `set bus.<id>.<prop>`: set a group bus's strip (`volume`, `muted`) or
@@ -1638,9 +1614,10 @@ fn set_bus_command(
     let id: u64 = id
         .parse()
         .map_err(|_| usage(format!("bad bus {id:?}")))?;
+    let prop = BusProp::parse(prop).map_err(usage)?;
     // A rename must be checked against the table before the bus is touched;
     // the other properties only need the bus to exist.
-    if prop == "name" {
+    if prop == BusProp::Name {
         if value == "master" {
             return Err(usage("'master' is reserved for the master bus"));
         }
@@ -1656,44 +1633,25 @@ fn set_bus_command(
             )));
         }
     }
-    let result = {
+    let (value, change) = {
         let bus = a
             .player
             .group_mut(id)
             .ok_or_else(|| fail(format!("no bus {id}")))?;
-        match prop {
-            "volume" => {
-                let v: f32 = value
-                    .parse()
-                    .map_err(|_| usage(format!("bad gain {value:?}")))?;
-                bus.set_gain(v);
-                Ok(SetResult::BusVolume { id, v: bus.gain() })
-            }
-            "muted" => {
-                let b = parse_bool(value).map_err(usage)?;
-                bus.set_muted(b);
-                Ok(SetResult::BusMuted { id, muted: b })
-            }
-            "name" => {
-                bus.set_name(value.to_string());
-                Ok(SetResult::BusName { id, name: value.to_string() })
-            }
-            _ => Err(usage(format!("unknown property {prop:?} on a bus"))),
-        }
-    }?;
-    let landed = match &result {
-        SetResult::BusName { .. } => None,
-        _ => Some(a.player.changed(Change::GroupGain(id))),
+        prop.apply(bus, value).map_err(usage)?;
+        (prop.read(bus), prop.change(id))
     };
+    let landed = land(a, change);
     Ok(Output::Set {
-        result,
-        landed: noting(a, landed),
+        var: format!("bus.{id}.{}", prop.key()),
+        value,
+        landed,
     })
 }
 
-/// `set clip.<track>.<id>.<prop>`: set a clip attribute (`gain`, `fade_in`,
-/// `fade_out`, `fade_shape`) and land it on the clip's own source chain, which
-/// reads its gain and envelope as it plays.
+/// `set clip.<track>.<id>.<prop>`: set a clip attribute and land it on the
+/// clip's own source chain, which reads its gain, placement and envelope as
+/// it plays.
 fn set_clip_command(
     a: &mut Arrangement,
     rest: &str,
@@ -1713,7 +1671,8 @@ fn set_clip_command(
         .parse()
         .map_err(|_| usage(format!("bad track {track:?}")))?;
     let id: u64 = id.parse().map_err(|_| usage(format!("bad clip id {id:?}")))?;
-    let result = {
+    let prop = ClipProp::parse(prop).map_err(usage)?;
+    let (value, change) = {
         let t = a
             .player
             .tracks_mut()
@@ -1722,136 +1681,417 @@ fn set_clip_command(
         let c = t
             .clip_mut(id)
             .ok_or_else(|| fail(format!("no clip {track_i}#{id}")))?;
-        match prop {
-            "gain" => {
+        prop.apply(c, value).map_err(usage)?;
+        (prop.read(c), prop.change(track_i, id))
+    };
+    let landed = land(a, change);
+    Ok(Output::Set {
+        var: format!("clip.{track_i}.{id}.{}", prop.key()),
+        value,
+        landed,
+    })
+}
+
+/// `set` with no var: list every current var and value, row by row, from
+/// the same registry `set` applies through. Master first; then each track's
+/// properties and its clips' non-default ones; the group buses last. A clip
+/// row only appears when the clip does not already carry the default, so an
+/// untouched clip is quiet rather than ten lines of noise.
+fn set_list(a: &Arrangement) -> Result<Output, (i32, String)> {
+    let tracks = a.player.tracks().len();
+    let clips: usize = a.player.tracks().iter().map(|t| t.clips().len()).sum();
+    let buses = a.player.groups().len();
+    let mut rows: Vec<(String, String)> = vec![("master".into(), two(a.player.volume()))];
+    for (i, t) in a.player.tracks().iter().enumerate() {
+        for p in TrackProp::ALL {
+            if let Some(v) = p.row(t) {
+                rows.push((format!("track.{i}.{}", p.key()), v));
+            }
+        }
+        for c in t.clips() {
+            for p in ClipProp::ALL {
+                if let Some(v) = p.row(c) {
+                    rows.push((format!("clip.{i}.{}.{}", c.id, p.key()), v));
+                }
+            }
+        }
+    }
+    for g in a.player.groups() {
+        for p in BusProp::ALL {
+            if let Some(v) = p.row(g) {
+                rows.push((format!("bus.{}.{}", g.id(), p.key()), v));
+            }
+        }
+    }
+    Ok(Output::SetList { rows, tracks, clips, buses })
+}
+
+/// Land a change on the running graph and decide whether the reply should
+/// say so (only a pending edit made while something plays).
+fn land(a: &mut Arrangement, change: Option<Change>) -> Option<Landed> {
+    match change {
+        Some(change) => {
+            let landed = a.player.changed(change);
+            noting(a, Some(landed))
+        }
+        None => None,
+    }
+}
+
+/// A var that names no set target, told with the whole key space.
+fn unknown_var(var: &str) -> String {
+    format!(
+        "unknown var {var:?}: set takes master, track.N.<prop>, bus.N.<prop> \
+         or clip.T.C.<prop> — `bo set` lists the current ones"
+    )
+}
+
+/// A level at two decimals, the reply's gain dialect.
+fn two(v: f32) -> String {
+    format!("{v:.2}")
+}
+
+/// The registry of a track's properties: every `track.N.<prop>` key is one
+/// variant, knowing its name, how a value is parsed and applied, its
+/// canonical current value, and what a change to it means to a running mix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrackProp {
+    Volume,
+    Pan,
+    Muted,
+    Name,
+}
+
+impl TrackProp {
+    const ALL: [Self; 4] = [Self::Volume, Self::Pan, Self::Muted, Self::Name];
+
+    fn key(self) -> &'static str {
+        match self {
+            Self::Volume => "volume",
+            Self::Pan => "pan",
+            Self::Muted => "muted",
+            Self::Name => "name",
+        }
+    }
+
+    fn parse(name: &str) -> Result<Self, String> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|p| p.key() == name)
+            .ok_or_else(|| {
+                format!(
+                    "no track property {name:?} — try {}",
+                    Self::ALL.iter().map(|p| p.key()).collect::<Vec<_>>().join(", ")
+                )
+            })
+    }
+
+    fn apply(self, t: &mut Track, value: &str) -> Result<(), String> {
+        match self {
+            Self::Volume => {
                 let v: f32 = value
                     .parse()
-                    .map_err(|_| usage(format!("bad gain {value:?}")))?;
-                c.gain = v.clamp(0.0, 1.0);
-                Ok(SetResult::ClipGain {
-                    track: track_i,
-                    id,
-                    gain: c.gain,
-                })
+                    .map_err(|_| format!("bad gain {value:?}"))?;
+                t.set_volume(v);
             }
-            "pan" => {
+            Self::Pan => {
+                let v: f32 = value
+                    .parse()
+                    .map_err(|_| format!("bad pan {value:?}: -1..1"))?;
+                t.set_pan(v);
+            }
+            Self::Muted => {
+                let b = parse_bool(value)?;
+                t.set_muted(b);
+            }
+            Self::Name => t.set_name(value.to_string()),
+        }
+        Ok(())
+    }
+
+    /// The canonical current value, the dialect replies and `bo set` share.
+    fn read(self, t: &Track) -> String {
+        match self {
+            Self::Volume => two(t.volume()),
+            Self::Pan => two(t.pan()),
+            Self::Muted => t.muted().to_string(),
+            Self::Name => t.name().unwrap_or_default().to_string(),
+        }
+    }
+
+    /// What a change to this property means in the mix; a name is a label and
+    /// changes nothing.
+    fn change(self, i: usize) -> Option<Change> {
+        match self {
+            Self::Volume | Self::Muted => Some(Change::TrackGain(i)),
+            Self::Pan => Some(Change::TrackPan(i)),
+            Self::Name => None,
+        }
+    }
+
+    /// The row `bo set` lists for this property on `t`, when the property is
+    /// worth a row (a mute off and an unnamed track are the defaults, so they
+    /// are absent rather than noise).
+    fn row(self, t: &Track) -> Option<String> {
+        let worth = match self {
+            Self::Volume | Self::Pan => true,
+            Self::Muted => t.muted(),
+            Self::Name => t.name().is_some(),
+        };
+        worth.then(|| self.read(t))
+    }
+}
+
+/// The registry of a group bus's properties: `bus.N.<prop>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BusProp {
+    Volume,
+    Muted,
+    Name,
+}
+
+impl BusProp {
+    const ALL: [Self; 3] = [Self::Volume, Self::Muted, Self::Name];
+
+    fn key(self) -> &'static str {
+        match self {
+            Self::Volume => "volume",
+            Self::Muted => "muted",
+            Self::Name => "name",
+        }
+    }
+
+    fn parse(name: &str) -> Result<Self, String> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|p| p.key() == name)
+            .ok_or_else(|| {
+                format!(
+                    "no bus property {name:?} — try {}",
+                    Self::ALL.iter().map(|p| p.key()).collect::<Vec<_>>().join(", ")
+                )
+            })
+    }
+
+    fn apply(self, bus: &mut Group, value: &str) -> Result<(), String> {
+        match self {
+            Self::Volume => {
+                let v: f32 = value
+                    .parse()
+                    .map_err(|_| format!("bad gain {value:?}"))?;
+                bus.set_gain(v);
+            }
+            Self::Muted => {
+                let b = parse_bool(value)?;
+                bus.set_muted(b);
+            }
+            Self::Name => bus.set_name(value.to_string()),
+        }
+        Ok(())
+    }
+
+    fn read(self, bus: &Group) -> String {
+        match self {
+            Self::Volume => two(bus.gain()),
+            Self::Muted => bus.muted().to_string(),
+            Self::Name => bus.name().unwrap_or_default().to_string(),
+        }
+    }
+
+    fn change(self, id: u64) -> Option<Change> {
+        match self {
+            Self::Volume | Self::Muted => Some(Change::GroupGain(id)),
+            Self::Name => None,
+        }
+    }
+
+    fn row(self, bus: &Group) -> Option<String> {
+        let worth = match self {
+            Self::Volume => true,
+            Self::Muted => bus.muted(),
+            Self::Name => bus.name().is_some(),
+        };
+        worth.then(|| self.read(bus))
+    }
+}
+
+/// The registry of a clip's properties: `clip.T.C.<prop>`. A gain, a fade,
+/// a shape or a placement is ClipParams or ClipPan; a plug into the pan or
+/// gain input is a store into the running chain (ClipControls,
+/// ClipGainControls).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClipProp {
+    Gain,
+    Pan,
+    FadeIn,
+    FadeInFrom,
+    FadeOut,
+    FadeOutTo,
+    FadeShape,
+    PanControl,
+    GainControl,
+}
+
+impl ClipProp {
+    const ALL: [Self; 9] = [
+        Self::Gain,
+        Self::Pan,
+        Self::FadeIn,
+        Self::FadeInFrom,
+        Self::FadeOut,
+        Self::FadeOutTo,
+        Self::FadeShape,
+        Self::PanControl,
+        Self::GainControl,
+    ];
+
+    fn key(self) -> &'static str {
+        match self {
+            Self::Gain => "gain",
+            Self::Pan => "pan",
+            Self::FadeIn => "fade_in",
+            Self::FadeInFrom => "fade_in_from",
+            Self::FadeOut => "fade_out",
+            Self::FadeOutTo => "fade_out_to",
+            Self::FadeShape => "fade_shape",
+            Self::PanControl => "pan_control",
+            Self::GainControl => "gain_control",
+        }
+    }
+
+    fn parse(name: &str) -> Result<Self, String> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|p| p.key() == name)
+            .ok_or_else(|| {
+                format!(
+                    "no clip property {name:?} — try {}",
+                    Self::ALL.iter().map(|p| p.key()).collect::<Vec<_>>().join(", ")
+                )
+            })
+    }
+
+    fn apply(self, c: &mut Clip, value: &str) -> Result<(), String> {
+        match self {
+            Self::Gain => {
+                let v: f32 = value
+                    .parse()
+                    .map_err(|_| format!("bad gain {value:?}"))?;
+                c.gain = v.clamp(0.0, 1.0);
+            }
+            Self::Pan => {
                 // A clip's own placement overrides its track for the whole
                 // clip; `auto` gives it back to the track.
-                let pan = match value.trim() {
+                c.placement = match value.trim() {
                     "auto" => None,
                     v => {
                         let p: f32 = v
                             .parse()
-                            .map_err(|_| usage(format!("bad pan {v:?}: -1..1, or auto")))?;
+                            .map_err(|_| format!("bad pan {v:?}: -1..1, or auto"))?;
                         Some(bo::bus::Placement::Stereo {
                             position: p.clamp(-1.0, 1.0),
                         })
                     }
                 };
-                c.placement = pan;
-                Ok(SetResult::ClipPan {
-                    track: track_i,
-                    id,
-                    pan: pan.map(|pl| pl.position()),
-                })
             }
-            "fade_in" => {
-                let d = parse_timecode(value).map_err(usage)?;
-                c.fade.fade_in = d;
-                Ok(SetResult::ClipFadeIn { track: track_i, id, d })
+            Self::FadeIn => {
+                c.fade.fade_in = parse_timecode(value)?;
             }
-            "fade_in_from" => {
+            Self::FadeInFrom => {
                 let level: f32 = value
                     .parse()
-                    .map_err(|_| usage(format!("bad gain {value:?}")))?;
+                    .map_err(|_| format!("bad gain {value:?}"))?;
                 c.fade.fade_in_from = level.clamp(0.0, 1.0);
-                Ok(SetResult::ClipFadeInFrom {
-                    track: track_i,
-                    id,
-                    level: c.fade.fade_in_from,
-                })
             }
-            "fade_out" => {
-                let d = parse_timecode(value).map_err(usage)?;
-                c.fade.fade_out = d;
-                Ok(SetResult::ClipFadeOut { track: track_i, id, d })
+            Self::FadeOut => {
+                c.fade.fade_out = parse_timecode(value)?;
             }
-            "fade_out_to" => {
+            Self::FadeOutTo => {
                 let level: f32 = value
                     .parse()
-                    .map_err(|_| usage(format!("bad gain {value:?}")))?;
+                    .map_err(|_| format!("bad gain {value:?}"))?;
                 c.fade.fade_out_to = level.clamp(0.0, 1.0);
-                Ok(SetResult::ClipFadeOutTo {
-                    track: track_i,
-                    id,
-                    level: c.fade.fade_out_to,
-                })
             }
-            "fade_shape" => {
-                let shape = value.parse::<FadeShape>().map_err(usage)?;
-                c.fade.shape = shape;
-                Ok(SetResult::ClipFadeShape {
-                    track: track_i,
-                    id,
-                    shape,
-                })
+            Self::FadeShape => {
+                c.fade.shape = value.parse::<FadeShape>()?;
             }
-            "pan_control" => {
+            Self::PanControl => {
                 // Plug one control source into the clip's pan input — a
                 // curve, an LFO or a sidechain, as one JSON object — or
                 // `none` to unplug. Repeated sets replace the source.
-                let curve = match value.trim() {
-                    "none" => None,
-                    text => Some(text.parse::<ControlSource>().map_err(usage)?),
-                };
-                c.pan_controls = match &curve {
-                    Some(source) => vec![source.clone()],
-                    None => Vec::new(),
-                };
-                let shown = match &curve {
-                    Some(source) => source.to_string(),
-                    None => "none".to_string(),
-                };
-                Ok(SetResult::ClipPanControl {
-                    track: track_i,
-                    id,
-                    control: shown,
-                })
+                let plug = plug(value)?;
+                c.pan_controls = plug;
             }
-            "gain_control" => {
+            Self::GainControl => {
                 // The same, into the clip's gain input.
-                let curve = match value.trim() {
-                    "none" => None,
-                    text => Some(text.parse::<ControlSource>().map_err(usage)?),
-                };
-                c.gain_controls = match &curve {
-                    Some(source) => vec![source.clone()],
-                    None => Vec::new(),
-                };
-                let shown = match &curve {
-                    Some(source) => source.to_string(),
-                    None => "none".to_string(),
-                };
-                Ok(SetResult::ClipGainControl {
-                    track: track_i,
-                    id,
-                    control: shown,
-                })
+                let plug = plug(value)?;
+                c.gain_controls = plug;
             }
-            _ => Err(usage(format!("unknown property {prop:?} on a clip"))),
         }
-    }?;
-    let change = match &result {
-        SetResult::ClipPan { track, id, .. } => Change::ClipPan(*track, *id),
-        SetResult::ClipPanControl { track, id, .. } => Change::ClipControls(*track, *id),
-        SetResult::ClipGainControl { track, id, .. } => Change::ClipGainControls(*track, *id),
-        _ => Change::ClipParams(track_i, id),
-    };
-    let landed = a.player.changed(change);
-    Ok(Output::Set {
-        result,
-        landed: noting(a, Some(landed)),
-    })
+        Ok(())
+    }
+
+    fn read(self, c: &Clip) -> String {
+        match self {
+            Self::Gain => two(c.gain),
+            Self::Pan => match &c.placement {
+                Some(p) => two(p.position()),
+                None => "auto".to_string(),
+            },
+            Self::FadeIn => bo::time::format(c.fade.fade_in),
+            Self::FadeInFrom => two(c.fade.fade_in_from),
+            Self::FadeOut => bo::time::format(c.fade.fade_out),
+            Self::FadeOutTo => two(c.fade.fade_out_to),
+            Self::FadeShape => c.fade.shape.to_string(),
+            Self::PanControl => c.pan_controls.first().map_or_else(
+                || "none".to_string(),
+                |s| s.to_string(),
+            ),
+            Self::GainControl => c.gain_controls.first().map_or_else(
+                || "none".to_string(),
+                |s| s.to_string(),
+            ),
+        }
+    }
+
+    fn change(self, track: usize, id: u64) -> Option<Change> {
+        Some(match self {
+            Self::Pan => Change::ClipPan(track, id),
+            Self::PanControl => Change::ClipControls(track, id),
+            Self::GainControl => Change::ClipGainControls(track, id),
+            _ => Change::ClipParams(track, id),
+        })
+    }
+
+    /// The row `bo set` lists for this property on `c` — only when the clip
+    /// does not already carry the default (a full-gain, straight fade, pan
+    /// following its track, nothing plugged).
+    fn row(self, c: &Clip) -> Option<String> {
+        let worth = match self {
+            Self::Gain => c.gain != 1.0,
+            Self::Pan => c.placement.is_some(),
+            Self::FadeIn => c.fade.fade_in > Duration::ZERO,
+            Self::FadeInFrom => c.fade.fade_in_from != 0.0,
+            Self::FadeOut => c.fade.fade_out > Duration::ZERO,
+            Self::FadeOutTo => c.fade.fade_out_to != 0.0,
+            Self::FadeShape => c.fade.shape != FadeShape::Linear,
+            Self::PanControl => c.pan_controls.len() == 1,
+            Self::GainControl => c.gain_controls.len() == 1,
+        };
+        worth.then(|| self.read(c))
+    }
+}
+
+/// Parse a `set ..._control` value: `none` unplugs, anything else must be
+/// one JSON control source.
+fn plug(value: &str) -> Result<Vec<ControlSource>, String> {
+    match value.trim() {
+        "none" => Ok(Vec::new()),
+        text => Ok(vec![text.parse::<ControlSource>()?]),
+    }
 }
 
 /// Parse a boolean value: `true`/`false` (or `1`/`0`).
@@ -1966,7 +2206,12 @@ fn command_line(command: &Command) -> String {
         Command::Stop => "stop".to_string(),
         Command::Seek { at } => format!("seek {}", quote_arg(at)),
         Command::Apply => "apply".to_string(),
-        Command::Set { var, value } => format!("set {} {}", quote_arg(var), quote_arg(value)),
+        Command::Set { var, value } => match (var, value) {
+            (None, None) => "set".to_string(),
+            (Some(var), None) => format!("set {}", quote_arg(var)),
+            (Some(var), Some(value)) => format!("set {} {}", quote_arg(var), quote_arg(value)),
+            (None, Some(_)) => unreachable!("a value never precedes its var"),
+        },
         Command::Take { track, clip } => format!("take {track} {}", quote_arg(clip)),
         Command::Move {
             track,
@@ -2199,7 +2444,7 @@ fn help_topic(topic: &str) -> Option<String> {
         "check" => "bo check",
         "probe" => "bo probe [uri]",
         "route" => "bo route <track> <bus>     # bus: a name (created by its first\n                              # mention), or master to route back out",
-        "set" => "bo set <var> <value>",
+        "set" => "bo set [<var> <value>]   # no args lists every current var and value",
         "play" => "bo play",
         "pause" => "bo pause",
         "resume" => "bo resume",
@@ -4210,5 +4455,76 @@ mod tests {
         assert_eq!(reply, "ok: `clip.0.0.gain_control` set to `none`\n");
         assert!(a.player.pending().is_empty());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_bare_set_lists_every_current_var_and_value() {
+        // A fresh arrangement lists only the master; the reply opens with
+        // the same ok: status line as `ls`.
+        let mut a = Arrangement::default();
+        assert_eq!(run_ok(&mut a, &["set"]), "ok: 0 tracks, 0 clips, 0 buses\nmaster 1.00\n");
+
+        // A named, muted track on a bus, with a faded clip and one source
+        // plugged in: rows come from the same registry set applies through.
+        let mut a = Arrangement::default();
+        run_ok(&mut a, &["put", "bed.wav,00:00:00-00:00:10"]);
+        run_ok(&mut a, &["set", "track.0.name", "bed"]);
+        run_ok(&mut a, &["set", "track.0.volume", "0.4"]);
+        run_ok(&mut a, &["set", "track.0.muted", "true"]);
+        run_ok(&mut a, &["set", "clip.0.0.gain", "0.7"]);
+        run_ok(&mut a, &["set", "clip.0.0.fade_in", "0.25"]);
+        run_ok(&mut a, &["set", "clip.0.0.pan_control", "{\"type\":\"lfo\",\"shape\":\"sine\",\"rate\":1,\"depth\":0.5,\"phase\":0}"]);
+        run_ok(&mut a, &["route", "0", "music"]);
+        run_ok(&mut a, &["set", "bus.0.volume", "0.5"]);
+        let listing = run_ok(&mut a, &["set"]);
+        let first = "ok: 1 track, 1 clip, 1 bus\n";
+        assert!(listing.starts_with(first), "{listing}");
+        for row in [
+            "master 1.00",
+            "track.0.volume 0.40",
+            "track.0.pan 0.00",
+            "track.0.muted true",
+            "track.0.name bed",
+            "clip.0.0.gain 0.70",
+            "clip.0.0.fade_in 00:00:00.250",
+            "clip.0.0.pan_control {\"type\":\"lfo\",\"shape\":\"sine\",\"rate\":1,\"depth\":0.5,\"phase\":0}",
+            "bus.0.volume 0.50",
+            "bus.0.name music",
+        ] {
+            assert!(listing.contains(row), "missing {row:?} in:\n{listing}");
+        }
+        // Defaults are quiet: no muted-false row, no name row when unnamed,
+        // no default-valued clip props.
+        assert!(!listing.contains("track.0.muted false"), "{listing}");
+        assert!(!listing.contains("clip.0.0.gain 1.00"), "{listing}");
+        // The rows round-trip: every listed var can be set back to the value.
+        for line in listing.lines().skip(1) {
+            let (var, value) = line.split_once(' ').unwrap();
+            let reply = run_ok(&mut a, &["set", var, value]);
+            assert!(reply.starts_with(&format!("ok: `{var}` set to `{value}`")), "{reply}");
+        }
+    }
+
+    #[test]
+    fn a_one_argument_set_is_a_usage_error() {
+        let mut a = Arrangement::default();
+        let (code, msg) = run_err(&mut a, &["set", "track.0.volume"]);
+        assert_eq!(code, 2, "{msg}");
+        assert!(msg.contains("needs a <value>"), "{msg}");
+    }
+
+    #[test]
+    fn unknown_vars_and_properties_name_the_key_space() {
+        let mut a = Arrangement::default();
+        let (code, msg) = run_err(&mut a, &["set", "masterr", "1"]);
+        assert_eq!(code, 2, "{msg}");
+        assert!(msg.contains("master"), "{msg}");
+        assert!(msg.contains("`bo set` lists"), "{msg}");
+        let (_, msg) = run_err(&mut a, &["set", "clip.0.0.vol", "0.5"]);
+        assert!(msg.contains("try gain, pan, fade_in"), "{msg}");
+        let (_, msg) = run_err(&mut a, &["set", "track.0.vol", "0.5"]);
+        assert!(msg.contains("try volume, pan, muted, name"), "{msg}");
+        let (_, msg) = run_err(&mut a, &["set", "bus.0.vol", "0.5"]);
+        assert!(msg.contains("try volume, muted, name"), "{msg}");
     }
 }

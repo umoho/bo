@@ -140,32 +140,6 @@ pub(crate) struct RoutedBus {
     pub(crate) tracks: usize,
 }
 
-/// The four shapes of `set`.
-#[derive(Debug)]
-pub(crate) enum SetResult {
-    Master { v: f32 },
-    TrackVolume { i: usize, v: f32 },
-    TrackPan { i: usize, v: f32 },
-    TrackMuted { i: usize, muted: bool },
-    TrackName { i: usize, name: String },
-    BusVolume { id: u64, v: f32 },
-    BusMuted { id: u64, muted: bool },
-    BusName { id: u64, name: String },
-    ClipGain { track: usize, id: u64, gain: f32 },
-    ClipPan {
-        track: usize,
-        id: u64,
-        pan: Option<f32>,
-    },
-    ClipFadeIn { track: usize, id: u64, d: Duration },
-    ClipFadeInFrom { track: usize, id: u64, level: f32 },
-    ClipFadeOut { track: usize, id: u64, d: Duration },
-    ClipFadeOutTo { track: usize, id: u64, level: f32 },
-    ClipFadeShape { track: usize, id: u64, shape: FadeShape },
-    ClipPanControl { track: usize, id: u64, control: String },
-    ClipGainControl { track: usize, id: u64, control: String },
-}
-
 /// One source measured by `probe` without a uri.
 #[derive(Debug)]
 pub(crate) struct ProbeResult {
@@ -296,8 +270,18 @@ pub(crate) enum Output {
     },
     Applied(ApplyReport),
     Set {
-        result: SetResult,
+        /// The canonical `var` (e.g. `track.0.volume`).
+        var: String,
+        /// The canonical current value, in the reply's display dialect.
+        value: String,
         landed: Option<Landed>,
+    },
+    /// `set` with no var: one row per current var and value.
+    SetList {
+        rows: Vec<(String, String)>,
+        tracks: usize,
+        clips: usize,
+        buses: usize,
     },
     Removed {
         track: usize,
@@ -449,58 +433,30 @@ impl fmt::Display for Output {
                 }
                 Ok(())
             }
-            Self::Set { result: set, landed } => {
-                let (var, value): (String, String) = match set {
-                    SetResult::Master { v } => ("master".into(), Gain(*v).to_string()),
-                    SetResult::TrackVolume { i, v } => {
-                        (format!("track.{i}.volume"), Gain(*v).to_string())
-                    }
-                    SetResult::TrackPan { i, v } => {
-                        (format!("track.{i}.pan"), Gain(*v).to_string())
-                    }
-                    SetResult::TrackMuted { i, muted } => {
-                        (format!("track.{i}.muted"), muted.to_string())
-                    }
-                    SetResult::TrackName { i, name } => (format!("track.{i}.name"), name.clone()),
-                    SetResult::BusVolume { id, v } => (format!("bus.{id}.volume"), Gain(*v).to_string()),
-                    SetResult::BusMuted { id, muted } => (format!("bus.{id}.muted"), muted.to_string()),
-                    SetResult::BusName { id, name } => (format!("bus.{id}.name"), name.clone()),
-                    SetResult::ClipGain { track, id, gain } => {
-                        (format!("clip.{track}.{id}.gain"), Gain(*gain).to_string())
-                    }
-                    SetResult::ClipPan { track, id, pan } => (
-                        format!("clip.{track}.{id}.pan"),
-                        match pan {
-                            Some(v) => Gain(*v).to_string(),
-                            None => "auto".to_string(),
-                        },
-                    ),
-                    SetResult::ClipFadeIn { track, id, d } => {
-                        (format!("clip.{track}.{id}.fade_in"), Tc(*d).to_string())
-                    }
-                    SetResult::ClipFadeInFrom { track, id, level } => (
-                        format!("clip.{track}.{id}.fade_in_from"),
-                        Gain(*level).to_string(),
-                    ),
-                    SetResult::ClipFadeOut { track, id, d } => {
-                        (format!("clip.{track}.{id}.fade_out"), Tc(*d).to_string())
-                    }
-                    SetResult::ClipFadeOutTo { track, id, level } => (
-                        format!("clip.{track}.{id}.fade_out_to"),
-                        Gain(*level).to_string(),
-                    ),
-                    SetResult::ClipFadeShape { track, id, shape } => {
-                        (format!("clip.{track}.{id}.fade_shape"), shape.to_string())
-                    }
-                    SetResult::ClipPanControl { track, id, control } => {
-                        (format!("clip.{track}.{id}.pan_control"), control.clone())
-                    }
-                    SetResult::ClipGainControl { track, id, control } => {
-                        (format!("clip.{track}.{id}.gain_control"), control.clone())
-                    }
-                };
+            Self::Set { var, value, landed } => {
                 writeln!(f, "ok: `{var}` set to `{value}`")?;
                 pending_note(f, *landed)
+            }
+            Self::SetList {
+                rows,
+                tracks,
+                clips,
+                buses,
+            } => {
+                writeln!(
+                    f,
+                    "ok: {} track{}, {} clip{}, {} {}",
+                    tracks,
+                    plural(*tracks),
+                    clips,
+                    plural(*clips),
+                    buses,
+                    if *buses == 1 { "bus" } else { "buses" }
+                )?;
+                for (var, value) in rows {
+                    writeln!(f, "{var} {value}")?;
+                }
+                Ok(())
             }
             Self::Removed {
                 track,
@@ -1003,7 +959,8 @@ pub(crate) fn example_reply(command: &str) -> Option<String> {
             channels: 2,
         },
         "set" => Output::Set {
-            result: SetResult::TrackVolume { i: 0, v: 0.4 },
+            var: "clip.0.0.pan_control".into(),
+            value: "{\"type\":\"lfo\",\"shape\":\"sine\",\"rate\":1,\"depth\":0.5,\"phase\":0}".into(),
             landed: None,
         },
         "play" => Output::Session {
