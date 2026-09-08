@@ -526,10 +526,10 @@ Mix:
   set clip.N.N.pan_control <src>
                            plug one source into the clip's pan input — a
                            gesture like a right-to-left sweep is a curve,
-                           'curve,0=1,3.2=-1' (time=value points, linear, held
-                           flat), or a wobble is an LFO,
-                           'lfo,shape=sine,rate=1,depth=0.5' — 'none'
-                           unplugs. The
+                           '{\"type\":\"curve\",\"0\":1,\"3.2\":-1}' (time=value
+                           points, linear, held flat), or a wobble is an LFO,
+                           '{\"type\":\"lfo\",\"shape\":\"sine\",\"rate\":1,\"depth\":0.5}' —
+                           'none' unplugs. The
                            source offsets the static pan as the clip plays,
                            identically live and rendered
   set clip.N.N.gain_control <src>
@@ -1798,8 +1798,8 @@ fn set_clip_command(
             }
             "pan_control" => {
                 // Plug one control source into the clip's pan input — a
-                // curve, an LFO or a sidechain, as `type,field=value,...` —
-                // or `none` to unplug. Repeated sets replace the source.
+                // curve, an LFO or a sidechain, as one JSON object — or
+                // `none` to unplug. Repeated sets replace the source.
                 let curve = match value.trim() {
                     "none" => None,
                     text => Some(text.parse::<ControlSource>().map_err(usage)?),
@@ -2053,12 +2053,23 @@ fn serialize(a: &Arrangement) -> String {
                 let _ = writeln!(out, "set clip.{ti}.{}.pan {}", c.id, p.position());
             }
             // So does a plug in its pan input. One source has a set form
-            // today; more than one is a future surface.
+            // today; more than one is a future surface. The JSON is quoted
+            // so the line tokenizes like any other value.
             if c.pan_controls.len() == 1 {
-                let _ = writeln!(out, "set clip.{ti}.{}.pan_control {}", c.id, c.pan_controls[0]);
+                let _ = writeln!(
+                    out,
+                    "set clip.{ti}.{}.pan_control {}",
+                    c.id,
+                    quote_arg(&c.pan_controls[0].to_string())
+                );
             }
             if c.gain_controls.len() == 1 {
-                let _ = writeln!(out, "set clip.{ti}.{}.gain_control {}", c.id, c.gain_controls[0]);
+                let _ = writeln!(
+                    out,
+                    "set clip.{ti}.{}.gain_control {}",
+                    c.id,
+                    quote_arg(&c.gain_controls[0].to_string())
+                );
             }
         }
         if let Some(name) = t.name() {
@@ -4050,16 +4061,19 @@ mod tests {
         let mut a = Arrangement::default();
         run_ok(&mut a, &["put", "bed.wav,00:00:00-00:00:10"]);
         assert_eq!(
-            run_ok(&mut a, &["set", "clip.0.0.pan_control", "curve,0=1,2=-1"]),
-            "ok: `clip.0.0.pan_control` set to `curve,0=1,2=-1`\n"
+            run_ok(&mut a, &["set", "clip.0.0.pan_control", "{\"type\":\"curve\",\"0\":1,\"2\":-1}"]),
+            "ok: `clip.0.0.pan_control` set to `{\"type\":\"curve\",\"00:00:00.000\":1,\"00:00:02.000\":-1}`\n"
         );
         let ls = run_ok(&mut a, &["ls"]);
-        assert!(ls.contains("pan_control=curve,0=1,2=-1"), "{ls}");
+        assert!(ls.contains("pan_control={\"type\":\"curve\",\"00:00:00.000\":1,\"00:00:02.000\":-1}"), "{ls}");
         assert!(ls.contains("pan=0.00"), "{ls}");
 
-        // The curve survives save/load as a set line.
+        // The curve survives save/load as a set line (JSON, quoted).
         let script = serialize(&a);
-        assert!(script.contains("set clip.0.0.pan_control curve,0=1,2=-1"), "{script}");
+        assert!(
+            script.contains("set clip.0.0.pan_control '{\"type\":\"curve\",\"00:00:00.000\":1,\"00:00:02.000\":-1}'"),
+            "{script}"
+        );
         run_ok(&mut a, &["save", &path]);
         let mut b = Arrangement::default();
         run_ok(&mut b, &["load", &path]);
@@ -4084,8 +4098,8 @@ mod tests {
         a.player.add_track(seed_track("a.wav", 10));
         run_ok(&mut a, &["play"]);
         // A curve is a store into the running chain — no note, no apply.
-        let reply = run_ok(&mut a, &["set", "clip.0.0.pan_control", "curve,0=1"]);
-        assert_eq!(reply, "ok: `clip.0.0.pan_control` set to `curve,0=1`\n");
+        let reply = run_ok(&mut a, &["set", "clip.0.0.pan_control", "{\"type\":\"curve\",\"0\":1}"]);
+        assert_eq!(reply, "ok: `clip.0.0.pan_control` set to `{\"type\":\"curve\",\"00:00:00.000\":1}`\n");
         assert!(a.player.pending().is_empty());
         assert_eq!(
             run_ok(&mut a, &["apply"]),
@@ -4101,14 +4115,17 @@ mod tests {
         let mut a = Arrangement::default();
         run_ok(&mut a, &["put", "bed.wav,00:00:00-00:00:10"]);
         assert_eq!(
-            run_ok(&mut a, &["set", "clip.0.0.gain_control", "curve,0=-0.5,10=0"]),
-            "ok: `clip.0.0.gain_control` set to `curve,0=-0.5,10=0`\n"
+            run_ok(&mut a, &["set", "clip.0.0.gain_control", "{\"type\":\"curve\",\"0\":-0.5,\"10\":0}"]),
+            "ok: `clip.0.0.gain_control` set to `{\"type\":\"curve\",\"00:00:00.000\":-0.5,\"00:00:10.000\":0}`\n"
         );
         let ls = run_ok(&mut a, &["ls"]);
-        assert!(ls.contains("gain_control=curve,0=-0.5,10=0"), "{ls}");
+        assert!(ls.contains("gain_control={\"type\":\"curve\",\"00:00:00.000\":-0.5,\"00:00:10.000\":0}"), "{ls}");
 
         let script = serialize(&a);
-        assert!(script.contains("set clip.0.0.gain_control curve,0=-0.5,10=0"), "{script}");
+        assert!(
+            script.contains("set clip.0.0.gain_control '{\"type\":\"curve\",\"00:00:00.000\":-0.5,\"00:00:10.000\":0}'"),
+            "{script}"
+        );
         run_ok(&mut a, &["save", &path]);
         let mut b = Arrangement::default();
         run_ok(&mut b, &["load", &path]);
@@ -4132,17 +4149,17 @@ mod tests {
         let mut a = Arrangement::default();
         run_ok(&mut a, &["put", "bed.wav,00:00:00-00:00:10"]);
         assert_eq!(
-            run_ok(&mut a, &["set", "clip.0.0.pan_control", "lfo,shape=sine,rate=1,depth=0.5,phase=0"]),
-            "ok: `clip.0.0.pan_control` set to `lfo,shape=sine,rate=1,depth=0.5,phase=0`\n"
+            run_ok(&mut a, &["set", "clip.0.0.pan_control", "{\"type\":\"lfo\",\"shape\":\"sine\",\"rate\":1,\"depth\":0.5,\"phase\":0}"]),
+            "ok: `clip.0.0.pan_control` set to `{\"type\":\"lfo\",\"shape\":\"sine\",\"rate\":1,\"depth\":0.5,\"phase\":0}`\n"
         );
         assert_eq!(
-            run_ok(&mut a, &["set", "clip.0.0.gain_control", "lfo,shape=triangle,rate=0.5,depth=0.3,phase=0.25"]),
-            "ok: `clip.0.0.gain_control` set to `lfo,shape=triangle,rate=0.5,depth=0.3,phase=0.25`\n"
+            run_ok(&mut a, &["set", "clip.0.0.gain_control", "{\"type\":\"lfo\",\"shape\":\"triangle\",\"rate\":0.5,\"depth\":0.3,\"phase\":0.25}"]),
+            "ok: `clip.0.0.gain_control` set to `{\"type\":\"lfo\",\"shape\":\"triangle\",\"rate\":0.5,\"depth\":0.3,\"phase\":0.25}`\n"
         );
         let ls = run_ok(&mut a, &["ls"]);
-        assert!(ls.contains("pan_control=lfo,shape=sine,rate=1,depth=0.5,phase=0"), "{ls}");
+        assert!(ls.contains("pan_control={\"type\":\"lfo\",\"shape\":\"sine\",\"rate\":1,\"depth\":0.5,\"phase\":0}"), "{ls}");
         assert!(
-            ls.contains("gain_control=lfo,shape=triangle,rate=0.5,depth=0.3,phase=0.25"),
+            ls.contains("gain_control={\"type\":\"lfo\",\"shape\":\"triangle\",\"rate\":0.5,\"depth\":0.3,\"phase\":0.25}"),
             "{ls}"
         );
 
@@ -4156,9 +4173,9 @@ mod tests {
         assert_eq!(clip.gain_controls.len(), 1);
 
         // A bad shape or a bad number is refused.
-        let (code, msg) = run_err(&mut a, &["set", "clip.0.0.pan_control", "wibble,rate=1"]);
+        let (code, msg) = run_err(&mut a, &["set", "clip.0.0.pan_control", "wibble"]);
         assert_eq!(code, 2, "{msg}");
-        let (_, msg) = run_err(&mut a, &["set", "clip.0.0.pan_control", "lfo,rate=x"]);
+        let (_, msg) = run_err(&mut a, &["set", "clip.0.0.pan_control", "{\"type\":\"lfo\",\"rate\":\"x\"}"]);
         assert!(msg.contains("rate"), "{msg}");
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -4171,11 +4188,11 @@ mod tests {
         let mut a = Arrangement::default();
         run_ok(&mut a, &["put", "bed.wav,00:00:00-00:00:10"]);
         assert_eq!(
-            run_ok(&mut a, &["set", "clip.0.0.gain_control", "sidechain,bus=group.0,amount=-1.5,attack=0.005,release=0.12"]),
-            "ok: `clip.0.0.gain_control` set to `sidechain,bus=group.0,amount=-1.5,attack=0.005,release=0.12`\n"
+            run_ok(&mut a, &["set", "clip.0.0.gain_control", "{\"type\":\"sidechain\",\"bus\":\"group.0\",\"amount\":-1.5,\"attack\":0.005,\"release\":0.12}"]),
+            "ok: `clip.0.0.gain_control` set to `{\"type\":\"sidechain\",\"bus\":\"group.0\",\"amount\":-1.5,\"attack\":\"00:00:00.005\",\"release\":\"00:00:00.120\"}`\n"
         );
         let ls = run_ok(&mut a, &["ls"]);
-        assert!(ls.contains("gain_control=sidechain,bus=group.0,amount=-1.5,attack=0.005,release=0.12"), "{ls}");
+        assert!(ls.contains("gain_control={\"type\":\"sidechain\",\"bus\":\"group.0\",\"amount\":-1.5,\"attack\":\"00:00:00.005\",\"release\":\"00:00:00.120\"}"), "{ls}");
 
         run_ok(&mut a, &["save", &path]);
         let mut b = Arrangement::default();

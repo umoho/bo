@@ -12,8 +12,8 @@
 //!   timelines. Content answers *what* plays and *when*; it holds no signal
 //!   state.
 //! * [`control`] — the control sources that modulate a clip's parameters as
-//!   they play: the curve, the LFO and the sidechain, each a serializable
-//!   `type,field=value,...` object.
+//!   they play: the curve, the LFO and the sidechain, each one serializable
+//!   JSON object (its text form, the registry [`control::ControlSource`]).
 //! * [`bus`] — the signal layer: [`bus::Output`] (a track's edge into the
 //!   mix, carrying gain, mute and placement) and the bus nodes it feeds —
 //!   the master ([`bus::Bus`]) and the group buses ([`bus::Group`]) several

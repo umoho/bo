@@ -21,7 +21,7 @@
 - **实时播放，或离线渲染** —— 编辑途中可从播放头试听一段，成品可从头到尾完整放出（rodio），或把整个编排——乃至其中一段区间——离线混音成 wav。
 - **播着改** —— 增益、淡化、声像或静音在设下的那一刻就落到正在跑的混音上；摆在某条音轨队尾之后的片段会直接加入正在跑的队列——所以节目可以边播边调、边播边续。`apply` 只留给正在跑的混音自己做不到的那类改动（take/move 一个已排队的片段），并且从声音真正所在的时码重建，而不是从墙上时钟。
 - **编组总线** —— 用 `route` 把若干音轨并进一条总线，一条 strip（音量/静音）就能统一控制整组——电台的音乐组/人声组；`ls` 会显示各总线以及每条音轨喂给谁。路由与总线 strip 改动都是结构变更：和 take/move 一样落在下一次 `apply`。
-- **源即手势** —— `set clip.N.N.pan_control curve,0=1,3.2=-1` 把一条曲线插进 clip 的声像、`set clip.N.N.gain_control lfo,shape=sine,rate=2,depth=0.3` 把一个 LFO 插进它的音量、`set clip.N.N.gain_control sidechain,bus=group.0,amount=-1.5` 让它听一条总线来闪避：听到的是静态基准加源随 clip 播放而变，现场播放与离线渲染完全一致（两边构建同一条链），改动像 fade 一样即时落在正在跑的混音上——不需要脚本去轮询播放头。今天有三种**控制源**——曲线、LFO、sidechain——骑在 clip 的声像与音量两个孔上。
+- **源即手势** —— `set clip.N.N.pan_control '{"type":"curve","0":1,"3.2":-1}'` 把一条曲线插进 clip 的声像、`set clip.N.N.gain_control '{"type":"lfo","shape":"sine","rate":2,"depth":0.3}'` 把一个 LFO 插进它的音量、`set clip.N.N.gain_control '{"type":"sidechain","bus":"group.0","amount":-1.5}'` 让它听一条总线来闪避：听到的是静态基准加源随 clip 播放而变，现场播放与离线渲染完全一致（两边构建同一条链），改动像 fade 一样即时落在正在跑的混音上——不需要脚本去轮询播放头。今天有三种**控制源**——曲线、LFO、sidechain——骑在 clip 的声像与音量两个孔上。
 - **静默回退** —— 没有音频设备时 daemon 照常工作；设 `BO_BACKEND=silent` 得到确定性的无头测试与 CI。
 - **自动清理** —— 播放结束、`stop`、或非播放状态静默超过 `BO_IDLE_TIMEOUT` 秒（默认 600，`0` 禁用）时，daemon 退出并删除自己的 socket。
 - **切片而非文件** —— `uri,from-to` 把源的任意切片放到时间轴的任意位置；in-point 在实时播放与离线渲染中都样本级精确；无需裁剪、无需拷贝。
@@ -99,18 +99,18 @@ bus #0 'music' vol=0.35 tracks=2
 ```console
 $ bo put slide.wav,00:00:00-00:00:03.200
 ok: 1 clip on track 0
-$ bo set clip.0.0.pan_control curve,0=1,3.2=-1   # 声像随 clip 从 +1 走到 -1
-ok: `clip.0.0.pan_control` set to `curve,0=1,3.2=-1`
+$ bo set clip.0.0.pan_control '{"type":"curve","0":1,"3.2":-1}'  # 声像从 +1 走到 -1
+ok: `clip.0.0.pan_control` set to `{"type":"curve","00:00:00.000":1,"00:00:03.200":-1}`
 $ bo render mix.wav                        # 渲染出的文件和播放听到的是同一条扫
 ```
 
-一个源 = 插进 clip 声像孔（`set clip.N.N.pan_control`）或音量孔（`set clip.N.N.gain_control`）的一根线。今天有两种：
+一个源 = 插进 clip 声像孔（`set clip.N.N.pan_control`）或音量孔（`set clip.N.N.gain_control`）的一根线。今天有三种，各自是一个单行 JSON 对象，`"type"` 标明是哪种：
 
-- **曲线** —— 一张 `时刻=偏移` 关键点表，时刻从 clip 起点算秒、点间线性、点外 hold：`curve,0=1,3.2=-1`；
-- **LFO** —— 周期摆动，字段 `shape`/`rate`/`depth`/`phase`（都可省略，默认 `sine`/`1`/`0.5`/`0`）：`lfo,shape=sine,rate=1,depth=0.5` 每秒半深摆一次；
-- **sidechain** —— 监听一条总线（master，或你 route 出来的组）并跟随它的电平：`sidechain,bus=group.0,amount=-1.5`——amount 是单位电平产生的偏移（负闪避、正上抬，默认 -0.5），attack/release 单位秒（默认 5ms/150ms）。电台手势就是一行：把人声 route 进一个组，给音乐的 gain 接 `sidechain,bus=group.0`——音乐在人声下压下去、人声结束再弹回来。
+- **曲线** —— 一张 时码→偏移 关键点表，点间线性、点外 hold：`{"type":"curve","0":1,"3.2":-1}`；
+- **LFO** —— 周期摆动，字段 `shape`/`rate`/`depth`/`phase` 都可省略（默认 `sine`/`1`/`0.5`/`0`）：`{"type":"lfo","shape":"sine","rate":1,"depth":0.5}` 每秒半深摆一次；
+- **sidechain** —— 监听一条总线（master，或你 route 出来的组）并跟随它的电平：`{"type":"sidechain","bus":"group.0","amount":-1.5}`——amount 是单位电平产生的偏移（负闪避、正上抬，默认 -0.5），attack/release 是时码（默认 5ms/150ms）。电台手势就是一行：把人声 route 进一个组，给音乐的 gain 接 `{"type":"sidechain","bus":"group.0"}`——音乐在人声下压下去、人声结束再弹回来。
 
-所有源都是 `type,field=value,...`——一行一个源，`:` 只留给时间码。
+时码可以按 CLI 的宽松写法输入——`3.2`、`0.005` 就是秒——回显统一成 `HH:MM:SS.fff`。
 
 `none` 拔线。参数 = 静态基准 + Σ(活跃控制源)；每个输入孔今天各接一个源。
 
