@@ -169,6 +169,7 @@ pub(crate) enum SetResult {
     ClipFadeOutTo { track: usize, id: u64, level: f32 },
     ClipFadeShape { track: usize, id: u64, shape: FadeShape },
     ClipCurve { track: usize, id: u64, curve: String },
+    ClipGainCurve { track: usize, id: u64, curve: String },
 }
 
 /// One source measured by `probe` without a uri.
@@ -250,9 +251,11 @@ pub(crate) struct LsClip {
     pub(crate) gain: f32,
     /// The clip's own placement, when it does not follow its track.
     pub(crate) pan: Option<f32>,
-    /// Its control sources as one text (v1: a single pan curve), when any
+    /// Its pan control sources as one text (v1: a single curve), when any
     /// are plugged in.
     pub(crate) curve: Option<String>,
+    /// Its gain control sources as one text, when any are plugged in.
+    pub(crate) gain_curve: Option<String>,
     pub(crate) fade_in: Duration,
     pub(crate) fade_in_from: f32,
     pub(crate) fade_out: Duration,
@@ -498,6 +501,9 @@ impl fmt::Display for Output {
                     }
                     SetResult::ClipCurve { track, id, curve } => {
                         (format!("clip.{track}.{id}.curve"), curve.clone())
+                    }
+                    SetResult::ClipGainCurve { track, id, curve } => {
+                        (format!("clip.{track}.{id}.gain_curve"), curve.clone())
                     }
                 };
                 writeln!(f, "ok: `{var}` set to `{value}`")?;
@@ -795,6 +801,9 @@ impl fmt::Display for Output {
                         if let Some(curve) = &c.curve {
                             let _ = write!(suffix, " curve={curve}");
                         }
+                        if let Some(curve) = &c.gain_curve {
+                            let _ = write!(suffix, " gain_curve={curve}");
+                        }
                         writeln!(
                             f,
                             "  {}{}",
@@ -930,6 +939,7 @@ pub(crate) fn example_reply(command: &str) -> Option<String> {
                         fade_out_to: 0.0,
                         fade_shape: Linear,
                         curve: None,
+                        gain_curve: None,
                     }],
                 },
                 LsTrack {
@@ -953,6 +963,7 @@ pub(crate) fn example_reply(command: &str) -> Option<String> {
                         fade_out_to: 0.0,
                         fade_shape: Linear,
                         curve: None,
+                        gain_curve: None,
                     }],
                 },
             ],

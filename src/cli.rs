@@ -528,6 +528,10 @@ Mix:
                            linear, held flat at the edges) — or 'none' to
                            unplug. The curve offsets the static pan as the
                            clip plays, identically live and rendered
+  set clip.N.N.gain_curve <kfs>
+                           the same, into the clip's gain: a curve ducks or
+                           swells the clip's own volume as it plays ('none'
+                           unplugs)
                            gains and fades land on the mix as they are set,
                            playing or paused; a name is only a label
 
@@ -1054,6 +1058,16 @@ fn arrangement_view(a: &Arrangement) -> Ls {
                         fade_shape: c.fade.shape,
                         curve: {
                             let controls = &c.pan_controls;
+                            (!controls.is_empty()).then(|| {
+                                controls
+                                    .iter()
+                                    .map(ToString::to_string)
+                                    .collect::<Vec<_>>()
+                                    .join("; ")
+                            })
+                        },
+                        gain_curve: {
+                            let controls = &c.gain_controls;
                             (!controls.is_empty()).then(|| {
                                 controls
                                     .iter()
@@ -1818,12 +1832,33 @@ fn set_clip_command(
                     curve: shown,
                 })
             }
+            "gain_curve" => {
+                // The same, into the clip's gain input.
+                let curve = match value.trim() {
+                    "none" => None,
+                    text => Some(text.parse::<ControlSource>().map_err(usage)?),
+                };
+                c.gain_controls = match &curve {
+                    Some(source) => vec![source.clone()],
+                    None => Vec::new(),
+                };
+                let shown = match &curve {
+                    Some(source) => source.to_string(),
+                    None => "none".to_string(),
+                };
+                Ok(SetResult::ClipGainCurve {
+                    track: track_i,
+                    id,
+                    curve: shown,
+                })
+            }
             _ => Err(usage(format!("unknown property {prop:?} on a clip"))),
         }
     }?;
     let change = match &result {
         SetResult::ClipPan { track, id, .. } => Change::ClipPan(*track, *id),
         SetResult::ClipCurve { track, id, .. } => Change::ClipControls(*track, *id),
+        SetResult::ClipGainCurve { track, id, .. } => Change::ClipGainControls(*track, *id),
         _ => Change::ClipParams(track_i, id),
     };
     let landed = a.player.changed(change);
@@ -2035,6 +2070,9 @@ fn serialize(a: &Arrangement) -> String {
             // today; more than one is a future surface.
             if c.pan_controls.len() == 1 {
                 let _ = writeln!(out, "set clip.{ti}.{}.curve {}", c.id, c.pan_controls[0]);
+            }
+            if c.gain_controls.len() == 1 {
+                let _ = writeln!(out, "set clip.{ti}.{}.gain_curve {}", c.id, c.gain_controls[0]);
             }
         }
         if let Some(name) = t.name() {
@@ -4067,5 +4105,36 @@ mod tests {
             run_ok(&mut a, &["apply"]),
             "ok: nothing pending\n"
         );
+    }
+
+    #[test]
+    fn a_gain_curve_sets_shows_round_trips_and_lands_live() {
+        let dir = temp_dir();
+        let file = dir.join("prog.bo");
+        let path = file.to_string_lossy().into_owned();
+        let mut a = Arrangement::default();
+        run_ok(&mut a, &["put", "bed.wav,00:00:00-00:00:10"]);
+        assert_eq!(
+            run_ok(&mut a, &["set", "clip.0.0.gain_curve", "0:-0.5,10:0"]),
+            "ok: `clip.0.0.gain_curve` set to `0:-0.5,10:0`\n"
+        );
+        let ls = run_ok(&mut a, &["ls"]);
+        assert!(ls.contains("gain_curve=0:-0.5,10:0"), "{ls}");
+
+        let script = serialize(&a);
+        assert!(script.contains("set clip.0.0.gain_curve 0:-0.5,10:0"), "{script}");
+        run_ok(&mut a, &["save", &path]);
+        let mut b = Arrangement::default();
+        run_ok(&mut b, &["load", &path]);
+        assert_eq!(serialize(&b), script);
+        assert_eq!(b.player.tracks()[0].clips()[0].gain_controls.len(), 1);
+
+        // Playing, a gain-curve edit is a store into the running chain.
+        run_ok(&mut a, &["play"]);
+        let reply = run_ok(&mut a, &["set", "clip.0.0.gain_curve", "none"]);
+        assert_eq!(reply, "ok: `clip.0.0.gain_curve` set to `none`\n");
+        assert!(a.player.pending().is_empty());
+        assert!(!serialize(&a).contains("gain_curve"), "unplugged is not saved");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
