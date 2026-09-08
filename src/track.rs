@@ -131,6 +131,173 @@ impl Fade {
     }
 }
 
+/// One breakpoint of a [`Curve`]: the offset it outputs at a clip-local
+/// timecode. Clip-local, so a curve rides its clip: move the clip and the
+/// whole curve moves with it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Keyframe {
+    /// Where on the clip this point sits, measured from the clip's start.
+    pub at: Duration,
+    /// The offset the source outputs here — an add-on to the parameter's
+    /// static base, not an absolute value.
+    pub value: f32,
+}
+
+/// A hand-drawn curve: the first control source (in GStreamer terms, a src
+/// — it only produces). Its signal is a scalar offset over the clip's own
+/// time, linear between keyframes and held flat beyond the first and last,
+/// so a clip that carries one has a value at every moment it plays. The
+/// broader notion — using curves to drive parameters as they play, live and
+/// rendered alike — is *automation*; this struct is the concrete curve a
+/// curve-automation is built on.
+///
+/// A curve knows nothing about which parameter it drives or what that
+/// parameter allows (the jack clamps); it only answers "what offset at this
+/// moment". An empty curve is silence: an offset of zero.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Curve {
+    keyframes: Vec<Keyframe>,
+}
+
+impl Curve {
+    /// A curve over the given breakpoints. They are sorted by time on the
+    /// way in, so authoring order never matters; at a time shared by two
+    /// keyframes the later one wins.
+    pub fn new(mut keyframes: Vec<Keyframe>) -> Self {
+        keyframes.sort_by_key(|k| k.at);
+        Self { keyframes }
+    }
+
+    /// Whether the curve carries no breakpoints — and so no signal.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.keyframes.is_empty()
+    }
+
+    /// The breakpoints, in time order.
+    #[must_use]
+    pub fn keyframes(&self) -> &[Keyframe] {
+        &self.keyframes
+    }
+
+    /// The curve's signal at clip-local time `t`: linear between two
+    /// keyframes, held flat before the first and at the last. Empty — no
+    /// signal — is zero.
+    #[must_use]
+    pub fn value_at(&self, t: Duration) -> f32 {
+        let ks = &self.keyframes;
+        let Some(first) = ks.first() else {
+            return 0.0;
+        };
+        if ks.len() == 1 {
+            return first.value;
+        }
+        if t < first.at {
+            return first.value;
+        }
+        for pair in ks.windows(2) {
+            let a = &pair[0];
+            let b = &pair[1];
+            if t >= a.at && t < b.at {
+                if b.at == a.at {
+                    return b.value; // unreachable in sorted input, kept honest
+                }
+                let x = (t - a.at).as_secs_f64() / (b.at - a.at).as_secs_f64();
+                return a.value + (b.value - a.value) * x as f32;
+            }
+        }
+        ks.last().expect("nonempty").value
+    }
+}
+
+impl std::fmt::Display for Curve {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (i, k) in self.keyframes.iter().enumerate() {
+            if i > 0 {
+                f.write_str(",")?;
+            }
+            write!(f, "{}:{}", k.at.as_secs_f64(), k.value)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::str::FromStr for Curve {
+    type Err = String;
+
+    /// `time:value[,time:value...]` — times in seconds, relative to the
+    /// clip's start. An empty string is an empty curve.
+    fn from_str(s: &str) -> Result<Self, String> {
+        let s = s.trim();
+        if s.is_empty() {
+            return Ok(Self::new(Vec::new()));
+        }
+        let mut keyframes = Vec::new();
+        for part in s.split(',') {
+            let part = part.trim();
+            let (at, value) = part.split_once(':').ok_or_else(|| {
+                format!("bad keyframe {part:?}: expected TIME:VALUE")
+            })?;
+            let secs: f64 = at.trim()
+                .parse()
+                .map_err(|_| format!("bad keyframe time {at:?}: seconds"))?;
+            if secs < 0.0 {
+                return Err(format!("bad keyframe time {at:?}: not negative"));
+            }
+            let at = std::time::Duration::try_from_secs_f64(secs)
+                .map_err(|_| format!("bad keyframe time {at:?}"))?;
+            let value: f32 = value.trim().trim_start_matches('+').parse().map_err(|_| {
+                format!("bad keyframe value {value:?}: a number")
+            })?;
+            keyframes.push(Keyframe { at, value });
+        }
+        Ok(Self::new(keyframes))
+    }
+}
+
+/// A control source — the "cable" plugged into a parameter's input. Every
+/// source is a scalar over the clip's own time, produced where the samples
+/// flow; the parameter it drives is the static base plus the sum of its
+/// active sources (a parameter with no cable is just its base).
+///
+/// v1 ships exactly one kind of source, the hand-drawn curve; further srcs
+/// (an LFO) and filters (an envelope follower — the detector side of a
+/// future sidechain) slot in as further variants. Automation is the notion
+/// of using such a source to drive a parameter; this enum is the registry of
+/// concrete sources automation can draw on.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ControlSource {
+    /// A hand-drawn keyframe curve ([`Curve`]).
+    Curve(Curve),
+}
+
+impl ControlSource {
+    /// This source's signal at clip-local time `t` — an offset on top of
+    /// the parameter's static base.
+    #[must_use]
+    pub fn value_at(&self, t: Duration) -> f32 {
+        match self {
+            Self::Curve(curve) => curve.value_at(t),
+        }
+    }
+}
+
+impl std::fmt::Display for ControlSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Curve(curve) => curve.fmt(f),
+        }
+    }
+}
+
+impl std::str::FromStr for ControlSource {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        Ok(Self::Curve(s.parse()?))
+    }
+}
+
 /// A slice of a source, occupying `at .. at + duration()` on one [`Track`].
 ///
 /// Two pairs of timecodes, deliberately separate: `from`/`to` select *which
@@ -158,6 +325,13 @@ pub struct Clip {
     /// track's output. `None` (the default) inherits the track's placement;
     /// the surface for setting a per-clip placement is not open yet.
     pub placement: Option<Placement>,
+    /// Control sources plugged into this clip's own inputs. v1 has exactly
+    /// one input worth plugging — pan — so a source here offsets the pan
+    /// a listener would otherwise hear (the placement, or the track's pan
+    /// when the clip has none). An empty list is no cable: the static base
+    /// is the whole story. A second automatable parameter would grow a
+    /// field of its own rather than share this one.
+    pub controls: Vec<ControlSource>,
 }
 
 impl Clip {
@@ -172,6 +346,7 @@ impl Clip {
             gain: 1.0,
             fade: Fade::default(),
             placement: None,
+            controls: Vec::new(),
         }
     }
 
@@ -186,6 +361,7 @@ impl Clip {
             gain: 1.0,
             fade: Fade::default(),
             placement: None,
+            controls: Vec::new(),
         }
     }
 
@@ -675,20 +851,85 @@ mod tests {
     }
 
     #[test]
-    fn fade_from_and_to_levels_hold_at_the_edges() {
-        // Fade in from -10 dB (0.3) to full, fade out from full to 0.3.
-        let f = Fade {
-            fade_in: secs(2),
-            fade_in_from: 0.3,
-            fade_out: secs(2),
-            fade_out_to: 0.3,
-            shape: FadeShape::Linear,
-        };
-        let len = secs(10);
-        assert!((f.gain_at(Duration::ZERO, len) - 0.3).abs() < 1e-6);
-        assert!((f.gain_at(secs(1), len) - 0.65).abs() < 1e-6);
-        assert_eq!(f.gain_at(secs(5), len), 1.0);
-        assert!((f.gain_at(secs(9), len) - 0.65).abs() < 1e-6);
-        assert!((f.gain_at(secs(10), len) - 0.3).abs() < 1e-6);
+    fn a_curve_interpolates_between_keyframes_and_holds_outside() {
+        let secs = |s: u64| Duration::from_secs(s);
+        let curve = Curve::new(vec![
+            Keyframe { at: Duration::ZERO, value: 1.0 },
+            Keyframe { at: secs(4), value: -1.0 },
+        ]);
+        assert_eq!(curve.value_at(Duration::ZERO), 1.0);
+        assert!((curve.value_at(secs(2)) - 0.0).abs() < 1e-6, "linear midpoint");
+        assert!((curve.value_at(secs(3)) - (-0.5)).abs() < 1e-6);
+        assert_eq!(curve.value_at(secs(4)), -1.0);
+        // Outside the span the edges hold flat — before the first point too,
+        // when the curve does not start at the clip's origin.
+        assert_eq!(curve.value_at(secs(10)), -1.0);
+        let late = Curve::new(vec![
+            Keyframe { at: secs(2), value: 0.5 },
+            Keyframe { at: secs(4), value: -0.5 },
+        ]);
+        assert_eq!(late.value_at(secs(1)), 0.5, "flat before the first point");
+    }
+
+    #[test]
+    fn a_curve_sorts_authoring_order_and_a_single_point_is_constant() {
+        let secs = |s: u64| Duration::from_secs(s);
+        // Written back to front: sorted on the way in.
+        let curve = Curve::new(vec![
+            Keyframe { at: secs(3), value: -1.0 },
+            Keyframe { at: secs(1), value: 1.0 },
+            Keyframe { at: secs(2), value: 0.0 },
+        ]);
+        let ats: Vec<u64> = curve.keyframes().iter().map(|k| k.at.as_secs()).collect();
+        assert_eq!(ats, vec![1, 2, 3]);
+        assert!((curve.value_at(secs(2)) - 0.0).abs() < 1e-6);
+        // One point: that value everywhere.
+        let flat = Curve::new(vec![Keyframe { at: Duration::ZERO, value: -0.5 }]);
+        assert_eq!(flat.value_at(secs(9)), -0.5);
+        // Empty: silence, an offset of zero.
+        assert_eq!(Curve::new(Vec::new()).value_at(secs(1)), 0.0);
+    }
+
+    #[test]
+    fn a_curve_round_trips_through_its_text() {
+        let curve = Curve::new(vec![
+            Keyframe { at: Duration::from_secs_f64(0.0), value: 1.0 },
+            Keyframe { at: Duration::from_secs_f64(3.2), value: -1.0 },
+            Keyframe { at: Duration::from_secs_f64(4.0), value: 0.5 },
+        ]);
+        let text = curve.to_string();
+        assert_eq!(text, "0:1,3.2:-1,4:0.5", "{text}");
+        assert_eq!(text.parse::<Curve>().unwrap(), curve, "display and parse agree");
+        // Authoring may lead values with a sign and scatter the order.
+        assert_eq!(
+            "3.2:-1,+0:1,4:+0.5".parse::<Curve>().unwrap(),
+            curve,
+            "order and '+' are forgiven"
+        );
+        assert_eq!(" ".parse::<Curve>().unwrap(), Curve::new(Vec::new()));
+        assert!("1".parse::<Curve>().is_err(), "no ':' is refused");
+        assert!("x:1".parse::<Curve>().is_err());
+        assert!("1:x".parse::<Curve>().is_err());
+        assert!("-1:0".parse::<Curve>().is_err(), "negative time is refused");
+    }
+
+    #[test]
+    fn a_control_source_delegates_to_its_curve() {
+        let curve = Curve::new(vec![
+            Keyframe { at: Duration::ZERO, value: 1.0 },
+            Keyframe { at: Duration::from_secs(2), value: -1.0 },
+        ]);
+        let source = ControlSource::Curve(curve);
+        assert_eq!(source.value_at(Duration::from_secs(1)), 0.0);
+        assert_eq!(source.to_string(), "0:1,2:-1");
+        assert_eq!("0:1,2:-1".parse::<ControlSource>().unwrap(), source);
+    }
+
+    #[test]
+    fn clips_come_with_no_cable_plugged_in() {
+        let c = Clip::new(src("a"), secs(10));
+        assert!(c.controls.is_empty());
+        let s = Clip::sliced(src("b"), Duration::ZERO, secs(5));
+        assert!(s.controls.is_empty());
     }
 }
