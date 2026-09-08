@@ -57,6 +57,9 @@ pub struct ClipPlan {
     /// This clip's own placement, when it does not follow its track: a fixed
     /// position that overrides the track's pan for the whole clip.
     pub placement: Option<f32>,
+    /// The control sources driving this clip's pan — carried into the chain
+    /// when it is built, so live and render read the same curves.
+    pub controls: Vec<crate::track::ControlSource>,
 }
 
 impl Timeline {
@@ -102,6 +105,7 @@ impl Timeline {
                     gain: clip.gain,
                     fade: clip.fade,
                     placement: clip.placement.map(crate::bus::Placement::position),
+                    controls: clip.controls.clone(),
                 });
                 previous_end = Some(abs_end);
                 end = end.max(abs_end);
@@ -285,6 +289,22 @@ mod tests {
         assert_eq!(plan.tracks()[0].index(), 1, "…but its index survives");
         let ids: Vec<u64> = plan.tracks()[0].clips().iter().map(|c| c.id).collect();
         assert_eq!(ids, vec![0, 2], "clip ids, not positions in the queue");
+    }
+
+    #[test]
+    fn plan_carries_a_clips_control_sources() {
+        // The curve a clip carries travels into the plan, so the chain both
+        // live and render build from it drives the same pan.
+        let mut t = track_with(vec![Clip::new(src("a.wav"), secs(10))]);
+        t.clip_mut(0).unwrap().controls = vec![crate::track::ControlSource::Curve(
+            crate::track::Curve::new(vec![crate::track::Keyframe {
+                at: Duration::ZERO,
+                value: 1.0,
+            }]),
+        )];
+        let plan = Timeline::plan(&[t], Duration::ZERO);
+        let source = &plan.tracks()[0].clips()[0].controls[0];
+        assert_eq!(source.value_at(Duration::ZERO), 1.0);
     }
 
     #[test]

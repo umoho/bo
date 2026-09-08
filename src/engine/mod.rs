@@ -55,6 +55,10 @@ pub enum Change {
     ClipParams(usize, u64),
     /// A clip's own placement changed (set, or given back to its track).
     ClipPan(usize, u64),
+    /// A clip's control sources changed — a curve edited, plugged or
+    /// unplugged. A running chain reads them through shared state, so the
+    /// edit is a store, not a rebuild.
+    ClipControls(usize, u64),
     /// Clips were placed past the end of a track's queued material.
     Appended(usize),
     /// The arrangement's shape changed: a clip was removed or moved, or the

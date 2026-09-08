@@ -41,7 +41,7 @@ use crate::bus::{BusRef, Group};
 use crate::engine::measure::{Measurement, Meter};
 use crate::engine::timeline::{ClipPlan, Timeline};
 use crate::engine::{Backend, BackendError, Change};
-use crate::track::{Fade, Track};
+use crate::track::{ControlSource, Fade, Track};
 
 /// A backend that actually makes sound.
 pub struct Rodio {
@@ -189,34 +189,43 @@ struct ClipVoice {
 struct ClipParams {
     gain: GainCell,
     fade: Arc<Mutex<Fade>>,
-    /// This clip's own pan cell — the modulation point its panner reads
-    /// every frame. Every live pan edit is a store into this one cell, so a
-    /// clip never needs rewiring to be panned; `follow_track` decides
-    /// whether track-pan edits reach it.
+    /// The modulated pan the panner reads — the modulation point. Written
+    /// by the pan drive every sample as base plus sources, never by an edit
+    /// directly, so a curve and a static pan share one mechanism.
     pan: GainCell,
+    /// The static pan base: what pan edits write — the clip's own
+    /// placement, or its track's pan while the clip follows it.
+    pan_base: GainCell,
     /// Whether the clip inherits its track's pan (its placement is `None`):
-    /// a track pan lands on this clip's cell too, until the clip is given a
+    /// a track pan lands on this clip's base too, until the clip is given a
     /// placement of its own.
     follow_track: bool,
+    /// The control sources driving this clip's pan, shared with the graph:
+    /// an edit is a store into this list, and the pan drive re-reads it
+    /// every few milliseconds.
+    controls: Arc<Mutex<Vec<ControlSource>>>,
     /// How far into the clip the graph entered it, so a fade-in edited later
     /// is still measured from the clip's own start.
     into: Duration,
 }
 
 impl ClipParams {
-    /// Parameters holding a plan's values: the pan cell starts at the
-    /// effective position — the clip's own placement, or the track's pan —
-    /// and follows the track only while the clip has none of its own.
+    /// Parameters holding a plan's values: the pan cell and its base start
+    /// at the effective position — the clip's own placement, or the track's
+    /// pan — and the base follows the track only while the clip has no
+    /// placement of its own.
     fn new(plan: &ClipPlan, track_pan: f32) -> Self {
-        let pan = match plan.placement {
+        let base = match plan.placement {
             Some(pos) => pos,
             None => track_pan,
         };
         Self {
             gain: GainCell::new(plan.gain),
             fade: Arc::new(Mutex::new(plan.fade)),
-            pan: GainCell::new(pan),
+            pan: GainCell::new(base),
+            pan_base: GainCell::new(base),
             follow_track: plan.placement.is_none(),
+            controls: Arc::new(Mutex::new(plan.controls.clone())),
             into: plan.into,
         }
     }
@@ -489,6 +498,7 @@ impl Graph {
             Change::TrackPan(track) => self.land_track_pan(tracks, *track),
             Change::ClipParams(track, id) => self.land_clip_params(tracks, *track, *id),
             Change::ClipPan(track, id) => self.land_clip_pan(tracks, *track, *id),
+            Change::ClipControls(track, id) => self.land_clip_controls(tracks, *track, *id),
             Change::Appended(track) => self.land_appended(tracks, at, *track),
             Change::Structure => false,
             // A group strip is baked into the graph when it is built; a
@@ -531,7 +541,7 @@ impl Graph {
         };
         for clip in &mut voice.clips {
             if clip.params.follow_track {
-                clip.params.pan.set(pan);
+                clip.params.pan_base.set(pan);
             }
         }
         true
@@ -562,6 +572,32 @@ impl Graph {
         true
     }
 
+    /// A clip's control sources — a curve plugged, unplugged or redrawn:
+    /// one store into the list the pan drive reads, heard within its next
+    /// refresh. No running chain needs rebuilding for it.
+    fn land_clip_controls(&mut self, tracks: &[Track], track: usize, id: u64) -> bool {
+        let Some(queued) = self
+            .voices
+            .iter_mut()
+            .find(|v| v.track == track)
+            .and_then(|v| v.clips.iter_mut().find(|c| c.id == id))
+        else {
+            // Not queued: the clip already sounded, or is gone from the
+            // arrangement. Either way nothing is waiting to be retuned.
+            return true;
+        };
+        let Some(clip) = tracks
+            .get(track)
+            .and_then(|t| t.clips().iter().find(|c| c.id == id))
+        else {
+            return true;
+        };
+        if let Ok(mut controls) = queued.params.controls.lock() {
+            *controls = clip.controls.clone();
+        }
+        true
+    }
+
     /// A clip's own placement: a fixed cell of its own, or — when the clip
     /// has none and follows its track again — the voice's shared cell.
     /// A clip's own placement: one store to the clip's own pan cell — the
@@ -586,12 +622,12 @@ impl Graph {
         };
         match clip.placement {
             Some(p) => {
-                queued.params.pan.set(p.position());
+                queued.params.pan_base.set(p.position());
                 queued.params.follow_track = false;
             }
             None => {
                 let pan = tracks.get(track).map_or(0.0, Track::pan);
-                queued.params.pan.set(pan);
+                queued.params.pan_base.set(pan);
                 queued.params.follow_track = true;
             }
         }
@@ -866,6 +902,107 @@ impl<I: Source> Source for Panner<I> {
     }
 }
 
+/// Drives a clip's pan cell from its control sources as the samples flow:
+/// every sample it writes `pan = base + Σ source(clip-local time)`, clamped
+/// to the field, so the panner downstream reads the modulated position. The
+/// static base (what pan edits write) is read per sample — a live pan is
+/// heard immediately; the sources are read from a shared list refreshed
+/// every few milliseconds, like a fade, so plugging or redrawing a curve
+/// lands on the running clip without a rebuild.
+///
+/// Placed inside the clip's delay, so a curve starts at the clip itself and
+/// the silence leading to it is not swept. Both live and render build this
+/// chain through the same `make_source`, so a curve sounds offline exactly
+/// as it does on air.
+struct PanDrive<I> {
+    input: I,
+    /// The modulated pan the panner reads.
+    pan: GainCell,
+    /// The static base — what pan edits write.
+    base: GainCell,
+    /// The control sources, shared with the graph.
+    controls: Arc<Mutex<Vec<ControlSource>>>,
+    /// The sources as last read, so the mutex is not touched per sample.
+    sources: Vec<ControlSource>,
+    /// Clip-local time of the next sample: where the clip was entered, plus
+    /// what has flowed since.
+    at: Duration,
+    /// Duration of one interleaved sample of `input`.
+    per_sample: Duration,
+    /// Samples until `controls` is read again.
+    until_refresh: u32,
+    /// Samples between reads: five milliseconds of this source's audio.
+    refresh_every: u32,
+}
+
+impl<I: Source> PanDrive<I> {
+    fn new(input: I, params: &ClipParams) -> Self {
+        let per_frame = input.sample_rate().get() as u64 * input.channels().get() as u64;
+        let per_sample = Duration::from_secs_f64(1.0 / per_frame as f64);
+        let refresh_every = u32::try_from(per_frame / 200).unwrap_or(u32::MAX).max(1);
+        let sources = params
+            .controls
+            .lock()
+            .map(|c| c.clone())
+            .unwrap_or_default();
+        Self {
+            input,
+            pan: params.pan.clone(),
+            base: params.pan_base.clone(),
+            controls: params.controls.clone(),
+            sources,
+            at: params.into,
+            per_sample,
+            until_refresh: refresh_every,
+            refresh_every,
+        }
+    }
+}
+
+impl<I: Source> Iterator for PanDrive<I> {
+    type Item = Sample;
+
+    fn next(&mut self) -> Option<Sample> {
+        let sample = self.input.next()?;
+        if self.until_refresh == 0 {
+            // A curve edited while this clip plays lands here, within one
+            // refresh window of being set.
+            if let Ok(controls) = self.controls.lock() {
+                self.sources = controls.clone();
+            }
+            self.until_refresh = self.refresh_every;
+        }
+        self.until_refresh -= 1;
+        // parameter = static base + the sum of the active sources, clamped.
+        let offset = self
+            .sources
+            .iter()
+            .fold(0.0f32, |sum, source| sum + source.value_at(self.at));
+        let pan = (self.base.get() + offset).clamp(-1.0, 1.0);
+        self.pan.set(pan);
+        self.at += self.per_sample;
+        Some(sample)
+    }
+}
+
+impl<I: Source> Source for PanDrive<I> {
+    fn current_span_len(&self) -> Option<usize> {
+        self.input.current_span_len()
+    }
+
+    fn channels(&self) -> rodio::ChannelCount {
+        self.input.channels()
+    }
+
+    fn sample_rate(&self) -> rodio::SampleRate {
+        self.input.sample_rate()
+    }
+
+    fn total_duration(&self) -> Option<Duration> {
+        self.input.total_duration()
+    }
+}
+
 /// Build one clip's source chain, from its in-point in the source to a
 /// placed stereo pair at its timecode, enveloped and scaled by the params
 /// the graph shares.
@@ -878,11 +1015,13 @@ impl<I: Source> Source for Panner<I> {
 fn make_source(plan: &ClipPlan, params: &ClipParams) -> Result<Box<dyn Source + Send>, String> {
     let decoder = positioned(&plan.uri, plan.from + plan.into)?;
     let faded = apply_fade(decoder.take_duration(plan.length), params, plan.length);
-    // The clip's own silence (its delay) stays in the source's own layout;
-    // the panner after it turns whatever that layout is into the stereo pair
-    // the bus carries. Silence pans to silence, so the gap's timing is
-    // untouched.
-    let placed = Panner::new(faded.delay(plan.delay), params.pan.clone());
+    // The control sources drive the pan cell as the content flows, then the
+    // clip's own silence (its delay) is added outside them: a sweep starts
+    // at the clip, not at the silence leading to it. The panner after the
+    // delay turns whatever layout it sees into the stereo pair the bus
+    // carries — silence pans to silence, so the gap's timing is untouched.
+    let driven = PanDrive::new(faded, params);
+    let placed = Panner::new(driven.delay(plan.delay), params.pan.clone());
     Ok(Box::new(LiveGain::new(
         placed,
         params.gain.clone(),
@@ -1483,7 +1622,7 @@ pub fn probe_sources(tracks: &[Track]) -> Vec<(String, Result<Probing, String>)>
 mod tests {
     use super::*;
     use crate::engine::Player;
-    use crate::track::{Clip, Source, Track};
+    use crate::track::{Clip, Curve, Keyframe, Source, Track};
     use rodio::Source as _;
     use std::sync::Arc;
 
@@ -2963,6 +3102,112 @@ mod tests {
         let second = pull(&mut output, 2_205);
         assert!(channel_peak(&second, 0) < 1e-4, "the pinned clip did not follow");
         assert!((channel_peak(&second, 1) - 0.5).abs() < 5e-3, "it is still hard right");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+    /// One mono clip on its own track, carrying a curve and a static pan
+    /// base — the two halves of `pan = base + sources`.
+    fn curve_track(uri: &str, curve: Curve, base: f32) -> Vec<Track> {
+        let mut track = Track::named("slide");
+        let id = track.insert(clip_at(uri, 0, 2)).unwrap();
+        let clip = track.clip_mut(id).unwrap();
+        clip.controls = vec![ControlSource::Curve(curve)];
+        clip.placement = Some(crate::bus::Placement::Stereo { position: base });
+        vec![track]
+    }
+
+    /// Loudest sample of one interleaved channel over `frames` frames from
+    /// sample `from` — a bounded span, so a measurement never leaks the
+    /// audio outside it.
+    fn ch_peak(samples: &[Sample], ch: usize, from: usize, frames: usize) -> f32 {
+        samples[from..from + frames * 2]
+            .iter()
+            .skip(ch)
+            .step_by(2)
+            .fold(0.0f32, |m, s| m.max(s.abs()))
+    }
+
+    #[test]
+    fn a_curve_sweeps_a_clips_pan_as_it_plays() {
+        // The demo gesture as one curve line instead of a background script
+        // polling the playhead and re-panning: over the clip's two seconds
+        // the pan rides +1 (right) down to -1 (left), live.
+        let dir = std::env::temp_dir().join(format!("bo-curve-live-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tone = dir.join("tone.wav");
+        write_wav(&tone, 2.0, 440.0, 0.5);
+        let sweep = Curve::new(vec![
+            Keyframe { at: Duration::ZERO, value: 1.0 },
+            Keyframe { at: Duration::from_secs(2), value: -1.0 },
+        ]);
+        let tracks = curve_track(tone.to_str().unwrap(), sweep, 0.0);
+        let (mut graph, mut output) = graph_on_a_mixer();
+        graph.play(&tracks, &[], Duration::ZERO).unwrap();
+
+        let early = pull(&mut output, 2_205); // ~50 ms in: pan near +1
+        assert!(ch_peak(&early, 1, 200, 1_000) > 0.4, "right early");
+        assert!(ch_peak(&early, 0, 200, 1_000) < 0.1, "left quiet early");
+        // Skip to the last ~50 ms of the two seconds: pan near -1.
+        let _mid = pull(&mut output, 44_100 * 2 - 2_205 - 4_410);
+        let late = pull(&mut output, 2_205);
+        assert!(ch_peak(&late, 0, 200, 1_000) > 0.4, "left late");
+        assert!(ch_peak(&late, 1, 200, 1_000) < 0.1, "right quiet late");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_curve_offsets_the_static_base_and_is_redrawn_live() {
+        // parameter = base + sources: base +0.5 under a +1 curve clamps hard
+        // right; redrawing the curve to -1 while the clip sounds lands within
+        // a refresh window — no rebuild, like a fade edit.
+        let dir = std::env::temp_dir().join(format!("bo-curve-edit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tone = dir.join("tone.wav");
+        write_wav(&tone, 2.0, 440.0, 0.5);
+        let uri = tone.to_str().unwrap();
+
+        let right = Curve::new(vec![Keyframe { at: Duration::ZERO, value: 1.0 }]);
+        let tracks = curve_track(uri, right, 0.5);
+        let id = tracks[0].clips()[0].id;
+        let (mut graph, mut output) = graph_on_a_mixer();
+        graph.play(&tracks, &[], Duration::ZERO).unwrap();
+        let first = pull(&mut output, 2_205);
+        assert!(ch_peak(&first, 1, 200, 1_000) > 0.4, "clamped hard right");
+        assert!(ch_peak(&first, 0, 200, 1_000) < 0.1);
+
+        // Redraw: base 0.5 stays, the curve drops to -1 -> pan -0.5, a mono
+        // constant-power position that leans left.
+        let left = Curve::new(vec![Keyframe { at: Duration::ZERO, value: -1.0 }]);
+        let redrawn = curve_track(uri, left, 0.5);
+        assert!(graph.land(&redrawn, graph.position(), &Change::ClipControls(0, id)));
+        let after = pull(&mut output, 4_410); // 100 ms: well past a refresh
+        let (l, r) = (ch_peak(&after, 0, 2_000, 1_000), ch_peak(&after, 1, 2_000, 1_000));
+        assert!(l > r && l > 0.25, "mid-left after the live redraw: l={l} r={r}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_curve_sweeps_offline_renders_like_it_plays() {
+        // The chain is shared: a render must hear the same sweep the live
+        // graph does, from the same curve.
+        let dir = std::env::temp_dir().join(format!("bo-curve-render-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tone = dir.join("tone.wav");
+        write_wav(&tone, 2.0, 440.0, 0.5);
+        let sweep = Curve::new(vec![
+            Keyframe { at: Duration::ZERO, value: 1.0 },
+            Keyframe { at: Duration::from_secs(2), value: -1.0 },
+        ]);
+        let tracks = curve_track(tone.to_str().unwrap(), sweep, 0.0);
+        let out = dir.join("out.wav");
+        render_to_file(&tracks, &[], &out, Duration::ZERO, None, 1.0).unwrap();
+        let decoder = Decoder::new(BufReader::new(File::open(&out).unwrap())).unwrap();
+        let samples: Vec<Sample> = decoder.collect();
+        // Frames ~2..25 ms: pan still near +1, the tone rides the right
+        // channel; near the last two hundred milliseconds it rides the left.
+        assert!(ch_peak(&samples, 1, 200, 1_000) > 0.4, "rendered early right");
+        assert!(ch_peak(&samples, 0, 200, 1_000) < 0.1);
+        assert!(ch_peak(&samples, 0, 171_990, 1_000) > 0.4, "rendered late left");
+        assert!(ch_peak(&samples, 1, 171_990, 1_000) < 0.1);
         std::fs::remove_dir_all(&dir).ok();
     }
 }
