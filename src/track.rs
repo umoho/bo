@@ -211,12 +211,12 @@ impl Curve {
 }
 
 impl std::fmt::Display for Curve {
+    /// `curve,T=V,...` — each point is a clip-local time (seconds) and the
+    /// offset it outputs.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for (i, k) in self.keyframes.iter().enumerate() {
-            if i > 0 {
-                f.write_str(",")?;
-            }
-            write!(f, "{}:{}", k.at.as_secs_f64(), k.value)?;
+        f.write_str("curve")?;
+        for k in &self.keyframes {
+            write!(f, ",{}={}", k.at.as_secs_f64(), k.value)?;
         }
         Ok(())
     }
@@ -225,34 +225,86 @@ impl std::fmt::Display for Curve {
 impl std::str::FromStr for Curve {
     type Err = String;
 
-    /// `time:value[,time:value...]` — times in seconds, relative to the
-    /// clip's start. An empty string is an empty curve.
+    /// `curve[,T=V,...]` — every point after the type is `time=value`.
     fn from_str(s: &str) -> Result<Self, String> {
-        let s = s.trim();
-        if s.is_empty() {
-            return Ok(Self::new(Vec::new()));
-        }
         let mut keyframes = Vec::new();
-        for part in s.split(',') {
-            let part = part.trim();
-            let (at, value) = part.split_once(':').ok_or_else(|| {
-                format!("bad keyframe {part:?}: expected TIME:VALUE")
-            })?;
-            let secs: f64 = at.trim()
-                .parse()
-                .map_err(|_| format!("bad keyframe time {at:?}: seconds"))?;
-            if secs < 0.0 {
-                return Err(format!("bad keyframe time {at:?}: not negative"));
-            }
-            let at = std::time::Duration::try_from_secs_f64(secs)
-                .map_err(|_| format!("bad keyframe time {at:?}"))?;
-            let value: f32 = value.trim().trim_start_matches('+').parse().map_err(|_| {
-                format!("bad keyframe value {value:?}: a number")
-            })?;
+        for (at, value) in type_args(s, &["curve"])? {
+            let at = parse_secs(at, "keyframe time")?;
+            let value = parse_number(value, "keyframe value")?;
             keyframes.push(Keyframe { at, value });
         }
         Ok(Self::new(keyframes))
     }
+}
+
+/// Split a `type,field=value,...` value into its fields — the object/dict
+/// grammar every control source speaks: a type, then fields as
+/// `name=value`, comma-separated. The type must be one of `types`; an empty
+/// value (just the type) has no fields.
+fn type_args<'a>(s: &'a str, types: &[&str]) -> Result<Vec<(&'a str, &'a str)>, String> {
+    let mut parts = s.split(',');
+    let kind = parts.next().unwrap_or("").trim();
+    if !types.contains(&kind) {
+        return Err(format!(
+            "bad control source {s:?}: expected {}",
+            types.join(", ")
+        ));
+    }
+    let mut fields: Vec<(&str, &str)> = Vec::new();
+    for token in parts {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        let (name, value) = token
+            .split_once('=')
+            .ok_or_else(|| format!("bad argument {token:?}: expected NAME=VALUE"))?;
+        let (name, value) = (name.trim(), value.trim());
+        if fields.iter().any(|(n, _)| *n == name) {
+            return Err(format!("duplicate argument {name:?}"));
+        }
+        fields.push((name, value));
+    }
+    Ok(fields)
+}
+
+/// Take one `name=value` argument out of a parsed list, if it is there.
+fn take_arg<'a>(args: &mut Vec<(&'a str, &'a str)>, name: &str) -> Result<Option<&'a str>, String> {
+    let index = args.iter().position(|(n, _)| *n == name);
+    match index {
+        Some(i) => Ok(Some(args.remove(i).1)),
+        None => Ok(None),
+    }
+}
+
+/// An argument list that every argument must have been consumed from.
+fn expect_none(args: &[(&str, &str)], what: &str) -> Result<(), String> {
+    match args.first() {
+        None => Ok(()),
+        Some((name, _)) => Err(format!("unknown {what} argument {name:?}")),
+    }
+}
+
+/// Seconds as a decimal number.
+fn parse_secs(s: &str, what: &str) -> Result<Duration, String> {
+    let v: f64 = s
+        .parse()
+        .map_err(|_| format!("bad {what} {s:?}: a number"))?;
+    if !v.is_finite() || v < 0.0 {
+        return Err(format!("bad {what} {s:?}: not negative"));
+    }
+    Duration::try_from_secs_f64(v).map_err(|_| format!("bad {what} {s:?}: a number"))
+}
+
+/// A signed finite number.
+fn parse_number(s: &str, what: &str) -> Result<f32, String> {
+    let v: f32 = s
+        .parse()
+        .map_err(|_| format!("bad {what} {s:?}: a number"))?;
+    if !v.is_finite() {
+        return Err(format!("bad {what} {s:?}: a finite number"));
+    }
+    Ok(v)
 }
 
 /// The shape of an [`Lfo`]'s cycle.
@@ -371,12 +423,13 @@ impl Lfo {
 }
 
 impl std::fmt::Display for Lfo {
-    /// `shape:rate:depth:phase` — e.g. `sine:1:0.5:0` swings once a second
-    /// at half depth from cycle zero.
+    /// `lfo,shape=…,rate=…,depth=…,phase=…` — e.g.
+    /// `lfo,shape=sine,rate=1,depth=0.5,phase=0` swings once a second at
+    /// half depth from cycle zero.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{}:{}:{}:{}",
+            "lfo,shape={},rate={},depth={},phase={}",
             self.shape, self.rate, self.depth, self.phase
         )
     }
@@ -385,21 +438,27 @@ impl std::fmt::Display for Lfo {
 impl std::str::FromStr for Lfo {
     type Err = String;
 
-    /// `shape:rate:depth[:phase]` — phase defaults to the start of the cycle.
+    /// `lfo[,arg=value,...]` — shape, rate (cycles per second), depth and
+    /// phase are all optional; each falls back to its default.
     fn from_str(s: &str) -> Result<Self, String> {
-        let parts: Vec<&str> = s.split(':').map(str::trim).collect();
-        if !(3..=4).contains(&parts.len()) {
-            return Err(format!(
-                "bad lfo {s:?}: expected SHAPE:RATE:DEPTH[:PHASE]"
-            ));
-        }
-        let shape = parts[0].parse::<LfoShape>()?;
-        let rate: f32 = parts[1].parse().map_err(|_| "bad lfo rate: cycles per second")?;
-        let depth: f32 = parts[2].parse().map_err(|_| "bad lfo depth: 0..1")?;
-        let phase: f32 = match parts.get(3) {
-            Some(p) => p.parse().map_err(|_| "bad lfo phase: a cycle fraction")?,
+        let mut fields = type_args(s, &["lfo"])?;
+        let shape = match take_arg(&mut fields, "shape")? {
+            Some(v) => v.parse::<LfoShape>()?,
+            None => LfoShape::Sine,
+        };
+        let rate = match take_arg(&mut fields, "rate")? {
+            Some(v) => parse_number(v, "rate")?,
+            None => 1.0,
+        };
+        let depth = match take_arg(&mut fields, "depth")? {
+            Some(v) => parse_number(v, "depth")?,
+            None => 0.5,
+        };
+        let phase = match take_arg(&mut fields, "phase")? {
+            Some(v) => parse_number(v, "phase")?,
             None => 0.0,
         };
+        expect_none(&fields, "lfo")?;
         Ok(Self::new(rate, depth, shape, phase))
     }
 }
@@ -436,7 +495,7 @@ impl Default for Sidechain {
 
 impl Sidechain {
     /// A sidechain over the given bus, offset per unit level, and detector
-    /// time constants (clamped to non-negative).
+    /// time constants.
     #[must_use]
     pub fn new(
         listen: crate::bus::BusRef,
@@ -454,7 +513,7 @@ impl Sidechain {
 }
 
 impl std::fmt::Display for Sidechain {
-    /// `sidechain:BUS:AMOUNT:ATTACK:RELEASE` — bus is `master` or
+    /// `sidechain,bus=…,amount=…,attack=…,release=…` — bus is `master` or
     /// `group.N`, times in seconds.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let bus = match self.listen {
@@ -463,7 +522,7 @@ impl std::fmt::Display for Sidechain {
         };
         write!(
             f,
-            "sidechain:{bus}:{}:{}:{}",
+            "sidechain,bus={bus},amount={},attack={},release={}",
             self.amount,
             self.attack.as_secs_f64(),
             self.release.as_secs_f64()
@@ -474,23 +533,18 @@ impl std::fmt::Display for Sidechain {
 impl std::str::FromStr for Sidechain {
     type Err = String;
 
-    /// `sidechain:BUS:AMOUNT[:ATTACK:RELEASE]` — the time constants default
-    /// to a fast attack and a slow release.
+    /// `sidechain[,arg=value,...]` — bus, amount, attack and release are
+    /// optional; a missing bus listens to the master, and the time constants
+    /// default to a fast attack and a slow release.
     fn from_str(s: &str) -> Result<Self, String> {
-        let rest = s
-            .strip_prefix("sidechain:")
-            .ok_or_else(|| format!("bad sidechain {s:?}: expected sidechain:BUS:AMOUNT[:ATTACK:RELEASE]"))?;
-        let parts: Vec<&str> = rest.split(':').map(str::trim).collect();
-        if !(2..=4).contains(&parts.len()) {
-            return Err(format!("bad sidechain {s:?}: expected sidechain:BUS:AMOUNT[:ATTACK:RELEASE]"));
-        }
-        let listen = match parts[0] {
-            "master" => crate::bus::BusRef::Master,
-            other => match other.strip_prefix("group.") {
+        let mut fields = type_args(s, &["sidechain"])?;
+        let listen = match take_arg(&mut fields, "bus")? {
+            Some("master") => crate::bus::BusRef::Master,
+            Some(other) => match other.strip_prefix("group.") {
                 Some(id) => {
-                    let id: u64 = id
-                        .parse()
-                        .map_err(|_| format!("bad sidechain bus {other:?}: master or group.N"))?;
+                    let id: u64 = id.parse().map_err(|_| {
+                        format!("bad sidechain bus {other:?}: master or group.N")
+                    })?;
                     crate::bus::BusRef::Group(id)
                 }
                 None => {
@@ -499,31 +553,21 @@ impl std::str::FromStr for Sidechain {
                     ))
                 }
             },
+            None => crate::bus::BusRef::Master,
         };
-        let amount: f32 = parts[1]
-            .parse()
-            .map_err(|_| format!("bad sidechain amount {:?}: a signed number", parts[1]))?;
-        if !amount.is_finite() {
-            return Err(format!("bad sidechain amount {:?}: a finite number", parts[1]));
-        }
-        let secs = |name: &str, v: &str| -> Result<Duration, String> {
-            let s: f64 = v
-                .parse()
-                .map_err(|_| format!("bad sidechain {name} {v:?}: seconds"))?;
-            if !s.is_finite() || s < 0.0 {
-                return Err(format!("bad sidechain {name} {v:?}: not negative"));
-            }
-            Duration::try_from_secs_f64(s)
-                .map_err(|_| format!("bad sidechain {name} {v:?}: seconds"))
+        let amount = match take_arg(&mut fields, "amount")? {
+            Some(v) => parse_number(v, "amount")?,
+            None => -0.5,
         };
-        let attack = match parts.get(2) {
-            Some(v) => secs("attack", v)?,
+        let attack = match take_arg(&mut fields, "attack")? {
+            Some(v) => parse_secs(v, "attack")?,
             None => Duration::from_millis(5),
         };
-        let release = match parts.get(3) {
-            Some(v) => secs("release", v)?,
+        let release = match take_arg(&mut fields, "release")? {
+            Some(v) => parse_secs(v, "release")?,
             None => Duration::from_millis(150),
         };
+        expect_none(&fields, "sidechain")?;
         Ok(Self::new(listen, amount, attack, release))
     }
 }
@@ -575,20 +619,19 @@ impl std::fmt::Display for ControlSource {
 impl std::str::FromStr for ControlSource {
     type Err = String;
 
-    /// A curve is its keyframes (`0:1,3.2:-1`); an LFO opens with its shape
-    /// (`sine:1:0.5:0`); a sidechain opens with its keyword
-    /// (`sidechain:master:-0.5:0.005:0.15`). A text that starts with a shape
-    /// name or the keyword is neither a curve — keyframe text never starts
-    /// with a letter.
+    /// One `type,field=value,...` text: a curve (`curve,0=1,3.2=-1`), an
+    /// LFO (`lfo,shape=sine,rate=1`) or a sidechain
+    /// (`sidechain,bus=group.0`). The type is explicit; nothing is inferred.
     fn from_str(s: &str) -> Result<Self, String> {
-        let first = s.trim().split(':').next().unwrap_or("");
-        if first == "sidechain" {
-            return Ok(Self::Sidechain(s.parse()?));
+        let kind = s.trim().split(',').next().unwrap_or("");
+        match kind {
+            "curve" => Ok(Self::Curve(s.parse()?)),
+            "lfo" => Ok(Self::Lfo(s.parse()?)),
+            "sidechain" => Ok(Self::Sidechain(s.parse()?)),
+            _ => Err(format!(
+                "bad control source {s:?}: expected curve, lfo or sidechain"
+            )),
         }
-        if first.parse::<LfoShape>().is_ok() {
-            return Ok(Self::Lfo(s.parse()?));
-        }
-        Ok(Self::Curve(s.parse()?))
     }
 }
 
@@ -1195,20 +1238,24 @@ mod tests {
             Keyframe { at: Duration::from_secs_f64(3.2), value: -1.0 },
             Keyframe { at: Duration::from_secs_f64(4.0), value: 0.5 },
         ]);
+        // A curve is a map: every point after the type is TIME=VALUE.
         let text = curve.to_string();
-        assert_eq!(text, "0:1,3.2:-1,4:0.5", "{text}");
+        assert_eq!(text, "curve,0=1,3.2=-1,4=0.5", "{text}");
         assert_eq!(text.parse::<Curve>().unwrap(), curve, "display and parse agree");
-        // Authoring may lead values with a sign and scatter the order.
+        // The map's order never matters; the points are sorted on the way in.
         assert_eq!(
-            "3.2:-1,+0:1,4:+0.5".parse::<Curve>().unwrap(),
+            "curve,4=0.5,3.2=-1,0=1".parse::<Curve>().unwrap(),
             curve,
-            "order and '+' are forgiven"
+            "scattered order is forgiven"
         );
-        assert_eq!(" ".parse::<Curve>().unwrap(), Curve::new(Vec::new()));
-        assert!("1".parse::<Curve>().is_err(), "no ':' is refused");
-        assert!("x:1".parse::<Curve>().is_err());
-        assert!("1:x".parse::<Curve>().is_err());
-        assert!("-1:0".parse::<Curve>().is_err(), "negative time is refused");
+        assert_eq!("curve".parse::<Curve>().unwrap(), Curve::new(Vec::new()));
+        assert_eq!("curve,".parse::<Curve>().unwrap(), Curve::new(Vec::new()));
+        assert!("lfo".parse::<Curve>().is_err(), "the type must be curve");
+        assert!("curve,1".parse::<Curve>().is_err(), "a point needs TIME=VALUE");
+        assert!("curve,x=1".parse::<Curve>().is_err());
+        assert!("curve,1=x".parse::<Curve>().is_err());
+        assert!("curve,-1=0".parse::<Curve>().is_err(), "negative time is refused");
+        assert!("curve,0=1,0=2".parse::<Curve>().is_err(), "a duplicate time is refused");
     }
 
     #[test]
@@ -1219,8 +1266,8 @@ mod tests {
         ]);
         let source = ControlSource::Curve(curve);
         assert_eq!(source.value_at(Duration::from_secs(1)), 0.0);
-        assert_eq!(source.to_string(), "0:1,2:-1");
-        assert_eq!("0:1,2:-1".parse::<ControlSource>().unwrap(), source);
+        assert_eq!(source.to_string(), "curve,0=1,2=-1");
+        assert_eq!("curve,0=1,2=-1".parse::<ControlSource>().unwrap(), source);
     }
 
     #[test]
@@ -1276,31 +1323,51 @@ mod tests {
     #[test]
     fn an_lfo_round_trips_through_its_text() {
         let lfo = Lfo::new(0.5, 0.8, LfoShape::Triangle, 0.25);
-        assert_eq!(lfo.to_string(), "triangle:0.5:0.8:0.25");
-        assert_eq!("triangle:0.5:0.8:0.25".parse::<Lfo>().unwrap(), lfo);
+        assert_eq!(lfo.to_string(), "lfo,shape=triangle,rate=0.5,depth=0.8,phase=0.25");
         assert_eq!(
-            "sine:2:0.4".parse::<Lfo>().unwrap(),
-            Lfo::new(2.0, 0.4, LfoShape::Sine, 0.0),
-            "phase defaults to the cycle start"
+            "lfo,shape=triangle,rate=0.5,depth=0.8,phase=0.25"
+                .parse::<Lfo>()
+                .unwrap(),
+            lfo
         );
-        assert!("sine:0:0.5:0".parse::<Lfo>().unwrap().rate > 0.0, "a zero rate is tamed");
-        assert!("sine:-2:0.5:0".parse::<Lfo>().unwrap().rate > 0.0);
-        assert!("wibble:1:0.5:0".parse::<Lfo>().is_err());
-        assert!("sine:1:x".parse::<Lfo>().is_err());
+        // Fields default and may come in any order.
+        assert_eq!(
+            "lfo,depth=0.4,rate=2".parse::<Lfo>().unwrap(),
+            Lfo::new(2.0, 0.4, LfoShape::Sine, 0.0),
+            "shape and phase fall back to their defaults"
+        );
+        assert_eq!(
+            "lfo".parse::<Lfo>().unwrap(),
+            Lfo::default(),
+            "an empty lfo is the default lfo"
+        );
+        assert!("lfo,rate=0".parse::<Lfo>().unwrap().rate > 0.0, "a zero rate is tamed");
+        assert!("lfo,rate=-2".parse::<Lfo>().unwrap().rate > 0.0);
+        assert!("lfo,rate=x".parse::<Lfo>().is_err());
+        assert!("lfo,shape=wibble".parse::<Lfo>().is_err());
+        assert!("lfo,rate=1,rate=2".parse::<Lfo>().is_err(), "no duplicates");
+        assert!("lfo,volume=1".parse::<Lfo>().is_err(), "unknown fields are refused");
+        assert!("wibble".parse::<Lfo>().is_err());
     }
 
     #[test]
-    fn a_control_source_tells_a_curve_from_an_lfo() {
+    fn a_control_source_is_typed_explicitly() {
         let lfo = ControlSource::Lfo(Lfo::new(1.0, 0.5, LfoShape::Sine, 0.0));
-        assert_eq!(lfo.to_string(), "sine:1:0.5:0");
-        assert_eq!("sine:1:0.5:0".parse::<ControlSource>().unwrap(), lfo);
-        // A curve still parses from bare keyframes: never a leading letter.
+        assert_eq!(lfo.to_string(), "lfo,shape=sine,rate=1,depth=0.5,phase=0");
+        assert_eq!(
+            "lfo,shape=sine,rate=1,depth=0.5,phase=0"
+                .parse::<ControlSource>()
+                .unwrap(),
+            lfo
+        );
+        // The leading type decides; nothing is inferred from the text.
         let curve = ControlSource::Curve(Curve::new(vec![
             Keyframe { at: Duration::ZERO, value: 1.0 },
             Keyframe { at: secs(2), value: -1.0 },
         ]));
-        assert_eq!("0:1,2:-1".parse::<ControlSource>().unwrap(), curve);
-        assert_eq!(curve.to_string(), "0:1,2:-1");
+        assert_eq!("curve,0=1,2=-1".parse::<ControlSource>().unwrap(), curve);
+        assert_eq!(curve.to_string(), "curve,0=1,2=-1");
+        assert!("wibble,rate=1".parse::<ControlSource>().is_err());
         // The offset at the peak of the first cycle.
         assert!(
             (lfo.value_at(Duration::from_secs_f64(0.25)) - 0.5).abs() < 1e-6
@@ -1315,17 +1382,25 @@ mod tests {
             Duration::from_secs_f64(0.01),
             Duration::from_secs_f64(0.2),
         );
-        assert_eq!(duck.to_string(), "sidechain:group.1:-0.4:0.01:0.2");
-        assert_eq!("sidechain:group.1:-0.4:0.01:0.2".parse::<Sidechain>().unwrap(), duck);
+        assert_eq!(duck.to_string(), "sidechain,bus=group.1,amount=-0.4,attack=0.01,release=0.2");
         assert_eq!(
-            "sidechain:master:-0.5".parse::<Sidechain>().unwrap(),
-            Sidechain::default(),
-            "time constants default to a fast attack and a slow release"
+            "sidechain,bus=group.1,amount=-0.4,attack=0.01,release=0.2"
+                .parse::<Sidechain>()
+                .unwrap(),
+            duck
         );
-        let boost = "sidechain:master:0.3:0.05".parse::<Sidechain>().unwrap();
+        assert_eq!(
+            "sidechain".parse::<Sidechain>().unwrap(),
+            Sidechain::default(),
+            "everything defaults: it listens to the master at -0.5"
+        );
+        let boost = "sidechain,amount=0.3,attack=0.05"
+            .parse::<Sidechain>()
+            .unwrap();
         assert_eq!(boost.amount, 0.3, "an amount may swell as well as duck");
         assert_eq!(boost.attack, Duration::from_millis(50));
         assert_eq!(boost.release, Duration::from_millis(150));
+        assert_eq!(boost.listen, BusRef::Master);
 
         // Wired nowhere yet, a sidechain contributes nothing on its own.
         let source = ControlSource::Sidechain(duck.clone());
@@ -1333,7 +1408,12 @@ mod tests {
         assert_eq!(source.to_string(), duck.to_string());
         assert_eq!(source.to_string().parse::<ControlSource>().unwrap(), source);
 
-        for bad in ["sidechain:grup.1:-0.4", "sidechain:group.x:-0.4", "sidechain:master:nan", "sidechain:master:-0.4:0.01:0.2:9"] {
+        for bad in [
+            "sidechain,bus=grup.1",
+            "sidechain,bus=group.x",
+            "sidechain,bus=master,amount=nan",
+            "sidechain,bus=master,amount=-0.4,extra=1",
+        ] {
             assert!(bad.parse::<Sidechain>().is_err(), "{bad} should be refused");
         }
     }

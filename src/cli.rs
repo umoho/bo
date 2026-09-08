@@ -525,9 +525,10 @@ Mix:
   set clip.N.N.pan_control <src>
                            plug one source into the clip's pan input — a
                            gesture like a right-to-left sweep is a curve,
-                           '0:1,3.2:-1' (time:value keyframes, linear, held
-                           flat), or a wobble is an LFO, 'sine:1:0.5:0'
-                           (shape:rate:depth:phase) — 'none' unplugs. The
+                           'curve,0=1,3.2=-1' (time=value points, linear, held
+                           flat), or a wobble is an LFO,
+                           'lfo,shape=sine,rate=1,depth=0.5' — 'none'
+                           unplugs. The
                            source offsets the static pan as the clip plays,
                            identically live and rendered
   set clip.N.N.gain_control <src>
@@ -1814,7 +1815,7 @@ fn set_clip_command(
             }
             "pan_control" => {
                 // Plug one control source into the clip's pan input — a
-                // curve (its keyframes) or an LFO (shape:rate:depth:phase) —
+                // curve, an LFO or a sidechain, as `type,field=value,...` —
                 // or `none` to unplug. Repeated sets replace the source.
                 let curve = match value.trim() {
                     "none" => None,
@@ -4066,16 +4067,16 @@ mod tests {
         let mut a = Arrangement::default();
         run_ok(&mut a, &["put", "bed.wav,00:00:00-00:00:10"]);
         assert_eq!(
-            run_ok(&mut a, &["set", "clip.0.0.pan_control", "0:1,2:-1"]),
-            "ok: `clip.0.0.pan_control` set to `0:1,2:-1`\n"
+            run_ok(&mut a, &["set", "clip.0.0.pan_control", "curve,0=1,2=-1"]),
+            "ok: `clip.0.0.pan_control` set to `curve,0=1,2=-1`\n"
         );
         let ls = run_ok(&mut a, &["ls"]);
-        assert!(ls.contains("pan_control=0:1,2:-1"), "{ls}");
+        assert!(ls.contains("pan_control=curve,0=1,2=-1"), "{ls}");
         assert!(ls.contains("pan=0.00"), "{ls}");
 
         // The curve survives save/load as a set line.
         let script = serialize(&a);
-        assert!(script.contains("set clip.0.0.pan_control 0:1,2:-1"), "{script}");
+        assert!(script.contains("set clip.0.0.pan_control curve,0=1,2=-1"), "{script}");
         run_ok(&mut a, &["save", &path]);
         let mut b = Arrangement::default();
         run_ok(&mut b, &["load", &path]);
@@ -4090,7 +4091,7 @@ mod tests {
         assert!(!serialize(&a).contains("curve"), "an unplugged curve is not saved");
         let (code, msg) = run_err(&mut a, &["set", "clip.0.0.pan_control", "nope"]);
         assert_eq!(code, 2, "{msg}");
-        assert!(msg.contains("keyframe"), "{msg}");
+        assert!(msg.contains("expected curve, lfo or sidechain"), "{msg}");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -4100,8 +4101,8 @@ mod tests {
         a.player.add_track(seed_track("a.wav", 10));
         run_ok(&mut a, &["play"]);
         // A curve is a store into the running chain — no note, no apply.
-        let reply = run_ok(&mut a, &["set", "clip.0.0.pan_control", "0:1"]);
-        assert_eq!(reply, "ok: `clip.0.0.pan_control` set to `0:1`\n");
+        let reply = run_ok(&mut a, &["set", "clip.0.0.pan_control", "curve,0=1"]);
+        assert_eq!(reply, "ok: `clip.0.0.pan_control` set to `curve,0=1`\n");
         assert!(a.player.pending().is_empty());
         assert_eq!(
             run_ok(&mut a, &["apply"]),
@@ -4117,14 +4118,14 @@ mod tests {
         let mut a = Arrangement::default();
         run_ok(&mut a, &["put", "bed.wav,00:00:00-00:00:10"]);
         assert_eq!(
-            run_ok(&mut a, &["set", "clip.0.0.gain_control", "0:-0.5,10:0"]),
-            "ok: `clip.0.0.gain_control` set to `0:-0.5,10:0`\n"
+            run_ok(&mut a, &["set", "clip.0.0.gain_control", "curve,0=-0.5,10=0"]),
+            "ok: `clip.0.0.gain_control` set to `curve,0=-0.5,10=0`\n"
         );
         let ls = run_ok(&mut a, &["ls"]);
-        assert!(ls.contains("gain_control=0:-0.5,10:0"), "{ls}");
+        assert!(ls.contains("gain_control=curve,0=-0.5,10=0"), "{ls}");
 
         let script = serialize(&a);
-        assert!(script.contains("set clip.0.0.gain_control 0:-0.5,10:0"), "{script}");
+        assert!(script.contains("set clip.0.0.gain_control curve,0=-0.5,10=0"), "{script}");
         run_ok(&mut a, &["save", &path]);
         let mut b = Arrangement::default();
         run_ok(&mut b, &["load", &path]);
@@ -4148,16 +4149,19 @@ mod tests {
         let mut a = Arrangement::default();
         run_ok(&mut a, &["put", "bed.wav,00:00:00-00:00:10"]);
         assert_eq!(
-            run_ok(&mut a, &["set", "clip.0.0.pan_control", "sine:1:0.5:0"]),
-            "ok: `clip.0.0.pan_control` set to `sine:1:0.5:0`\n"
+            run_ok(&mut a, &["set", "clip.0.0.pan_control", "lfo,shape=sine,rate=1,depth=0.5,phase=0"]),
+            "ok: `clip.0.0.pan_control` set to `lfo,shape=sine,rate=1,depth=0.5,phase=0`\n"
         );
         assert_eq!(
-            run_ok(&mut a, &["set", "clip.0.0.gain_control", "triangle:0.5:0.3:0.25"]),
-            "ok: `clip.0.0.gain_control` set to `triangle:0.5:0.3:0.25`\n"
+            run_ok(&mut a, &["set", "clip.0.0.gain_control", "lfo,shape=triangle,rate=0.5,depth=0.3,phase=0.25"]),
+            "ok: `clip.0.0.gain_control` set to `lfo,shape=triangle,rate=0.5,depth=0.3,phase=0.25`\n"
         );
         let ls = run_ok(&mut a, &["ls"]);
-        assert!(ls.contains("pan_control=sine:1:0.5:0"), "{ls}");
-        assert!(ls.contains("gain_control=triangle:0.5:0.3:0.25"), "{ls}");
+        assert!(ls.contains("pan_control=lfo,shape=sine,rate=1,depth=0.5,phase=0"), "{ls}");
+        assert!(
+            ls.contains("gain_control=lfo,shape=triangle,rate=0.5,depth=0.3,phase=0.25"),
+            "{ls}"
+        );
 
         // The LFOs ride save/load as the same set lines.
         run_ok(&mut a, &["save", &path]);
@@ -4169,9 +4173,9 @@ mod tests {
         assert_eq!(clip.gain_controls.len(), 1);
 
         // A bad shape or a bad number is refused.
-        let (code, msg) = run_err(&mut a, &["set", "clip.0.0.pan_control", "wibble:1:0.5:0"]);
+        let (code, msg) = run_err(&mut a, &["set", "clip.0.0.pan_control", "wibble,rate=1"]);
         assert_eq!(code, 2, "{msg}");
-        let (_, msg) = run_err(&mut a, &["set", "clip.0.0.pan_control", "sine:x:0.5:0"]);
+        let (_, msg) = run_err(&mut a, &["set", "clip.0.0.pan_control", "lfo,rate=x"]);
         assert!(msg.contains("rate"), "{msg}");
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -4184,11 +4188,11 @@ mod tests {
         let mut a = Arrangement::default();
         run_ok(&mut a, &["put", "bed.wav,00:00:00-00:00:10"]);
         assert_eq!(
-            run_ok(&mut a, &["set", "clip.0.0.gain_control", "sidechain:group.0:-1.5:0.005:0.12"]),
-            "ok: `clip.0.0.gain_control` set to `sidechain:group.0:-1.5:0.005:0.12`\n"
+            run_ok(&mut a, &["set", "clip.0.0.gain_control", "sidechain,bus=group.0,amount=-1.5,attack=0.005,release=0.12"]),
+            "ok: `clip.0.0.gain_control` set to `sidechain,bus=group.0,amount=-1.5,attack=0.005,release=0.12`\n"
         );
         let ls = run_ok(&mut a, &["ls"]);
-        assert!(ls.contains("gain_control=sidechain:group.0:-1.5:0.005:0.12"), "{ls}");
+        assert!(ls.contains("gain_control=sidechain,bus=group.0,amount=-1.5,attack=0.005,release=0.12"), "{ls}");
 
         run_ok(&mut a, &["save", &path]);
         let mut b = Arrangement::default();

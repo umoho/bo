@@ -21,7 +21,7 @@ What it is **not** — yet — is a DAW: no effects, no LFOs or sidechains, and 
 - **Play it live, or render it offline** — audition from the playhead mid-edit, play a finished arrangement out end to end (rodio), or mix the whole arrangement — or just a range — to a wav file.
 - **Edit while it plays** — a gain, a fade, a pan or a mute lands on the running mix as it is set, and a clip placed past the end of a track's queue joins that queue, so a show can be remixed and extended on air. `apply` is left for what a running mix cannot take itself — a clip taken or moved — and rebuilds it from where the audio really is, not from a wall clock.
 - **Group buses** — `route` several tracks into one bus and a single strip (volume, mute) controls the whole group, a radio music bus or voice bus; `ls` shows the buses and which track feeds which. Routing and a bus-strip change are structure: they land on the next `apply`, like a clip move.
-- **A source is a gesture** — `set clip.N.N.pan_control 0:1,3.2:-1` plugs a curve into a clip's pan, `set clip.N.N.gain_control sine:2:0.3:0` an LFO into its gain, and `set clip.N.N.gain_control sidechain:group.0:-1.5:0.005:0.12` a duck under a bus: the parameter rides the static base plus the source as the clip plays, identically live and rendered (both build the same chain), and an edit lands on the running mix like a fade. No script polling the playhead. Three *control sources* today — curve, LFO, sidechain — ride the pan and the gain of a clip.
+- **A source is a gesture** — `set clip.N.N.pan_control curve,0=1,3.2=-1` plugs a curve into a clip's pan, `set clip.N.N.gain_control lfo,shape=sine,rate=2,depth=0.3` an LFO into its gain, and `set clip.N.N.gain_control sidechain,bus=group.0,amount=-1.5` a duck under a bus: the parameter rides the static base plus the source as the clip plays, identically live and rendered (both build the same chain), and an edit lands on the running mix like a fade. No script polling the playhead. Three *control sources* today — curve, LFO, sidechain — ride the pan and the gain of a clip.
 - **Silent fallback** — with no audio device the daemon still runs; set `BO_BACKEND=silent` for deterministic, headless tests and CI.
 - **Self-cleaning** — the daemon exits and removes its socket when playback finishes, on `stop`, or after `BO_IDLE_TIMEOUT` seconds of silence (default 600, `0` disables).
 - **Slicing, not files** — `uri,from-to` places any slice of a source anywhere on the timeline; in-points are sample-accurate in live play and offline render alike; no trimming, no copies.
@@ -112,26 +112,29 @@ and rendered alike:
 ```console
 $ bo put slide.wav,00:00:00-00:00:03.200
 ok: 1 clip on track 0
-$ bo set clip.0.0.pan_control 0:1,3.2:-1   # pan rides +1 → -1 over the clip
-ok: `clip.0.0.pan_control` set to `0:1,3.2:-1`
+$ bo set clip.0.0.pan_control curve,0=1,3.2=-1   # pan rides +1 → -1 over the clip
+ok: `clip.0.0.pan_control` set to `curve,0=1,3.2=-1`
 $ bo render mix.wav                        # the file sweeps the same way it plays
 ```
 
 A source is one cable plugged into a clip's pan (`set clip.N.N.pan_control`)
 or its gain (`set clip.N.N.gain_control`) input. Two kinds today:
 
-- a *curve* — `time:value` keyframes, seconds from the clip's start, linear
-  between them and held flat at the edges: `0:1,3.2:-1`;
-- an *LFO* — a periodic wiggle as `shape:rate:depth:phase`, shapes
-  `sine`/`triangle`/`square`: `sine:1:0.5:0` swings once a second at half
-  depth;
+- a *curve* — a map of `time=value` points, seconds from the clip's start,
+  linear between them and held flat at the edges: `curve,0=1,3.2=-1`;
+- an *LFO* — a periodic wiggle as fields `shape`, `rate`, `depth`, `phase`
+  (each optional, defaults `sine`, `1`, `0.5`, `0`):
+  `lfo,shape=sine,rate=1,depth=0.5` swings once a second at half depth;
 - a *sidechain* — listens to a bus (the master, or a group you routed) and
-  follows its level, as `sidechain:BUS:AMOUNT[:ATTACK:RELEASE]`: amount is
-  the offset per unit level — negative ducks, positive swells — and the
-  times are seconds (defaults: 5 ms attack, 150 ms release). The radio
-  gesture is one line: route the voice into a group and put
-  `sidechain:group.0:-1.5` on the music's gain — the music rides down under
-  the voice and swells back when it ends.
+  follows its level: `sidechain,bus=group.0,amount=-1.5` — amount is the
+  offset per unit level (negative ducks, positive swells; defaults -0.5),
+  attack/release in seconds (defaults 5 ms / 150 ms). The radio gesture is
+  one line: route the voice into a group and put `sidechain,bus=group.0`
+  on the music's gain — the music rides down under the voice and swells
+  back when it ends.
+
+Every source is `type,field=value,...` — one value per line, `:` reserved
+for timecodes alone.
 
 `none` unplugs. A parameter is the static base plus the sum of its sources;
 each input takes one source today.
