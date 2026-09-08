@@ -169,9 +169,6 @@ struct Voice {
     /// so the track's strip can move without a rebuild; the master is not
     /// here, it sits on the bus's output.
     gain: f32,
-    /// The placement every queued clip of this voice reads, shared so a pan
-    /// set while playing lands on the whole queue as one store.
-    pan: GainCell,
     /// The track timecode this voice's queue runs to: a clip placed at or
     /// past it can be appended, one placed before it cannot.
     queued_until: Duration,
@@ -192,27 +189,34 @@ struct ClipVoice {
 struct ClipParams {
     gain: GainCell,
     fade: Arc<Mutex<Fade>>,
-    /// The track's placement, shared by every clip of one voice: panning the
-    /// track writes one cell, and every queued clip's panner hears it.
+    /// This clip's own pan cell — the modulation point its panner reads
+    /// every frame. Every live pan edit is a store into this one cell, so a
+    /// clip never needs rewiring to be panned; `follow_track` decides
+    /// whether track-pan edits reach it.
     pan: GainCell,
+    /// Whether the clip inherits its track's pan (its placement is `None`):
+    /// a track pan lands on this clip's cell too, until the clip is given a
+    /// placement of its own.
+    follow_track: bool,
     /// How far into the clip the graph entered it, so a fade-in edited later
     /// is still measured from the clip's own start.
     into: Duration,
 }
 
 impl ClipParams {
-    /// Parameters holding a plan's values, placed by the track's shared cell
-    /// — unless the clip carries its own placement, which gets a fixed cell
-    /// of its own (then panning the track never touches it).
-    fn new(plan: &ClipPlan, track_pan: &GainCell) -> Self {
+    /// Parameters holding a plan's values: the pan cell starts at the
+    /// effective position — the clip's own placement, or the track's pan —
+    /// and follows the track only while the clip has none of its own.
+    fn new(plan: &ClipPlan, track_pan: f32) -> Self {
         let pan = match plan.placement {
-            Some(pos) => GainCell::new(pos),
-            None => track_pan.clone(),
+            Some(pos) => pos,
+            None => track_pan,
         };
         Self {
             gain: GainCell::new(plan.gain),
             fade: Arc::new(Mutex::new(plan.fade)),
-            pan,
+            pan: GainCell::new(pan),
+            follow_track: plan.placement.is_none(),
             into: plan.into,
         }
     }
@@ -340,22 +344,22 @@ impl Graph {
         let mut staged = Vec::new();
         for track in timeline.tracks() {
             let gain = if track.muted() { 0.0 } else { track.gain() };
-            let pan = GainCell::new(track.pan());
+            let pan = track.pan();
             let mut clips = Vec::new();
             let mut queued_until = at;
             for clip in track.clips() {
-                let params = ClipParams::new(clip, &pan);
+                let params = ClipParams::new(clip, pan);
                 let source = make_source(clip, &params)?;
                 queued_until += clip.delay + clip.length;
                 clips.push((clip.id, params, source));
             }
-            staged.push((track.index(), gain, pan, queued_until, clips));
+            staged.push((track.index(), gain, queued_until, clips));
         }
         // The last graph's buses are ending with its voices; this build gets
         // its own, so a strip set since the last build is the one that lands.
         self.buses.clear();
         let mut voices = Vec::new();
-        for (track, gain, pan, queued_until, clips) in staged {
+        for (track, gain, queued_until, clips) in staged {
             // Queue the clips *before* the voice joins the mixer: rodio
             // bootstraps a new input by pulling it, and an empty queue
             // answers that pull with a few hundred samples of anti-spinlock
@@ -376,7 +380,6 @@ impl Graph {
                 track,
                 player,
                 gain,
-                pan,
                 group,
                 queued_until,
                 clips: queued,
@@ -513,6 +516,9 @@ impl Graph {
 
     /// A track's placement: one store to the pan cell every queued clip of
     /// its voice reads.
+    /// A track's placement: one store to every queued clip of its voice that
+    /// follows the track — each has a pan cell of its own, so a pan set while
+    /// playing lands on the whole queue as one fan-out.
     fn land_track_pan(&mut self, tracks: &[Track], track: usize) -> bool {
         let Some(voice) = self.voices.iter_mut().find(|v| v.track == track) else {
             // No voice: the track is empty or its clips have all finished, so
@@ -523,7 +529,11 @@ impl Graph {
             Some(t) => t.pan(),
             None => 0.0,
         };
-        voice.pan.set(pan);
+        for clip in &mut voice.clips {
+            if clip.params.follow_track {
+                clip.params.pan.set(pan);
+            }
+        }
         true
     }
 
@@ -554,6 +564,11 @@ impl Graph {
 
     /// A clip's own placement: a fixed cell of its own, or — when the clip
     /// has none and follows its track again — the voice's shared cell.
+    /// A clip's own placement: one store to the clip's own pan cell — the
+    /// modulation point its panner already reads — so a pan set while the
+    /// clip sounds is heard, with no rewiring. Giving the placement back
+    /// (`auto`) makes the clip follow its track again, from the track's pan
+    /// as it is right now.
     fn land_clip_pan(&mut self, tracks: &[Track], track: usize, id: u64) -> bool {
         let Some(clip) = tracks
             .get(track)
@@ -564,12 +579,21 @@ impl Graph {
         let Some(voice) = self.voices.iter_mut().find(|v| v.track == track) else {
             return true;
         };
-        let cell = match clip.placement {
-            Some(p) => GainCell::new(p.position()),
-            None => voice.pan.clone(),
+        let Some(queued) = voice.clips.iter_mut().find(|c| c.id == id) else {
+            // Not queued: the clip already sounded, or is gone from the
+            // arrangement. Either way nothing is waiting to be panned.
+            return true;
         };
-        if let Some(queued) = voice.clips.iter_mut().find(|c| c.id == id) {
-            queued.params.pan = cell;
+        match clip.placement {
+            Some(p) => {
+                queued.params.pan.set(p.position());
+                queued.params.follow_track = false;
+            }
+            None => {
+                let pan = tracks.get(track).map_or(0.0, Track::pan);
+                queued.params.pan.set(pan);
+                queued.params.follow_track = true;
+            }
         }
         true
     }
@@ -626,17 +650,13 @@ impl Graph {
             return true; // nothing out there to queue
         };
         let gain = if planned.muted() { 0.0 } else { planned.gain() };
-        // Pan new clips with the voice's own cell when there is one, so a pan
-        // set later still lands on what is appended now; a fresh voice takes
-        // the planned value.
-        let pan = match existing {
-            Some(i) => self.voices[i].pan.clone(),
-            None => GainCell::new(planned.pan()),
-        };
+        // New clips follow the track's pan as it is right now — each has a
+        // pan cell of its own, and the model's current value is the truth.
+        let track_pan = planned.pan();
         let mut staged = Vec::new();
         let mut queued_until = from;
         for clip in planned.clips() {
-            let params = ClipParams::new(clip, &pan);
+            let params = ClipParams::new(clip, track_pan);
             // A source that cannot be built is not this command's problem to
             // report: refuse the live landing, and the rebuild it forces will
             // say why.
@@ -671,7 +691,6 @@ impl Graph {
                     track,
                     player,
                     gain,
-                    pan,
                     group,
                     queued_until,
                     clips: queued,
@@ -1172,12 +1191,12 @@ fn mix(
     let mut buses: Vec<(u64, Mixer, MixerSource)> = Vec::new();
     for track in timeline.tracks() {
         let gain = if track.muted() { 0.0 } else { track.gain() };
-        let pan = GainCell::new(track.pan());
+        let pan = track.pan();
         let mut pending: Vec<Box<dyn Source + Send>> = Vec::new();
         for clip in track.clips() {
             // A render never retunes a clip as it goes, but it builds the same
             // parameters a live graph would, so both sides share one chain.
-            pending.push(make_source(clip, &ClipParams::new(clip, &pan))?);
+            pending.push(make_source(clip, &ClipParams::new(clip, pan))?);
         }
         let mut pending = pending.into_iter();
         let track_source = from_factory(move || pending.next());
@@ -2857,6 +2876,93 @@ mod tests {
             (left_peak - 0.5).abs() < 5e-3,
             "the appended clip sounds through the group at its strip: {left_peak}"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_clip_pan_lands_live_on_the_sounding_clip() {
+        // The reported fault: a clip's pan set while it sounded was written
+        // to the queued parameters, but the panner had already captured its
+        // own cell, so the change was never heard. Each clip now owns the pan
+        // cell its panner reads, and a live pan is a store into it.
+        let dir = std::env::temp_dir().join(format!("bo-clip-pan-live-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tone = dir.join("tone.wav");
+        write_wav(&tone, 2.0, 440.0, 0.5);
+        let mut track = Track::named("slide");
+        let id = track.insert(clip_at(tone.to_str().unwrap(), 0, 2)).unwrap();
+        // Pinned hard left, so the mono source sits on the left channel.
+        track.clip_mut(id).unwrap().placement =
+            Some(crate::bus::Placement::Stereo { position: -1.0 });
+        let mut tracks = [track];
+        let (mut graph, mut output) = graph_on_a_mixer();
+        graph.play(&tracks, &[], Duration::ZERO).unwrap();
+
+        let channel_peak = |samples: &[Sample], ch: usize| {
+            samples[200..]
+                .iter()
+                .skip(ch)
+                .step_by(2)
+                .fold(0.0f32, |m, s| m.max(s.abs()))
+        };
+        let before = pull(&mut output, 2_205);
+        assert!((channel_peak(&before, 0) - 0.5).abs() < 5e-3, "hard left sounds left");
+        assert!(channel_peak(&before, 1) < 1e-4, "nothing on the right yet");
+
+        // Swing the clip to hard right while it is sounding: no rebuild, the
+        // running panner must hear the store on its own cell.
+        tracks[0].clip_mut(id).unwrap().placement =
+            Some(crate::bus::Placement::Stereo { position: 1.0 });
+        assert!(graph.land(&tracks, graph.position(), &Change::ClipPan(0, id)));
+        let after = pull(&mut output, 2_205);
+        assert!(channel_peak(&after, 0) < 1e-4, "the left has gone quiet");
+        assert!(
+            (channel_peak(&after, 1) - 0.5).abs() < 5e-3,
+            "the clip is heard at its new pan, live"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_track_pan_moves_only_the_clips_that_follow_it() {
+        // Auto clips (no placement of their own) follow their track's pan, as
+        // one fan-out over their own cells; a clip pinned to its own
+        // placement does not move with the track until it is given back.
+        let dir = std::env::temp_dir().join(format!("bo-track-pan-live-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tone = dir.join("tone.wav");
+        write_wav(&tone, 2.0, 440.0, 0.5);
+        let mut track = Track::named("two");
+        track.insert(clip_at(tone.to_str().unwrap(), 0, 1)).unwrap();
+        let pinned = track
+            .insert(clip_at(tone.to_str().unwrap(), 1, 1))
+            .unwrap();
+        track.clip_mut(pinned).unwrap().placement =
+            Some(crate::bus::Placement::Stereo { position: 1.0 });
+        let mut tracks = [track];
+        let (mut graph, mut output) = graph_on_a_mixer();
+        graph.play(&tracks, &[], Duration::ZERO).unwrap();
+
+        let channel_peak = |samples: &[Sample], ch: usize| {
+            samples[200..]
+                .iter()
+                .skip(ch)
+                .step_by(2)
+                .fold(0.0f32, |m, s| m.max(s.abs()))
+        };
+        // Duck the whole track left while it plays.
+        tracks[0].set_pan(-1.0);
+        assert!(graph.land(&tracks, graph.position(), &Change::TrackPan(0)));
+
+        // The first second is the auto clip: it follows left.
+        let first = pull(&mut output, 2_205);
+        assert!((channel_peak(&first, 0) - 0.5).abs() < 5e-3, "the auto clip followed left");
+        assert!(channel_peak(&first, 1) < 1e-4);
+        // Advance to the pinned clip's own second, then measure it.
+        let _tail_of_first = pull(&mut output, 44_100 - 2_205);
+        let second = pull(&mut output, 2_205);
+        assert!(channel_peak(&second, 0) < 1e-4, "the pinned clip did not follow");
+        assert!((channel_peak(&second, 1) - 0.5).abs() < 5e-3, "it is still hard right");
         std::fs::remove_dir_all(&dir).ok();
     }
 }
