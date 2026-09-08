@@ -21,8 +21,11 @@
 //!   answers *where the sound goes*; it holds no content.
 //! * [`engine`] — [`engine::Player`]: transport state over stacked tracks,
 //!   with an [`engine::Backend`] seam for whatever actually makes sound.
+//! * [`time`] — the timecode text both layers speak: a lenient
+//!   `SS`/`MM:SS`/`HH:MM:SS` parse and the canonical `HH:MM:SS.fff` form.
 
 pub mod bus;
+pub mod time;
 pub mod control;
 pub mod engine;
 pub mod track;

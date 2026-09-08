@@ -29,13 +29,7 @@ pub(crate) struct Tc(pub(crate) Duration);
 
 impl fmt::Display for Tc {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let d = self.0;
-        let total_ms = d.as_secs().saturating_mul(1000) + u64::from(d.subsec_millis());
-        let ms = total_ms % 1000;
-        let s = (total_ms / 1000) % 60;
-        let m = (total_ms / 60_000) % 60;
-        let h = total_ms / 3_600_000;
-        write!(f, "{h:02}:{m:02}:{s:02}.{ms:03}")
+        f.write_str(&bo::time::format(self.0))
     }
 }
 

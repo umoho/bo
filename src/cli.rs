@@ -624,32 +624,14 @@ fn quote_arg(arg: &str) -> String {
 }
 
 /// Parse `SS`, `MM:SS` or `HH:MM:SS` (optional `.fff` fraction) into a
-/// duration.
+/// duration (delegates to [`bo::time::parse`]).
 fn parse_timecode(s: &str) -> Result<Duration, String> {
-    let s = s.trim();
-    if s.is_empty() {
-        return Err("empty timecode".to_string());
-    }
-    let parts: Vec<&str> = s.split(':').collect();
-    if parts.len() > 3 {
-        return Err(format!("timecode has too many fields: {s:?}"));
-    }
-    let mut total = 0.0_f64;
-    let mut scale = 1.0_f64;
-    for part in parts.iter().rev() {
-        let value: f64 = part.parse().map_err(|_| format!("bad timecode {s:?}"))?;
-        total += value * scale;
-        scale *= 60.0;
-    }
-    if !total.is_finite() || total < 0.0 {
-        return Err(format!("bad timecode {s:?}"));
-    }
-    Ok(Duration::from_secs_f64(total))
+    bo::time::parse(s)
 }
 
-/// Format a duration as `HH:MM:SS.fff` (delegates to [`reply::Tc`]).
+/// Format a duration as `HH:MM:SS.fff` (delegates to [`bo::time::format`]).
 fn format_time(d: Duration) -> String {
-    Tc(d).to_string()
+    bo::time::format(d)
 }
 
 /// The client's working directory, as a string; empty when it cannot be read.
