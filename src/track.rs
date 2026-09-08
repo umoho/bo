@@ -255,20 +255,171 @@ impl std::str::FromStr for Curve {
     }
 }
 
+/// The shape of an [`Lfo`]'s cycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LfoShape {
+    /// A smooth sine swing.
+    #[default]
+    Sine,
+    /// A linear triangle.
+    Triangle,
+    /// A hard square.
+    Square,
+}
+
+impl LfoShape {
+    /// The shape sampled at cycle phase `p` in `0.0 .. 1.0`, in `-1 ..= 1`.
+    #[must_use]
+    pub fn sample(self, p: f32) -> f32 {
+        let p = p - p.floor(); // keep it in the unit cycle
+        match self {
+            Self::Sine => (p * std::f32::consts::TAU).sin(),
+            Self::Triangle => {
+                if p < 0.25 {
+                    4.0 * p
+                } else if p < 0.75 {
+                    2.0 - 4.0 * p
+                } else {
+                    4.0 * p - 4.0
+                }
+            }
+            Self::Square => {
+                if p < 0.5 {
+                    1.0
+                } else {
+                    -1.0
+                }
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for LfoShape {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Sine => "sine",
+            Self::Triangle => "triangle",
+            Self::Square => "square",
+        })
+    }
+}
+
+impl std::str::FromStr for LfoShape {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s.trim() {
+            "sine" => Ok(Self::Sine),
+            "triangle" => Ok(Self::Triangle),
+            "square" => Ok(Self::Square),
+            other => Err(format!(
+                "bad shape {other:?}: sine, triangle, square"
+            )),
+        }
+    }
+}
+
+/// A low-frequency oscillator — a periodic control source (a GStreamer-style
+/// src like the curve, producing where the samples flow). Its offset at any
+/// clip-local moment is `depth` times its shape at the cycle reached by
+/// `rate` since the clip started, nudged by `phase`: a bipolar wiggle the
+/// parameter's static base rides, clamped at the parameter's own field.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Lfo {
+    /// Cycles per second, `> 0`.
+    pub rate: f32,
+    /// Peak offset, `0.0 ..= 1.0`; half by default.
+    pub depth: f32,
+    /// The shape of each cycle.
+    pub shape: LfoShape,
+    /// Where in the cycle the clip starts, in cycles, `0.0 .. 1.0`.
+    pub phase: f32,
+}
+
+impl Default for Lfo {
+    fn default() -> Self {
+        Self {
+            rate: 1.0,
+            depth: 0.5,
+            shape: LfoShape::Sine,
+            phase: 0.0,
+        }
+    }
+}
+
+impl Lfo {
+    /// An LFO over the given rate, depth, shape and start phase, normalized
+    /// on the way in (rate kept positive, depth clamped to `0..=1`, phase
+    /// wrapped to one cycle).
+    #[must_use]
+    pub fn new(rate: f32, depth: f32, shape: LfoShape, phase: f32) -> Self {
+        Self {
+            rate: rate.abs().max(f32::EPSILON),
+            depth: depth.clamp(0.0, 1.0),
+            shape,
+            phase: phase - phase.floor(),
+        }
+    }
+
+    /// The LFO's signal at clip-local time `t` — an offset on top of the
+    /// parameter's static base, in `-depth ..= depth`.
+    #[must_use]
+    pub fn value_at(&self, t: Duration) -> f32 {
+        let cycles = t.as_secs_f64() as f32 * self.rate;
+        self.depth * self.shape.sample(self.phase + cycles)
+    }
+}
+
+impl std::fmt::Display for Lfo {
+    /// `shape:rate:depth:phase` — e.g. `sine:1:0.5:0` swings once a second
+    /// at half depth from cycle zero.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}:{}:{}:{}",
+            self.shape, self.rate, self.depth, self.phase
+        )
+    }
+}
+
+impl std::str::FromStr for Lfo {
+    type Err = String;
+
+    /// `shape:rate:depth[:phase]` — phase defaults to the start of the cycle.
+    fn from_str(s: &str) -> Result<Self, String> {
+        let parts: Vec<&str> = s.split(':').map(str::trim).collect();
+        if !(3..=4).contains(&parts.len()) {
+            return Err(format!(
+                "bad lfo {s:?}: expected SHAPE:RATE:DEPTH[:PHASE]"
+            ));
+        }
+        let shape = parts[0].parse::<LfoShape>()?;
+        let rate: f32 = parts[1].parse().map_err(|_| "bad lfo rate: cycles per second")?;
+        let depth: f32 = parts[2].parse().map_err(|_| "bad lfo depth: 0..1")?;
+        let phase: f32 = match parts.get(3) {
+            Some(p) => p.parse().map_err(|_| "bad lfo phase: a cycle fraction")?,
+            None => 0.0,
+        };
+        Ok(Self::new(rate, depth, shape, phase))
+    }
+}
+
 /// A control source — the "cable" plugged into a parameter's input. Every
 /// source is a scalar over the clip's own time, produced where the samples
 /// flow; the parameter it drives is the static base plus the sum of its
 /// active sources (a parameter with no cable is just its base).
 ///
-/// v1 ships exactly one kind of source, the hand-drawn curve; further srcs
-/// (an LFO) and filters (an envelope follower — the detector side of a
-/// future sidechain) slot in as further variants. Automation is the notion
-/// of using such a source to drive a parameter; this enum is the registry of
-/// concrete sources automation can draw on.
+/// v1 ships two kinds of source, the hand-drawn curve and the low-frequency
+/// oscillator; a filter (an envelope follower — the detector side of a
+/// future sidechain) slots in later. Automation is the notion of using a
+/// source to drive a parameter; this enum is the registry of the concrete
+/// sources automation can draw on.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ControlSource {
     /// A hand-drawn keyframe curve ([`Curve`]).
     Curve(Curve),
+    /// A periodic oscillator ([`Lfo`]).
+    Lfo(Lfo),
 }
 
 impl ControlSource {
@@ -278,6 +429,7 @@ impl ControlSource {
     pub fn value_at(&self, t: Duration) -> f32 {
         match self {
             Self::Curve(curve) => curve.value_at(t),
+            Self::Lfo(lfo) => lfo.value_at(t),
         }
     }
 }
@@ -286,6 +438,7 @@ impl std::fmt::Display for ControlSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Curve(curve) => curve.fmt(f),
+            Self::Lfo(lfo) => lfo.fmt(f),
         }
     }
 }
@@ -293,7 +446,14 @@ impl std::fmt::Display for ControlSource {
 impl std::str::FromStr for ControlSource {
     type Err = String;
 
+    /// A curve is its keyframes (`0:1,3.2:-1`); an LFO opens with its shape
+    /// (`sine:1:0.5:0`). A text that starts with a shape name is an LFO —
+    /// keyframe text never starts with a letter.
     fn from_str(s: &str) -> Result<Self, String> {
+        let first = s.trim().split(':').next().unwrap_or("");
+        if first.parse::<LfoShape>().is_ok() {
+            return Ok(Self::Lfo(s.parse()?));
+        }
         Ok(Self::Curve(s.parse()?))
     }
 }
@@ -937,5 +1097,79 @@ mod tests {
         let s = Clip::sliced(src("b"), Duration::ZERO, secs(5));
         assert!(s.pan_controls.is_empty());
         assert!(s.gain_controls.is_empty());
+    }
+
+    #[test]
+    fn an_lfo_shape_samples_its_cycle() {
+        use LfoShape::*;
+        let close = |a: f32, b: f32| (a - b).abs() < 1e-6;
+        assert!(close(Sine.sample(0.0), 0.0));
+        assert!(close(Sine.sample(0.25), 1.0));
+        assert!(close(Sine.sample(0.5), 0.0));
+        assert!(close(Sine.sample(0.75), -1.0));
+        // Triangle: linear up 0->1, down to -1, back to 0.
+        assert!(close(Triangle.sample(0.0), 0.0));
+        assert!(close(Triangle.sample(0.125), 0.5));
+        assert!(close(Triangle.sample(0.25), 1.0));
+        assert!(close(Triangle.sample(0.5), 0.0));
+        assert!(close(Triangle.sample(0.75), -1.0));
+        assert!(close(Triangle.sample(0.9), -0.4));
+        // Square: the sign of the half-cycle.
+        assert_eq!(Square.sample(0.0), 1.0);
+        assert_eq!(Square.sample(0.49), 1.0);
+        assert_eq!(Square.sample(0.5), -1.0);
+        // Phase wraps inside the unit cycle.
+        assert!(close(Sine.sample(1.25), 1.0));
+    }
+
+    #[test]
+    fn an_lfo_oscillates_over_time_and_is_normalized_on_the_way_in() {
+        let s = Lfo::new(1.0, 0.5, LfoShape::Sine, 0.0);
+        let t = |secs: f64| Duration::from_secs_f64(secs);
+        assert!((s.value_at(t(0.0)) - 0.0).abs() < 1e-6);
+        assert!((s.value_at(t(0.25)) - 0.5).abs() < 1e-6, "peak at a quarter cycle");
+        assert!((s.value_at(t(0.75)) + 0.5).abs() < 1e-6);
+        // Phase shifts where in the cycle the clip starts.
+        let peaked = Lfo::new(1.0, 0.5, LfoShape::Sine, 0.25);
+        assert!((peaked.value_at(t(0.0)) - 0.5).abs() < 1e-6, "starts at its peak");
+        // Normalization: rate stays positive, depth clamps, phase wraps.
+        let rough = Lfo::new(-1.0, 2.0, LfoShape::Sine, 1.25);
+        assert_eq!(rough.rate, 1.0);
+        assert_eq!(rough.depth, 1.0);
+        assert!((rough.phase - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn an_lfo_round_trips_through_its_text() {
+        let lfo = Lfo::new(0.5, 0.8, LfoShape::Triangle, 0.25);
+        assert_eq!(lfo.to_string(), "triangle:0.5:0.8:0.25");
+        assert_eq!("triangle:0.5:0.8:0.25".parse::<Lfo>().unwrap(), lfo);
+        assert_eq!(
+            "sine:2:0.4".parse::<Lfo>().unwrap(),
+            Lfo::new(2.0, 0.4, LfoShape::Sine, 0.0),
+            "phase defaults to the cycle start"
+        );
+        assert!("sine:0:0.5:0".parse::<Lfo>().unwrap().rate > 0.0, "a zero rate is tamed");
+        assert!("sine:-2:0.5:0".parse::<Lfo>().unwrap().rate > 0.0);
+        assert!("wibble:1:0.5:0".parse::<Lfo>().is_err());
+        assert!("sine:1:x".parse::<Lfo>().is_err());
+    }
+
+    #[test]
+    fn a_control_source_tells_a_curve_from_an_lfo() {
+        let lfo = ControlSource::Lfo(Lfo::new(1.0, 0.5, LfoShape::Sine, 0.0));
+        assert_eq!(lfo.to_string(), "sine:1:0.5:0");
+        assert_eq!("sine:1:0.5:0".parse::<ControlSource>().unwrap(), lfo);
+        // A curve still parses from bare keyframes: never a leading letter.
+        let curve = ControlSource::Curve(Curve::new(vec![
+            Keyframe { at: Duration::ZERO, value: 1.0 },
+            Keyframe { at: secs(2), value: -1.0 },
+        ]));
+        assert_eq!("0:1,2:-1".parse::<ControlSource>().unwrap(), curve);
+        assert_eq!(curve.to_string(), "0:1,2:-1");
+        // The offset at the peak of the first cycle.
+        assert!(
+            (lfo.value_at(Duration::from_secs_f64(0.25)) - 0.5).abs() < 1e-6
+        );
     }
 }

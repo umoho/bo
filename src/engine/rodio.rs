@@ -1681,7 +1681,7 @@ pub fn probe_sources(tracks: &[Track]) -> Vec<(String, Result<Probing, String>)>
 mod tests {
     use super::*;
     use crate::engine::Player;
-    use crate::track::{Clip, Curve, Keyframe, Source, Track};
+    use crate::track::{Clip, Curve, Keyframe, Lfo, LfoShape, Source, Track};
     use rodio::Source as _;
     use std::sync::Arc;
 
@@ -3340,6 +3340,35 @@ mod tests {
             ch_peak(&after, 0, 2_000, 1_000) < 1e-3,
             "ducked to silence by the redraw"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_lfo_swings_a_clips_pan_as_it_plays() {
+        // One sine cycle a second at full depth on a centered clip: the tone
+        // is hard right at a quarter cycle, hard left three quarters in.
+        let dir = std::env::temp_dir().join(format!("bo-lfo-live-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tone = dir.join("tone.wav");
+        write_wav(&tone, 2.0, 440.0, 0.5);
+        let lfo = Lfo::new(1.0, 1.0, LfoShape::Sine, 0.0);
+        let mut track = Track::named("wobble");
+        let id = track.insert(clip_at(tone.to_str().unwrap(), 0, 2)).unwrap();
+        track.clip_mut(id).unwrap().pan_controls = vec![ControlSource::Lfo(lfo)];
+        let tracks = [track];
+        let (mut graph, mut output) = graph_on_a_mixer();
+        graph.play(&tracks, &[], Duration::ZERO).unwrap();
+
+        // Advance to ~0.25 s (quarter cycle: pan +1, right) and measure.
+        let _lead = pull(&mut output, 44_100 / 4 - 2_205);
+        let peak = pull(&mut output, 2_205);
+        assert!(ch_peak(&peak, 1, 200, 1_000) > 0.4, "right at the quarter cycle");
+        assert!(ch_peak(&peak, 0, 200, 1_000) < 0.1);
+        // Advance to ~0.75 s (three quarters: pan -1, left).
+        let _ = pull(&mut output, 44_100 / 2);
+        let trough = pull(&mut output, 2_205);
+        assert!(ch_peak(&trough, 0, 200, 1_000) > 0.4, "left three quarters in");
+        assert!(ch_peak(&trough, 1, 200, 1_000) < 0.1);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

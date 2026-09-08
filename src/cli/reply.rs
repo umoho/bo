@@ -168,8 +168,8 @@ pub(crate) enum SetResult {
     ClipFadeOut { track: usize, id: u64, d: Duration },
     ClipFadeOutTo { track: usize, id: u64, level: f32 },
     ClipFadeShape { track: usize, id: u64, shape: FadeShape },
-    ClipCurve { track: usize, id: u64, curve: String },
-    ClipGainCurve { track: usize, id: u64, curve: String },
+    ClipPanControl { track: usize, id: u64, control: String },
+    ClipGainControl { track: usize, id: u64, control: String },
 }
 
 /// One source measured by `probe` without a uri.
@@ -251,11 +251,10 @@ pub(crate) struct LsClip {
     pub(crate) gain: f32,
     /// The clip's own placement, when it does not follow its track.
     pub(crate) pan: Option<f32>,
-    /// Its pan control sources as one text (v1: a single curve), when any
-    /// are plugged in.
-    pub(crate) curve: Option<String>,
+    /// Its pan control sources as one text, when any are plugged in.
+    pub(crate) pan_control: Option<String>,
     /// Its gain control sources as one text, when any are plugged in.
-    pub(crate) gain_curve: Option<String>,
+    pub(crate) gain_control: Option<String>,
     pub(crate) fade_in: Duration,
     pub(crate) fade_in_from: f32,
     pub(crate) fade_out: Duration,
@@ -499,11 +498,11 @@ impl fmt::Display for Output {
                     SetResult::ClipFadeShape { track, id, shape } => {
                         (format!("clip.{track}.{id}.fade_shape"), shape.to_string())
                     }
-                    SetResult::ClipCurve { track, id, curve } => {
-                        (format!("clip.{track}.{id}.curve"), curve.clone())
+                    SetResult::ClipPanControl { track, id, control } => {
+                        (format!("clip.{track}.{id}.pan_control"), control.clone())
                     }
-                    SetResult::ClipGainCurve { track, id, curve } => {
-                        (format!("clip.{track}.{id}.gain_curve"), curve.clone())
+                    SetResult::ClipGainControl { track, id, control } => {
+                        (format!("clip.{track}.{id}.gain_control"), control.clone())
                     }
                 };
                 writeln!(f, "ok: `{var}` set to `{value}`")?;
@@ -798,11 +797,11 @@ impl fmt::Display for Output {
                             c.fade_out_to,
                             c.fade_shape,
                         );
-                        if let Some(curve) = &c.curve {
-                            let _ = write!(suffix, " curve={curve}");
+                        if let Some(control) = &c.pan_control {
+                            let _ = write!(suffix, " pan_control={control}");
                         }
-                        if let Some(curve) = &c.gain_curve {
-                            let _ = write!(suffix, " gain_curve={curve}");
+                        if let Some(control) = &c.gain_control {
+                            let _ = write!(suffix, " gain_control={control}");
                         }
                         writeln!(
                             f,
@@ -938,8 +937,8 @@ pub(crate) fn example_reply(command: &str) -> Option<String> {
                         fade_out: D::ZERO,
                         fade_out_to: 0.0,
                         fade_shape: Linear,
-                        curve: None,
-                        gain_curve: None,
+                        pan_control: None,
+                        gain_control: None,
                     }],
                 },
                 LsTrack {
@@ -962,8 +961,8 @@ pub(crate) fn example_reply(command: &str) -> Option<String> {
                         fade_out: D::ZERO,
                         fade_out_to: 0.0,
                         fade_shape: Linear,
-                        curve: None,
-                        gain_curve: None,
+                        pan_control: None,
+                        gain_control: None,
                     }],
                 },
             ],
