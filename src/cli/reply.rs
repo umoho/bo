@@ -15,6 +15,7 @@
 //! `bo <command> --help` documents each command's reply shape; both render
 //! from this module so they cannot drift apart.
 
+use std::fmt::Write as _;
 use std::fmt;
 use std::time::Duration;
 
@@ -167,6 +168,7 @@ pub(crate) enum SetResult {
     ClipFadeOut { track: usize, id: u64, d: Duration },
     ClipFadeOutTo { track: usize, id: u64, level: f32 },
     ClipFadeShape { track: usize, id: u64, shape: FadeShape },
+    ClipCurve { track: usize, id: u64, curve: String },
 }
 
 /// One source measured by `probe` without a uri.
@@ -248,6 +250,9 @@ pub(crate) struct LsClip {
     pub(crate) gain: f32,
     /// The clip's own placement, when it does not follow its track.
     pub(crate) pan: Option<f32>,
+    /// Its control sources as one text (v1: a single pan curve), when any
+    /// are plugged in.
+    pub(crate) curve: Option<String>,
     pub(crate) fade_in: Duration,
     pub(crate) fade_in_from: f32,
     pub(crate) fade_out: Duration,
@@ -490,6 +495,9 @@ impl fmt::Display for Output {
                     ),
                     SetResult::ClipFadeShape { track, id, shape } => {
                         (format!("clip.{track}.{id}.fade_shape"), shape.to_string())
+                    }
+                    SetResult::ClipCurve { track, id, curve } => {
+                        (format!("clip.{track}.{id}.curve"), curve.clone())
                     }
                 };
                 writeln!(f, "ok: `{var}` set to `{value}`")?;
@@ -775,19 +783,23 @@ impl fmt::Display for Output {
                     }
                     writeln!(f)?;
                     for c in &t.clips {
+                        let mut suffix = clip_suffix(
+                            c.gain,
+                            c.pan,
+                            c.fade_in,
+                            c.fade_in_from,
+                            c.fade_out,
+                            c.fade_out_to,
+                            c.fade_shape,
+                        );
+                        if let Some(curve) = &c.curve {
+                            let _ = write!(suffix, " curve={curve}");
+                        }
                         writeln!(
                             f,
                             "  {}{}",
                             clip_head(c.id, &c.uri, c.from, c.to, c.at),
-                            clip_suffix(
-                                c.gain,
-                                c.pan,
-                                c.fade_in,
-                                c.fade_in_from,
-                                c.fade_out,
-                                c.fade_out_to,
-                                c.fade_shape,
-                            )
+                            suffix
                         )?;
                     }
                 }
@@ -917,6 +929,7 @@ pub(crate) fn example_reply(command: &str) -> Option<String> {
                         fade_out: D::ZERO,
                         fade_out_to: 0.0,
                         fade_shape: Linear,
+                        curve: None,
                     }],
                 },
                 LsTrack {
@@ -939,6 +952,7 @@ pub(crate) fn example_reply(command: &str) -> Option<String> {
                         fade_out: D::ZERO,
                         fade_out_to: 0.0,
                         fade_shape: Linear,
+                        curve: None,
                     }],
                 },
             ],

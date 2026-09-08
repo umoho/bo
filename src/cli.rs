@@ -130,7 +130,7 @@ use bo::engine::rodio::{
     render_to_file_mono, Probing, Rodio, SourceLength,
 };
 use bo::engine::{Applied, Backend, BackendError, Change, Landed, Player, Silent, State};
-use bo::track::{Clip, Fade, FadeShape, Source, Track};
+use bo::track::{Clip, ControlSource, Fade, FadeShape, Source, Track};
 use clap::error::ErrorKind;
 use clap::{Parser, Subcommand};
 
@@ -522,6 +522,12 @@ Mix:
   set clip.N.N.fade_shape <s>  set a clip's fade curve (linear)
   set clip.N.N.pan <v|auto> set a clip's own placement, -1..1 — overrides
                            the track for that clip; auto follows the track
+  set clip.N.N.curve <kfs> plug a curve into the clip's pan input — a
+                           gesture like a right-to-left sweep becomes one
+                           curve line: '0:1,3.2:-1' (time:value keyframes,
+                           linear, held flat at the edges) — or 'none' to
+                           unplug. The curve offsets the static pan as the
+                           clip plays, identically live and rendered
                            gains and fades land on the mix as they are set,
                            playing or paused; a name is only a label
 
@@ -550,7 +556,7 @@ OUTPUT
   note: line, and `ls` counts what is waiting as pending=N. A clip is one
   signature line, a track a header over its clips:
 
-    clip #<id> '<uri>' <from>-<to> @ <at> [gain=..] [fade_in=..] ...
+    clip #<id> '<uri>' <from>-<to> @ <at> [gain=..] [fade_in=..] ... [curve=..]
     track <n> '<name>'|untitled vol=.. pan=.. end=.. [muted] [bus=#<id> '<name>']
     bus #<id> '<name>'|untitled vol=.. tracks=.. [muted]   # group buses
 
@@ -1046,6 +1052,16 @@ fn arrangement_view(a: &Arrangement) -> Ls {
                         fade_out: c.fade.fade_out,
                         fade_out_to: c.fade.fade_out_to,
                         fade_shape: c.fade.shape,
+                        curve: {
+                            let controls = &c.controls;
+                            (!controls.is_empty()).then(|| {
+                                controls
+                                    .iter()
+                                    .map(ToString::to_string)
+                                    .collect::<Vec<_>>()
+                                    .join("; ")
+                            })
+                        },
                     })
                     .collect(),
             })
@@ -1780,11 +1796,34 @@ fn set_clip_command(
                     shape,
                 })
             }
+            "curve" => {
+                // Plug a curve into the clip's pan input — the only input
+                // v1 exposes — or `none` to unplug it. A curve is the text
+                // of its keyframes; repeated sets replace the curve.
+                let curve = match value.trim() {
+                    "none" => None,
+                    text => Some(text.parse::<ControlSource>().map_err(usage)?),
+                };
+                c.controls = match &curve {
+                    Some(source) => vec![source.clone()],
+                    None => Vec::new(),
+                };
+                let shown = match &curve {
+                    Some(source) => source.to_string(),
+                    None => "none".to_string(),
+                };
+                Ok(SetResult::ClipCurve {
+                    track: track_i,
+                    id,
+                    curve: shown,
+                })
+            }
             _ => Err(usage(format!("unknown property {prop:?} on a clip"))),
         }
     }?;
     let change = match &result {
         SetResult::ClipPan { track, id, .. } => Change::ClipPan(*track, *id),
+        SetResult::ClipCurve { track, id, .. } => Change::ClipControls(*track, *id),
         _ => Change::ClipParams(track_i, id),
     };
     let landed = a.player.changed(change);
@@ -1991,6 +2030,11 @@ fn serialize(a: &Arrangement) -> String {
             // A clip that carries its own placement serializes the same way.
             if let Some(p) = c.placement {
                 let _ = writeln!(out, "set clip.{ti}.{}.pan {}", c.id, p.position());
+            }
+            // So does a plug in its pan input. One source has a set form
+            // today; more than one is a future surface.
+            if c.controls.len() == 1 {
+                let _ = writeln!(out, "set clip.{ti}.{}.curve {}", c.id, c.controls[0]);
             }
         }
         if let Some(name) = t.name() {
@@ -3972,5 +4016,56 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_clip_curve_sets_shows_round_trips_and_clears() {
+        let dir = temp_dir();
+        let file = dir.join("prog.bo");
+        let path = file.to_string_lossy().into_owned();
+        let mut a = Arrangement::default();
+        run_ok(&mut a, &["put", "bed.wav,00:00:00-00:00:10"]);
+        assert_eq!(
+            run_ok(&mut a, &["set", "clip.0.0.curve", "0:1,2:-1"]),
+            "ok: `clip.0.0.curve` set to `0:1,2:-1`\n"
+        );
+        let ls = run_ok(&mut a, &["ls"]);
+        assert!(ls.contains("curve=0:1,2:-1"), "{ls}");
+        assert!(ls.contains("pan=0.00"), "{ls}");
+
+        // The curve survives save/load as a set line.
+        let script = serialize(&a);
+        assert!(script.contains("set clip.0.0.curve 0:1,2:-1"), "{script}");
+        run_ok(&mut a, &["save", &path]);
+        let mut b = Arrangement::default();
+        run_ok(&mut b, &["load", &path]);
+        assert_eq!(serialize(&b), script);
+        assert_eq!(b.player.tracks()[0].clips()[0].controls.len(), 1);
+
+        // 'none' unplugs; the text round-trip forgets it again.
+        assert_eq!(
+            run_ok(&mut a, &["set", "clip.0.0.curve", "none"]),
+            "ok: `clip.0.0.curve` set to `none`\n"
+        );
+        assert!(!serialize(&a).contains("curve"), "an unplugged curve is not saved");
+        let (code, msg) = run_err(&mut a, &["set", "clip.0.0.curve", "nope"]);
+        assert_eq!(code, 2, "{msg}");
+        assert!(msg.contains("keyframe"), "{msg}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_curve_set_while_playing_lands_live() {
+        let mut a = Arrangement::default();
+        a.player.add_track(seed_track("a.wav", 10));
+        run_ok(&mut a, &["play"]);
+        // A curve is a store into the running chain — no note, no apply.
+        let reply = run_ok(&mut a, &["set", "clip.0.0.curve", "0:1"]);
+        assert_eq!(reply, "ok: `clip.0.0.curve` set to `0:1`\n");
+        assert!(a.player.pending().is_empty());
+        assert_eq!(
+            run_ok(&mut a, &["apply"]),
+            "ok: nothing pending\n"
+        );
     }
 }
