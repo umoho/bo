@@ -4175,4 +4175,36 @@ mod tests {
         assert!(msg.contains("rate"), "{msg}");
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    #[test]
+    fn a_sidechain_plugs_in_and_round_trips() {
+        let dir = temp_dir();
+        let file = dir.join("prog.bo");
+        let path = file.to_string_lossy().into_owned();
+        let mut a = Arrangement::default();
+        run_ok(&mut a, &["put", "bed.wav,00:00:00-00:00:10"]);
+        assert_eq!(
+            run_ok(&mut a, &["set", "clip.0.0.gain_control", "sidechain:group.0:-1.5:0.005:0.12"]),
+            "ok: `clip.0.0.gain_control` set to `sidechain:group.0:-1.5:0.005:0.12`\n"
+        );
+        let ls = run_ok(&mut a, &["ls"]);
+        assert!(ls.contains("gain_control=sidechain:group.0:-1.5:0.005:0.12"), "{ls}");
+
+        run_ok(&mut a, &["save", &path]);
+        let mut b = Arrangement::default();
+        run_ok(&mut b, &["load", &path]);
+        assert_eq!(serialize(&b), serialize(&a));
+        let clip = &b.player.tracks()[0].clips()[0];
+        assert!(matches!(
+            clip.gain_controls.first(),
+            Some(ControlSource::Sidechain(..))
+        ));
+
+        // Playing, plugging a sidechain is a store, not a rebuild.
+        run_ok(&mut a, &["play"]);
+        let reply = run_ok(&mut a, &["set", "clip.0.0.gain_control", "none"]);
+        assert_eq!(reply, "ok: `clip.0.0.gain_control` set to `none`\n");
+        assert!(a.player.pending().is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
