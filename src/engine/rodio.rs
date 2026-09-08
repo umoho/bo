@@ -137,6 +137,9 @@ struct Graph {
     /// a rebuild can change a group strip, so this snapshot cannot drift
     /// from what the graph sounds.
     groups: Vec<Group>,
+    /// The envelope cells of this graph's buses — the master, plus each
+    /// group that has materialized — where sidechain sources read levels.
+    envs: EnvTaps,
     clock: Arc<Clock>,
     /// The timecode the graph was built from, and the clock's reading at that
     /// moment: where the sound is, is `at` plus the frames pulled since.
@@ -195,6 +198,9 @@ struct ClipParams {
     gain_base: GainCell,
     /// The control sources on the clip's gain, shared with the graph.
     gain_controls: Arc<Mutex<Vec<ControlSource>>>,
+    /// The envelope cells of the buses this mix can be listened through —
+    /// where a sidechain source reads its signal.
+    envs: EnvTaps,
     fade: Arc<Mutex<Fade>>,
     /// The modulated pan the panner reads — the modulation point. Written
     /// by the clip drive every sample as base plus sources.
@@ -218,7 +224,7 @@ impl ClipParams {
     /// at the effective position — the clip's own placement, or the track's
     /// pan — and the base follows the track only while the clip has no
     /// placement of its own.
-    fn new(plan: &ClipPlan, track_pan: f32) -> Self {
+    fn new(plan: &ClipPlan, track_pan: f32, envs: &EnvTaps) -> Self {
         let base = match plan.placement {
             Some(pos) => pos,
             None => track_pan,
@@ -227,6 +233,7 @@ impl ClipParams {
             gain: GainCell::new(plan.gain),
             gain_base: GainCell::new(plan.gain),
             gain_controls: Arc::new(Mutex::new(plan.gain_controls.clone())),
+            envs: envs.clone(),
             fade: Arc::new(Mutex::new(plan.fade)),
             pan: GainCell::new(base),
             pan_base: GainCell::new(base),
@@ -291,13 +298,21 @@ impl Graph {
         // The master sits on the bus's output: whatever the device mixer
         // (or test) receives is the mixed stereo pair, scaled once. The
         // device mixer converts that one stream to its own channel count.
-        device.add(LiveGain::new(bus_out, master.clone()));
+        // A tee in front of it publishes the master's level for sidechains.
+        let master_env = GainCell::new(0.0);
+        let envs = EnvTaps::default();
+        envs.ensure(BusRef::Master, &master_env);
+        device.add(LiveGain::new(
+            EnvTap::new(bus_out, master_env.clone()),
+            master.clone(),
+        ));
         Self {
             bus,
             master,
             voices: Vec::new(),
             buses: Vec::new(),
             groups: Vec::new(),
+            envs,
             clock,
             base_at: Duration::ZERO,
             base_frames: 0,
@@ -356,6 +371,17 @@ impl Graph {
     /// graph sounds always match the arrangement it was built from.
     fn build(&mut self, tracks: &[Track], at: Duration) -> Result<Vec<Voice>, String> {
         let timeline = Timeline::plan(tracks, at);
+        // The last graph's buses are ending with its voices; this build gets
+        // its own, so a strip set since the last build is the one that lands.
+        self.buses.clear();
+        // Materialize the group buses first, so a sidechain source staged
+        // below can resolve the bus it listens to — and so the envelope tee
+        // each bus publishes is the one the sources will read.
+        for track in timeline.tracks() {
+            if let BusRef::Group(id) = tracks[track.index()].bus() {
+                self.group_bus(id)?;
+            }
+        }
         let mut staged = Vec::new();
         for track in timeline.tracks() {
             let gain = if track.muted() { 0.0 } else { track.gain() };
@@ -363,16 +389,13 @@ impl Graph {
             let mut clips = Vec::new();
             let mut queued_until = at;
             for clip in track.clips() {
-                let params = ClipParams::new(clip, pan);
+                let params = ClipParams::new(clip, pan, &self.envs);
                 let source = make_source(clip, &params)?;
                 queued_until += clip.delay + clip.length;
                 clips.push((clip.id, params, source));
             }
             staged.push((track.index(), gain, queued_until, clips));
         }
-        // The last graph's buses are ending with its voices; this build gets
-        // its own, so a strip set since the last build is the one that lands.
-        self.buses.clear();
         let mut voices = Vec::new();
         for (track, gain, queued_until, clips) in staged {
             // Queue the clips *before* the voice joins the mixer: rodio
@@ -436,7 +459,10 @@ impl Graph {
             std::num::NonZeroU32::new(self.rate).expect("a device rate is nonzero"),
         );
         let strip = group_strip(&self.groups, id)?;
-        self.bus.add(Gain::new(out, strip));
+        // A tee in front of the strip publishes the group's own level.
+        let env = GainCell::new(0.0);
+        self.envs.ensure(BusRef::Group(id), &env);
+        self.bus.add(Gain::new(EnvTap::new(out, env), strip));
         self.buses.push(BusNode {
             id,
             mixer: mixer.clone(),
@@ -723,7 +749,7 @@ impl Graph {
         let mut staged = Vec::new();
         let mut queued_until = from;
         for clip in planned.clips() {
-            let params = ClipParams::new(clip, track_pan);
+            let params = ClipParams::new(clip, track_pan, &self.envs);
             // A source that cannot be built is not this command's problem to
             // report: refuse the live landing, and the rebuild it forces will
             // say why.
@@ -946,29 +972,147 @@ impl<I: Source> Source for Panner<I> {
 /// the silence leading to it is not swept. Both live and render build this
 /// chain through the same `make_source`, so curves sound offline exactly as
 /// they do on air.
+/// The envelope cells of the buses of one mix: a sidechain source reads
+/// the level of the bus it listens to from here. Cells are pushed as buses
+/// materialize (the master at construction, a group when it gets a voice),
+/// and looked up only every refresh window, so the registry can be shared
+/// cheaply while the mix is built around it.
+#[derive(Debug, Clone, Default)]
+struct EnvTaps {
+    cells: Arc<Mutex<Vec<(BusRef, GainCell)>>>,
+}
+
+impl EnvTaps {
+    /// The level cell of `bus`, if this mix has one. A bus with no cell
+    /// (nothing in the mix feeds it) reads as silence — level zero.
+    fn cell(&self, bus: BusRef) -> Option<GainCell> {
+        let cells = self.cells.lock().ok()?;
+        cells.iter().find(|(b, _)| *b == bus).map(|(_, c)| c.clone())
+    }
+
+    /// Make sure `bus` has a level cell, adding one when it does not.
+    fn ensure(&self, bus: BusRef, cell: &GainCell) {
+        if let Ok(mut cells) = self.cells.lock()
+            && !cells.iter().any(|(b, _)| *b == bus)
+        {
+            cells.push((bus, cell.clone()));
+        }
+    }
+}
+
+/// A tee on a bus's output: every sample flows through untouched, while the
+/// loudest channel of each frame is published into an envelope cell — the
+/// raw level other sources smooth with their own attack and release.
+///
+/// Publishing per frame (not per sample) matters: a bus's channels are
+/// interleaved, and a hard-panned sound leaves one channel silent. A source
+/// reading per sample at the wrong phase would lock onto the silent channel
+/// forever; a per-frame peak reads the same whichever phase the reader
+/// samples.
+struct EnvTap<I> {
+    input: I,
+    env: GainCell,
+    channels: usize,
+    /// The loudest absolute sample of the frame being assembled.
+    frame: f32,
+    /// Samples of that frame seen so far.
+    seen: usize,
+}
+
+impl<I: Source> EnvTap<I> {
+    fn new(input: I, env: GainCell) -> Self {
+        let channels = input.channels().get() as usize;
+        Self {
+            input,
+            env,
+            channels,
+            frame: 0.0,
+            seen: 0,
+        }
+    }
+}
+
+impl<I: Source> Iterator for EnvTap<I> {
+    type Item = Sample;
+
+    fn next(&mut self) -> Option<Sample> {
+        let sample = self.input.next()?;
+        self.frame = self.frame.max(sample.abs().min(1.0));
+        self.seen += 1;
+        if self.seen == self.channels {
+            self.env.set(self.frame);
+            self.frame = 0.0;
+            self.seen = 0;
+        }
+        Some(sample)
+    }
+}
+
+impl<I: Source> Source for EnvTap<I> {
+    fn current_span_len(&self) -> Option<usize> {
+        self.input.current_span_len()
+    }
+
+    fn channels(&self) -> rodio::ChannelCount {
+        self.input.channels()
+    }
+
+    fn sample_rate(&self) -> rodio::SampleRate {
+        self.input.sample_rate()
+    }
+
+    fn total_duration(&self) -> Option<Duration> {
+        self.input.total_duration()
+    }
+}
+
+/// One listening side of a sidechain source, resolved when the source list
+/// changes: the bus's level cell, the offset per unit level, and the two
+/// one-pole coefficients (attack for a rising level, release for a falling
+/// one) smoothing the read into the envelope that actually drives.
+struct SideState {
+    cell: GainCell,
+    amount: f32,
+    up: f32,
+    down: f32,
+    level: f32,
+}
+
 struct ClipDrive<I> {
     input: I,
     /// The modulated pan the panner reads.
     pan: GainCell,
     /// The static pan base — what pan edits write.
     pan_base: GainCell,
-    /// The control sources on the pan.
+    /// The control sources on the pan, shared with the graph.
     pan_controls: Arc<Mutex<Vec<ControlSource>>>,
-    /// The pan sources as last read, so the mutex is not touched per sample.
+    /// The pan sources as last built, for detecting a change.
+    pan_built: Vec<ControlSource>,
+    /// The pan sources that contribute from their own time (curve, LFO).
     pan_sources: Vec<ControlSource>,
+    /// The pan's listening sidechains, with their smoothing state.
+    pan_side: Vec<SideState>,
     /// The modulated gain the live gain reads.
     gain: GainCell,
     /// The static gain base — what a clip-gain edit writes.
     gain_base: GainCell,
-    /// The control sources on the gain.
+    /// The control sources on the gain, shared with the graph.
     gain_controls: Arc<Mutex<Vec<ControlSource>>>,
-    /// The gain sources as last read.
+    /// The gain sources as last built, for detecting a change.
+    gain_built: Vec<ControlSource>,
+    /// The gain sources that contribute from their own time.
     gain_sources: Vec<ControlSource>,
+    /// The gain's listening sidechains, with their smoothing state.
+    gain_side: Vec<SideState>,
+    /// The envelope cells of this mix's buses.
+    envs: EnvTaps,
     /// Clip-local time of the next sample: where the clip was entered, plus
     /// what has flowed since.
     at: Duration,
     /// Duration of one interleaved sample of `input`.
     per_sample: Duration,
+    /// Samples per second, for the smoothing coefficients.
+    rate: f32,
     /// Samples until the source lists are read again.
     until_refresh: u32,
     /// Samples between reads: five milliseconds of this source's audio.
@@ -980,31 +1124,98 @@ impl<I: Source> ClipDrive<I> {
         let per_frame = input.sample_rate().get() as u64 * input.channels().get() as u64;
         let per_sample = Duration::from_secs_f64(1.0 / per_frame as f64);
         let refresh_every = u32::try_from(per_frame / 200).unwrap_or(u32::MAX).max(1);
-        let pan_sources = params
-            .pan_controls
-            .lock()
-            .map(|c| c.clone())
-            .unwrap_or_default();
-        let gain_sources = params
-            .gain_controls
-            .lock()
-            .map(|c| c.clone())
-            .unwrap_or_default();
-        Self {
+        let rate = input.sample_rate().get() as f32;
+        let mut drive = Self {
             input,
             pan: params.pan.clone(),
             pan_base: params.pan_base.clone(),
             pan_controls: params.pan_controls.clone(),
-            pan_sources,
+            pan_built: Vec::new(),
+            pan_sources: Vec::new(),
+            pan_side: Vec::new(),
             gain: params.gain.clone(),
             gain_base: params.gain_base.clone(),
             gain_controls: params.gain_controls.clone(),
-            gain_sources,
+            gain_built: Vec::new(),
+            gain_sources: Vec::new(),
+            gain_side: Vec::new(),
+            envs: params.envs.clone(),
             at: params.into,
             per_sample,
+            rate,
             until_refresh: refresh_every,
             refresh_every,
+        };
+        drive.refresh();
+        drive
+    }
+
+    /// One-pole coefficient for a time constant `t` at this chain's rate.
+    fn pole(rate: f32, t: Duration) -> f32 {
+        if t.is_zero() {
+            1.0
+        } else {
+            1.0 - (-1.0 / (t.as_secs_f32() * rate)).exp()
         }
+    }
+
+    /// Resolve the sidechains of `list` against the mix's envelope cells;
+    /// a bus with no cell contributes nothing.
+    fn sides(envs: &EnvTaps, rate: f32, list: &[ControlSource]) -> Vec<SideState> {
+        list.iter()
+            .filter_map(|source| match source {
+                ControlSource::Sidechain(side) => {
+                    let cell = envs.cell(side.listen)?;
+                    Some(SideState {
+                        cell,
+                        amount: side.amount,
+                        up: Self::pole(rate, side.attack),
+                        down: Self::pole(rate, side.release),
+                        level: 0.0,
+                    })
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Re-read the shared source lists: when a list changed (a curve
+    /// redrawn, a source plugged or unplugged), rebuild what the drive
+    /// evaluates; when it did not, the smoothing levels carry on.
+    fn refresh(&mut self) {
+        if let Ok(guard) = self.pan_controls.lock() {
+            let now = guard.clone();
+            if now != self.pan_built {
+                self.pan_built = now.clone();
+                self.pan_sources = now.clone();
+                self.pan_side = Self::sides(&self.envs, self.rate, &now);
+            }
+        }
+        if let Ok(guard) = self.gain_controls.lock() {
+            let now = guard.clone();
+            if now != self.gain_built {
+                self.gain_built = now.clone();
+                self.gain_sources = now.clone();
+                self.gain_side = Self::sides(&self.envs, self.rate, &now);
+            }
+        }
+    }
+
+    /// base + the pure sources at clip-local time + the smoothed sidechains.
+    fn offset(sources: &[ControlSource], sides: &mut [SideState], at: Duration) -> f32 {
+        let mut offset = sources
+            .iter()
+            .fold(0.0f32, |sum, source| sum + source.value_at(at));
+        for side in sides {
+            let x = side.cell.get();
+            side.level = if x > side.level {
+                side.level + (x - side.level) * side.up
+            } else {
+                side.level + (x - side.level) * side.down
+            };
+            offset += side.amount * side.level;
+        }
+        offset
     }
 }
 
@@ -1014,29 +1225,18 @@ impl<I: Source> Iterator for ClipDrive<I> {
     fn next(&mut self) -> Option<Sample> {
         let sample = self.input.next()?;
         if self.until_refresh == 0 {
-            // A curve edited while this clip plays lands here, within one
+            // A source edited while this clip plays lands here, within one
             // refresh window of being set.
-            if let Ok(controls) = self.pan_controls.lock() {
-                self.pan_sources = controls.clone();
-            }
-            if let Ok(controls) = self.gain_controls.lock() {
-                self.gain_sources = controls.clone();
-            }
+            self.refresh();
             self.until_refresh = self.refresh_every;
         }
         self.until_refresh -= 1;
         // parameter = static base + the sum of the active sources, clamped
         // to the parameter's field.
-        let pan_offset = self
-            .pan_sources
-            .iter()
-            .fold(0.0f32, |sum, source| sum + source.value_at(self.at));
+        let pan_offset = Self::offset(&self.pan_sources, &mut self.pan_side, self.at);
         self.pan
             .set((self.pan_base.get() + pan_offset).clamp(-1.0, 1.0));
-        let gain_offset = self
-            .gain_sources
-            .iter()
-            .fold(0.0f32, |sum, source| sum + source.value_at(self.at));
+        let gain_offset = Self::offset(&self.gain_sources, &mut self.gain_side, self.at);
         self.gain
             .set((self.gain_base.get() + gain_offset).clamp(0.0, 1.0));
         self.at += self.per_sample;
@@ -1382,11 +1582,23 @@ fn mix(
         timeline.truncate(to.saturating_sub(from));
     }
     let (input, source) = mixer::mixer(nz!(2), nz!(44100));
-    // Group buses, materialized per group id as its tracks appear: each gets
-    // its own mixer, and after the track loop its output joins the master
-    // mixer scaled by the group's strip — the same routing the live graph
-    // builds, so a rendered file sounds like the session.
-    let mut buses: Vec<(u64, Mixer, MixerSource)> = Vec::new();
+    // The envelope cells this render's buses publish: the master plus each
+    // group that has a member — built up front, so a sidechain staged while
+    // laying the tracks can resolve the bus it listens to.
+    let envs = EnvTaps::default();
+    let master_env = GainCell::new(0.0);
+    envs.ensure(BusRef::Master, &master_env);
+    let mut buses: Vec<(u64, Mixer, MixerSource, GainCell)> = Vec::new();
+    for track in timeline.tracks() {
+        if let BusRef::Group(id) = tracks[track.index()].bus()
+            && !buses.iter().any(|(gid, _, _, _)| *gid == id)
+        {
+            let (mixer, out) = mixer::mixer(nz!(2), nz!(44100));
+            let env = GainCell::new(0.0);
+            envs.ensure(BusRef::Group(id), &env);
+            buses.push((id, mixer, out, env));
+        }
+    }
     for track in timeline.tracks() {
         let gain = if track.muted() { 0.0 } else { track.gain() };
         let pan = track.pan();
@@ -1394,28 +1606,25 @@ fn mix(
         for clip in track.clips() {
             // A render never retunes a clip as it goes, but it builds the same
             // parameters a live graph would, so both sides share one chain.
-            pending.push(make_source(clip, &ClipParams::new(clip, pan))?);
+            pending.push(make_source(clip, &ClipParams::new(clip, pan, &envs))?);
         }
         let mut pending = pending.into_iter();
         let track_source = from_factory(move || pending.next());
         match tracks[track.index()].bus() {
             BusRef::Master => input.add(Gain::new(track_source, gain)),
             BusRef::Group(id) => {
-                if !buses.iter().any(|(gid, _, _)| *gid == id) {
-                    let (mixer, out) = mixer::mixer(nz!(2), nz!(44100));
-                    buses.push((id, mixer, out));
-                }
-                let (_, mixer, _) = buses
+                let (_, mixer, _, _) = buses
                     .iter_mut()
-                    .find(|(gid, _, _)| *gid == id)
-                    .expect("a group bus was just pushed");
+                    .find(|(gid, _, _, _)| *gid == id)
+                    .expect("a group bus was staged");
                 mixer.add(Gain::new(track_source, gain));
             }
         }
     }
-    for (id, _, out) in buses {
+    for (id, _, out, env) in buses {
         let strip = group_strip(groups, id)?;
-        input.add(Gain::new(out, strip));
+        // A tee in front of the strip publishes the group's own level.
+        input.add(Gain::new(EnvTap::new(out, env), strip));
     }
     // Stage the file next to its target so the final rename stays on one
     // filesystem; `tempfile` also deletes the staging file on any early
@@ -1457,8 +1666,9 @@ fn mix(
     };
     let mut meter = measure.then(|| Meter::new(if mono { 1 } else { 2 }, 44100));
     // The master scales the whole mixed stream once, just before it is
-    // written and measured — the render's own bus output.
-    let source = Gain::new(source, master);
+    // written and measured — the render's own bus output. A tee in front
+    // of it publishes the master's level for sidechains.
+    let source = Gain::new(EnvTap::new(source, master_env), master);
     // Consume whole frames: a stereo pair each time (mono folds the pair to
     // `(L+R)/2`), feed the meter and the writer, and drop a trailing
     // half-frame so the stream the file receives is exactly the stream that
@@ -1681,7 +1891,7 @@ pub fn probe_sources(tracks: &[Track]) -> Vec<(String, Result<Probing, String>)>
 mod tests {
     use super::*;
     use crate::engine::Player;
-    use crate::track::{Clip, Curve, Keyframe, Lfo, LfoShape, Source, Track};
+    use crate::track::{Clip, Curve, Keyframe, Lfo, LfoShape, Sidechain, Source, Track};
     use rodio::Source as _;
     use std::sync::Arc;
 
@@ -3369,6 +3579,81 @@ mod tests {
         let trough = pull(&mut output, 2_205);
         assert!(ch_peak(&trough, 0, 200, 1_000) > 0.4, "left three quarters in");
         assert!(ch_peak(&trough, 1, 200, 1_000) < 0.1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A voice-over scene: a loud voice on group bus 0 for the first second,
+    /// a music bed playing the whole way, whose gain listens to that bus.
+    /// The voice sits on the right, the music on the left, so one channel
+    /// carries each.
+    fn duck_scene(dir: &std::path::Path) -> Vec<Track> {
+        let voice_file = dir.join("voice.wav");
+        write_wav(&voice_file, 1.0, 440.0, 0.9);
+        let bed_file = dir.join("bed.wav");
+        write_wav(&bed_file, 2.0, 440.0, 0.5);
+        let mut voice = Track::named("voice");
+        let v = voice.insert(clip_at(voice_file.to_str().unwrap(), 0, 1)).unwrap();
+        voice.clip_mut(v).unwrap().placement =
+            Some(crate::bus::Placement::Stereo { position: 1.0 });
+        voice.set_bus(BusRef::Group(0));
+        let mut music = Track::named("music");
+        let m = music.insert(clip_at(bed_file.to_str().unwrap(), 0, 2)).unwrap();
+        let clip = music.clip_mut(m).unwrap();
+        clip.placement = Some(crate::bus::Placement::Stereo { position: -1.0 });
+        // Deep duck: a full-level voice drives the music's gain to silence.
+        clip.gain_controls = vec![ControlSource::Sidechain(Sidechain::new(
+            BusRef::Group(0),
+            -1.5,
+            Duration::from_millis(5),
+            Duration::from_millis(120),
+        ))];
+        vec![voice, music]
+    }
+
+    #[test]
+    fn a_sidechain_ducks_the_music_under_the_voice() {
+        // The radio gesture: while the voice group is loud the music's gain
+        // rides its level down; when the voice ends the music swells back.
+        let dir = std::env::temp_dir().join(format!("bo-duck-live-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tracks = duck_scene(&dir);
+        let group = [Group::new(0)];
+        let (mut graph, mut output) = graph_on_a_mixer();
+        graph.play(&tracks, &group, Duration::ZERO).unwrap();
+
+        // Inside the voice (0.4..0.5 s): the music on the left is ducked.
+        let loud = pull(&mut output, 44_100 / 2);
+        let ducked = ch_peak(&loud, 0, 17_640, 4_000);
+        assert!(ducked < 0.2, "music ducked under the voice: {ducked}");
+        // Past the voice's end (1 s) plus its release, the bed swells back.
+        let _past = pull(&mut output, 44_100 - 44_100 / 2 + 44_100 / 4);
+        let bed = pull(&mut output, 2_205);
+        assert!(
+            ch_peak(&bed, 0, 200, 1_000) > 0.4,
+            "music back once the voice ends"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_sidechain_ducks_offline_renders_like_it_plays() {
+        let dir = std::env::temp_dir().join(format!("bo-duck-render-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tracks = duck_scene(&dir);
+        let group = [Group::new(0)];
+        let out = dir.join("out.wav");
+        render_to_file(&tracks, &group, &out, Duration::ZERO, None, 1.0).unwrap();
+        let decoder = Decoder::new(BufReader::new(File::open(&out).unwrap())).unwrap();
+        let samples: Vec<Sample> = decoder.collect();
+        assert!(
+            ch_peak(&samples, 0, 17_640, 4_000) < 0.2,
+            "rendered music ducked while the voice speaks"
+        );
+        // Well past the voice's end and its release, the bed is back.
+        assert!(
+            ch_peak(&samples, 0, 114_660, 1_000) > 0.4,
+            "rendered music back once the voice ends"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }
