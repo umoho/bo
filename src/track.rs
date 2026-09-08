@@ -404,32 +404,160 @@ impl std::str::FromStr for Lfo {
     }
 }
 
+/// A ducking (or swelling) source: it listens to another bus — the master
+/// or a group bus — follows its level with an envelope detector, and emits
+/// `amount` times that level as an offset. Negative amount ducks the
+/// parameter as the listened bus gets loud (music under a voice, the
+/// radio gesture); positive swells with it. The audio comes from the
+/// graph's wiring, not from the source's own time, so this source carries
+/// no signal until it is built into a mix that has the bus it listens to.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Sidechain {
+    /// The bus whose level is followed: the master, or a group bus by id.
+    pub listen: crate::bus::BusRef,
+    /// Offset per unit level, signed: negative ducks, positive swells.
+    pub amount: f32,
+    /// How fast the level rises when the listened signal jumps.
+    pub attack: Duration,
+    /// How fast it falls back when the signal goes quiet.
+    pub release: Duration,
+}
+
+impl Default for Sidechain {
+    fn default() -> Self {
+        Self {
+            listen: crate::bus::BusRef::Master,
+            amount: -0.5,
+            attack: Duration::from_millis(5),
+            release: Duration::from_millis(150),
+        }
+    }
+}
+
+impl Sidechain {
+    /// A sidechain over the given bus, offset per unit level, and detector
+    /// time constants (clamped to non-negative).
+    #[must_use]
+    pub fn new(
+        listen: crate::bus::BusRef,
+        amount: f32,
+        attack: Duration,
+        release: Duration,
+    ) -> Self {
+        Self {
+            listen,
+            amount,
+            attack,
+            release,
+        }
+    }
+}
+
+impl std::fmt::Display for Sidechain {
+    /// `sidechain:BUS:AMOUNT:ATTACK:RELEASE` — bus is `master` or
+    /// `group.N`, times in seconds.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let bus = match self.listen {
+            crate::bus::BusRef::Master => "master".to_string(),
+            crate::bus::BusRef::Group(id) => format!("group.{id}"),
+        };
+        write!(
+            f,
+            "sidechain:{bus}:{}:{}:{}",
+            self.amount,
+            self.attack.as_secs_f64(),
+            self.release.as_secs_f64()
+        )
+    }
+}
+
+impl std::str::FromStr for Sidechain {
+    type Err = String;
+
+    /// `sidechain:BUS:AMOUNT[:ATTACK:RELEASE]` — the time constants default
+    /// to a fast attack and a slow release.
+    fn from_str(s: &str) -> Result<Self, String> {
+        let rest = s
+            .strip_prefix("sidechain:")
+            .ok_or_else(|| format!("bad sidechain {s:?}: expected sidechain:BUS:AMOUNT[:ATTACK:RELEASE]"))?;
+        let parts: Vec<&str> = rest.split(':').map(str::trim).collect();
+        if !(2..=4).contains(&parts.len()) {
+            return Err(format!("bad sidechain {s:?}: expected sidechain:BUS:AMOUNT[:ATTACK:RELEASE]"));
+        }
+        let listen = match parts[0] {
+            "master" => crate::bus::BusRef::Master,
+            other => match other.strip_prefix("group.") {
+                Some(id) => {
+                    let id: u64 = id
+                        .parse()
+                        .map_err(|_| format!("bad sidechain bus {other:?}: master or group.N"))?;
+                    crate::bus::BusRef::Group(id)
+                }
+                None => {
+                    return Err(format!(
+                        "bad sidechain bus {other:?}: master or group.N"
+                    ))
+                }
+            },
+        };
+        let amount: f32 = parts[1]
+            .parse()
+            .map_err(|_| format!("bad sidechain amount {:?}: a signed number", parts[1]))?;
+        if !amount.is_finite() {
+            return Err(format!("bad sidechain amount {:?}: a finite number", parts[1]));
+        }
+        let secs = |name: &str, v: &str| -> Result<Duration, String> {
+            let s: f64 = v
+                .parse()
+                .map_err(|_| format!("bad sidechain {name} {v:?}: seconds"))?;
+            if !s.is_finite() || s < 0.0 {
+                return Err(format!("bad sidechain {name} {v:?}: not negative"));
+            }
+            Duration::try_from_secs_f64(s)
+                .map_err(|_| format!("bad sidechain {name} {v:?}: seconds"))
+        };
+        let attack = match parts.get(2) {
+            Some(v) => secs("attack", v)?,
+            None => Duration::from_millis(5),
+        };
+        let release = match parts.get(3) {
+            Some(v) => secs("release", v)?,
+            None => Duration::from_millis(150),
+        };
+        Ok(Self::new(listen, amount, attack, release))
+    }
+}
+
 /// A control source — the "cable" plugged into a parameter's input. Every
 /// source is a scalar over the clip's own time, produced where the samples
 /// flow; the parameter it drives is the static base plus the sum of its
 /// active sources (a parameter with no cable is just its base).
 ///
-/// v1 ships two kinds of source, the hand-drawn curve and the low-frequency
-/// oscillator; a filter (an envelope follower — the detector side of a
-/// future sidechain) slots in later. Automation is the notion of using a
-/// source to drive a parameter; this enum is the registry of the concrete
-/// sources automation can draw on.
+/// v1 ships three kinds of source: the hand-drawn curve, the low-frequency
+/// oscillator, and the sidechain (an envelope follower listening to another
+/// bus). Automation is the notion of using a source to drive a parameter;
+/// this enum is the registry of the concrete sources automation can draw on.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ControlSource {
     /// A hand-drawn keyframe curve ([`Curve`]).
     Curve(Curve),
     /// A periodic oscillator ([`Lfo`]).
     Lfo(Lfo),
+    /// An envelope follower on another bus ([`Sidechain`]).
+    Sidechain(Sidechain),
 }
 
 impl ControlSource {
-    /// This source's signal at clip-local time `t` — an offset on top of
-    /// the parameter's static base.
+    /// This source's own signal at clip-local time `t` — an offset on top
+    /// of the parameter's static base. Curve and LFO answer from their own
+    /// time; a sidechain's signal comes from the mix it is wired into, so
+    /// without that wiring it contributes nothing.
     #[must_use]
     pub fn value_at(&self, t: Duration) -> f32 {
         match self {
             Self::Curve(curve) => curve.value_at(t),
             Self::Lfo(lfo) => lfo.value_at(t),
+            Self::Sidechain(..) => 0.0,
         }
     }
 }
@@ -439,6 +567,7 @@ impl std::fmt::Display for ControlSource {
         match self {
             Self::Curve(curve) => curve.fmt(f),
             Self::Lfo(lfo) => lfo.fmt(f),
+            Self::Sidechain(side) => side.fmt(f),
         }
     }
 }
@@ -447,10 +576,15 @@ impl std::str::FromStr for ControlSource {
     type Err = String;
 
     /// A curve is its keyframes (`0:1,3.2:-1`); an LFO opens with its shape
-    /// (`sine:1:0.5:0`). A text that starts with a shape name is an LFO —
-    /// keyframe text never starts with a letter.
+    /// (`sine:1:0.5:0`); a sidechain opens with its keyword
+    /// (`sidechain:master:-0.5:0.005:0.15`). A text that starts with a shape
+    /// name or the keyword is neither a curve — keyframe text never starts
+    /// with a letter.
     fn from_str(s: &str) -> Result<Self, String> {
         let first = s.trim().split(':').next().unwrap_or("");
+        if first == "sidechain" {
+            return Ok(Self::Sidechain(s.parse()?));
+        }
         if first.parse::<LfoShape>().is_ok() {
             return Ok(Self::Lfo(s.parse()?));
         }
@@ -1171,5 +1305,36 @@ mod tests {
         assert!(
             (lfo.value_at(Duration::from_secs_f64(0.25)) - 0.5).abs() < 1e-6
         );
+    }
+
+    #[test]
+    fn a_sidechain_round_trips_through_its_text() {
+        let duck = Sidechain::new(
+            BusRef::Group(1),
+            -0.4,
+            Duration::from_secs_f64(0.01),
+            Duration::from_secs_f64(0.2),
+        );
+        assert_eq!(duck.to_string(), "sidechain:group.1:-0.4:0.01:0.2");
+        assert_eq!("sidechain:group.1:-0.4:0.01:0.2".parse::<Sidechain>().unwrap(), duck);
+        assert_eq!(
+            "sidechain:master:-0.5".parse::<Sidechain>().unwrap(),
+            Sidechain::default(),
+            "time constants default to a fast attack and a slow release"
+        );
+        let boost = "sidechain:master:0.3:0.05".parse::<Sidechain>().unwrap();
+        assert_eq!(boost.amount, 0.3, "an amount may swell as well as duck");
+        assert_eq!(boost.attack, Duration::from_millis(50));
+        assert_eq!(boost.release, Duration::from_millis(150));
+
+        // Wired nowhere yet, a sidechain contributes nothing on its own.
+        let source = ControlSource::Sidechain(duck.clone());
+        assert_eq!(source.value_at(secs(1)), 0.0);
+        assert_eq!(source.to_string(), duck.to_string());
+        assert_eq!(source.to_string().parse::<ControlSource>().unwrap(), source);
+
+        for bad in ["sidechain:grup.1:-0.4", "sidechain:group.x:-0.4", "sidechain:master:nan", "sidechain:master:-0.4:0.01:0.2:9"] {
+            assert!(bad.parse::<Sidechain>().is_err(), "{bad} should be refused");
+        }
     }
 }
