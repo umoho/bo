@@ -41,7 +41,8 @@ use crate::bus::{BusRef, Group};
 use crate::engine::measure::{Measurement, Meter};
 use crate::engine::timeline::{ClipPlan, Timeline};
 use crate::engine::{Backend, BackendError, Change};
-use crate::track::{ControlSource, Fade, Track};
+use crate::control::ControlSource;
+use crate::track::{Fade, Track};
 
 /// A backend that actually makes sound.
 pub struct Rodio {
@@ -1891,7 +1892,8 @@ pub fn probe_sources(tracks: &[Track]) -> Vec<(String, Result<Probing, String>)>
 mod tests {
     use super::*;
     use crate::engine::Player;
-    use crate::track::{Clip, Curve, Keyframe, Lfo, LfoShape, Sidechain, Source, Track};
+    use crate::control::{Curve, Keyframe, Lfo, LfoShape, Sidechain};
+    use crate::track::{Clip, Source, Track};
     use rodio::Source as _;
     use std::sync::Arc;
 

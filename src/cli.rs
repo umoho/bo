@@ -130,7 +130,8 @@ use bo::engine::rodio::{
     render_to_file_mono, Probing, Rodio, SourceLength,
 };
 use bo::engine::{Applied, Backend, BackendError, Change, Landed, Player, Silent, State};
-use bo::track::{Clip, ControlSource, Fade, FadeShape, Source, Track};
+use bo::control::ControlSource;
+use bo::track::{Clip, Fade, FadeShape, Source, Track};
 use clap::error::ErrorKind;
 use clap::{Parser, Subcommand};
 

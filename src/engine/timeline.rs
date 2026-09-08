@@ -54,7 +54,7 @@ pub struct ClipPlan {
     pub gain: f32,
     /// Control sources on the clip's gain — carried into the chain when it
     /// is built, so live and render read the same curves.
-    pub gain_controls: Vec<crate::track::ControlSource>,
+    pub gain_controls: Vec<crate::control::ControlSource>,
     /// The clip's fade envelope.
     pub fade: crate::track::Fade,
     /// This clip's own placement, when it does not follow its track: a fixed
@@ -62,7 +62,7 @@ pub struct ClipPlan {
     pub placement: Option<f32>,
     /// Control sources on the clip's pan — carried into the chain when it
     /// is built, so live and render read the same curves.
-    pub pan_controls: Vec<crate::track::ControlSource>,
+    pub pan_controls: Vec<crate::control::ControlSource>,
 }
 
 impl Timeline {
@@ -300,14 +300,14 @@ mod tests {
         // The curve a clip carries travels into the plan, so the chain both
         // live and render build from it drives the same pan.
         let mut t = track_with(vec![Clip::new(src("a.wav"), secs(10))]);
-        t.clip_mut(0).unwrap().pan_controls = vec![crate::track::ControlSource::Curve(
-            crate::track::Curve::new(vec![crate::track::Keyframe {
+        t.clip_mut(0).unwrap().pan_controls = vec![crate::control::ControlSource::Curve(
+            crate::control::Curve::new(vec![crate::control::Keyframe {
                 at: Duration::ZERO,
                 value: 1.0,
             }]),
         )];
-        t.clip_mut(0).unwrap().gain_controls = vec![crate::track::ControlSource::Curve(
-            crate::track::Curve::new(vec![crate::track::Keyframe {
+        t.clip_mut(0).unwrap().gain_controls = vec![crate::control::ControlSource::Curve(
+            crate::control::Curve::new(vec![crate::control::Keyframe {
                 at: Duration::from_secs(5),
                 value: -0.5,
             }]),

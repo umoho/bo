@@ -11,6 +11,9 @@
 //!   [`track::Track`], slices of audio sources laid on non-overlapping
 //!   timelines. Content answers *what* plays and *when*; it holds no signal
 //!   state.
+//! * [`control`] — the control sources that modulate a clip's parameters as
+//!   they play: the curve, the LFO and the sidechain, each a serializable
+//!   `type,field=value,...` object.
 //! * [`bus`] — the signal layer: [`bus::Output`] (a track's edge into the
 //!   mix, carrying gain, mute and placement) and the bus nodes it feeds —
 //!   the master ([`bus::Bus`]) and the group buses ([`bus::Group`]) several
@@ -20,5 +23,6 @@
 //!   with an [`engine::Backend`] seam for whatever actually makes sound.
 
 pub mod bus;
+pub mod control;
 pub mod engine;
 pub mod track;
