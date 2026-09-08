@@ -413,7 +413,7 @@ impl std::str::FromStr for ControlSource {
             Some("lfo") => Ok(Self::Lfo(lfo_from_value(&value)?)),
             Some("sidechain") => Ok(Self::Sidechain(sidechain_from_value(&value)?)),
             _ => Err(
-                "bad control source: expected curve, lfo or sidechain — \
+                "bad control source: expected curve, lfo or sidechain - \
                  a JSON object whose \"type\" says which".to_string(),
             ),
         }
@@ -427,7 +427,7 @@ impl std::str::FromStr for ControlSource {
 /// Parse the whole text as one JSON value.
 fn json_value(s: &str) -> Result<Value, String> {
     serde_json::from_str(s).map_err(|_| {
-        "bad control source: not JSON — expected curve, lfo or sidechain as one \
+        "bad control source: not JSON - expected curve, lfo or sidechain as one \
          object, e.g. {\"type\":\"curve\",\"0\":1,\"3.2\":-1}"
             .to_string()
     })

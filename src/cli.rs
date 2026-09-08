@@ -456,7 +456,7 @@ fn default_socket() -> PathBuf {
 /// so grouping (Arrangement / Mix / Transport) and the examples live here.
 /// Keep in sync with [`Command`] when the surface changes.
 const HELP: &str = "\
-bo — edit and mix audio, one command at a time
+bo - edit and mix audio, one command at a time
 
 USAGE
   bo [--socket PATH] <command> [args...]
@@ -464,20 +464,20 @@ USAGE
 COMMANDS
 
 Arrangement:
-  put <spec> [where]       place a clip; where = track[@pos] — omit the track
+  put <spec> [where]       place a clip; where = track[@pos] - omit the track
                            for a fresh one and the pos for the playhead
                            (--repeat n places n butt-joined copies)
                            (--gain/--fade-in/--fade-in-from/--fade-out/
                            --fade-out-to set the clip's gain and fades)
-  take <track> <clip>      remove a clip — by its id, or the @timecode it
+  take <track> <clip>      remove a clip - by its id, or the @timecode it
                            covers
   move <track> <clip> <dest>
                            move a clip to another track, or to a new
                            position on its own; keeps its gain, fades and
                            (when free on the destination) its id. dest =
-                           [track]@[pos] — track omitted: the same track,
+                           [track]@[pos] - track omitted: the same track,
                            pos omitted: the playhead
-  route <track> <bus>      route a track's output into a group bus — several
+  route <track> <bus>      route a track's output into a group bus - several
                            tracks share one strip (its volume, its mute)
                            before the master hears them, a radio music bus
                            or voice bus. The bus is created by its first
@@ -512,18 +512,18 @@ Mix:
   set <var> <value>        set an attribute and land it on the running mix
                            (playing or paused; a name is only a label). With
                            no var at all, `bo set` lists every current var
-                           and value — the key space below, one row each:
+                           and value - the key space below, one row each:
                            master, track.N.volume/pan/muted/name,
                            bus.N.volume/muted/name, and clip.T.C.gain/pan/
                            fade_in/fade_in_from/fade_out/fade_out_to/
                            fade_shape/pan_control/gain_control.
                            A plain value is a token: a gain, a timecode, a
                            boolean, a name. Only the two *_control properties
-                           take a one-line JSON object — a curve
+                           take a one-line JSON object - a curve
                            '{\"type\":\"curve\",\"0\":1,\"3.2\":-1}', an lfo
                            '{\"type\":\"lfo\",\"shape\":\"sine\",\"rate\":1,\"depth\":0.5}'
                            or a sidechain '{\"type\":\"sidechain\",\"bus\":\"group.0\"}'
-                           — and \"none\" unplugs. Timecodes may be typed as
+                           - and \"none\" unplugs. Timecodes may be typed as
                            bare seconds (3.2, 0.005).
 
 Transport:
@@ -567,7 +567,7 @@ CLIP SPEC
 
   A source with no out-point is probed at put time and its whole length is
   used, so every clip has a known finite end; when the container states no
-  length the file is decoded to its end (see `probe` — the reply marks it
+  length the file is decoded to its end (see `probe` - the reply marks it
   `estimated`). A source that cannot be opened or decoded is refused (run
   `bo probe <uri>`). Spans are half-open: clips may butt-join (one ends
   exactly where the next starts). In-points are exact: reading starts at
@@ -811,7 +811,7 @@ fn dispatch(a: &mut Arrangement, command: Command, cwd: &str) -> Result<Output, 
             let t = parse_timecode(&at).map_err(usage)?;
             if t > a.player.duration() {
                 return Err(fail(format!(
-                    "cannot seek to {} — the arrangement ends at {}",
+                    "cannot seek to {} - the arrangement ends at {}",
                     format_time(t),
                     format_time(a.player.duration())
                 )));
@@ -868,7 +868,7 @@ fn dispatch(a: &mut Arrangement, command: Command, cwd: &str) -> Result<Output, 
                     if measure && path.contains('-') && parse_range(path).is_ok() {
                         return Err(usage(format!(
                             "{path:?} looks like a range; `render --measure` measures the whole \
-                             arrangement — to measure a range, write it: `render out.wav {path} \
+                             arrangement - to measure a range, write it: `render out.wav {path} \
                              --measure`"
                         )));
                     }
@@ -1742,7 +1742,7 @@ fn land(a: &mut Arrangement, change: Option<Change>) -> Option<Landed> {
 fn unknown_var(var: &str) -> String {
     format!(
         "unknown var {var:?}: set takes master, track.N.<prop>, bus.N.<prop> \
-         or clip.T.C.<prop> — `bo set` lists the current ones"
+         or clip.T.C.<prop> - `bo set` lists the current ones"
     )
 }
 
@@ -1781,7 +1781,7 @@ impl TrackProp {
             .find(|p| p.key() == name)
             .ok_or_else(|| {
                 format!(
-                    "no track property {name:?} — try {}",
+                    "no track property {name:?} - try {}",
                     Self::ALL.iter().map(|p| p.key()).collect::<Vec<_>>().join(", ")
                 )
             })
@@ -1869,7 +1869,7 @@ impl BusProp {
             .find(|p| p.key() == name)
             .ok_or_else(|| {
                 format!(
-                    "no bus property {name:?} — try {}",
+                    "no bus property {name:?} - try {}",
                     Self::ALL.iter().map(|p| p.key()).collect::<Vec<_>>().join(", ")
                 )
             })
@@ -1968,7 +1968,7 @@ impl ClipProp {
             .find(|p| p.key() == name)
             .ok_or_else(|| {
                 format!(
-                    "no clip property {name:?} — try {}",
+                    "no clip property {name:?} - try {}",
                     Self::ALL.iter().map(|p| p.key()).collect::<Vec<_>>().join(", ")
                 )
             })
@@ -2415,7 +2415,7 @@ pub fn run(args: Vec<String>) -> i32 {
                 0
             }
             None => {
-                eprintln!("bo: no such command {topic:?} — try `bo help`");
+                eprintln!("bo: no such command {topic:?} - try `bo help`");
                 2
             }
         },
