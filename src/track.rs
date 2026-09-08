@@ -319,19 +319,21 @@ pub struct Clip {
     pub to: Duration,
     /// Gain applied to this clip in the mix, `0.0 ..= 1.0`; full by default.
     pub gain: f32,
+    /// Control sources on this clip's gain — its own gain input. A clip's
+    /// gain is the static `gain` above plus the sum of its active sources,
+    /// clamped to `0.0 ..= 1.0`; an empty list is no cable.
+    pub gain_controls: Vec<ControlSource>,
     /// The fade envelope.
     pub fade: Fade,
     /// Where this clip sits in the bus space, when it does not follow its
     /// track's output. `None` (the default) inherits the track's placement;
     /// the surface for setting a per-clip placement is not open yet.
     pub placement: Option<Placement>,
-    /// Control sources plugged into this clip's own inputs. v1 has exactly
-    /// one input worth plugging — pan — so a source here offsets the pan
-    /// a listener would otherwise hear (the placement, or the track's pan
-    /// when the clip has none). An empty list is no cable: the static base
-    /// is the whole story. A second automatable parameter would grow a
-    /// field of its own rather than share this one.
-    pub controls: Vec<ControlSource>,
+    /// Control sources on this clip's pan — its own pan input. A clip's pan
+    /// is the effective static position (the placement, or the track's pan
+    /// when the clip has none) plus the sum of its active sources, clamped
+    /// to the field; an empty list is no cable.
+    pub pan_controls: Vec<ControlSource>,
 }
 
 impl Clip {
@@ -346,7 +348,8 @@ impl Clip {
             gain: 1.0,
             fade: Fade::default(),
             placement: None,
-            controls: Vec::new(),
+            gain_controls: Vec::new(),
+            pan_controls: Vec::new(),
         }
     }
 
@@ -361,7 +364,8 @@ impl Clip {
             gain: 1.0,
             fade: Fade::default(),
             placement: None,
-            controls: Vec::new(),
+            gain_controls: Vec::new(),
+            pan_controls: Vec::new(),
         }
     }
 
@@ -928,8 +932,10 @@ mod tests {
     #[test]
     fn clips_come_with_no_cable_plugged_in() {
         let c = Clip::new(src("a"), secs(10));
-        assert!(c.controls.is_empty());
+        assert!(c.pan_controls.is_empty());
+        assert!(c.gain_controls.is_empty());
         let s = Clip::sliced(src("b"), Duration::ZERO, secs(5));
-        assert!(s.controls.is_empty());
+        assert!(s.pan_controls.is_empty());
+        assert!(s.gain_controls.is_empty());
     }
 }

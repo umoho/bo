@@ -52,14 +52,17 @@ pub struct ClipPlan {
     pub delay: Duration,
     /// The clip's gain, `0.0 ..= 1.0`.
     pub gain: f32,
+    /// Control sources on the clip's gain — carried into the chain when it
+    /// is built, so live and render read the same curves.
+    pub gain_controls: Vec<crate::track::ControlSource>,
     /// The clip's fade envelope.
     pub fade: crate::track::Fade,
     /// This clip's own placement, when it does not follow its track: a fixed
     /// position that overrides the track's pan for the whole clip.
     pub placement: Option<f32>,
-    /// The control sources driving this clip's pan — carried into the chain
-    /// when it is built, so live and render read the same curves.
-    pub controls: Vec<crate::track::ControlSource>,
+    /// Control sources on the clip's pan — carried into the chain when it
+    /// is built, so live and render read the same curves.
+    pub pan_controls: Vec<crate::track::ControlSource>,
 }
 
 impl Timeline {
@@ -103,9 +106,10 @@ impl Timeline {
                     length: remaining,
                     delay,
                     gain: clip.gain,
+                    gain_controls: clip.gain_controls.clone(),
                     fade: clip.fade,
                     placement: clip.placement.map(crate::bus::Placement::position),
-                    controls: clip.controls.clone(),
+                    pan_controls: clip.pan_controls.clone(),
                 });
                 previous_end = Some(abs_end);
                 end = end.max(abs_end);
@@ -296,15 +300,23 @@ mod tests {
         // The curve a clip carries travels into the plan, so the chain both
         // live and render build from it drives the same pan.
         let mut t = track_with(vec![Clip::new(src("a.wav"), secs(10))]);
-        t.clip_mut(0).unwrap().controls = vec![crate::track::ControlSource::Curve(
+        t.clip_mut(0).unwrap().pan_controls = vec![crate::track::ControlSource::Curve(
             crate::track::Curve::new(vec![crate::track::Keyframe {
                 at: Duration::ZERO,
                 value: 1.0,
             }]),
         )];
+        t.clip_mut(0).unwrap().gain_controls = vec![crate::track::ControlSource::Curve(
+            crate::track::Curve::new(vec![crate::track::Keyframe {
+                at: Duration::from_secs(5),
+                value: -0.5,
+            }]),
+        )];
         let plan = Timeline::plan(&[t], Duration::ZERO);
-        let source = &plan.tracks()[0].clips()[0].controls[0];
-        assert_eq!(source.value_at(Duration::ZERO), 1.0);
+        let pan = &plan.tracks()[0].clips()[0].pan_controls[0];
+        assert_eq!(pan.value_at(Duration::ZERO), 1.0);
+        let gain = &plan.tracks()[0].clips()[0].gain_controls[0];
+        assert_eq!(gain.value_at(Duration::from_secs(5)), -0.5);
     }
 
     #[test]

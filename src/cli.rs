@@ -1053,7 +1053,7 @@ fn arrangement_view(a: &Arrangement) -> Ls {
                         fade_out_to: c.fade.fade_out_to,
                         fade_shape: c.fade.shape,
                         curve: {
-                            let controls = &c.controls;
+                            let controls = &c.pan_controls;
                             (!controls.is_empty()).then(|| {
                                 controls
                                     .iter()
@@ -1804,7 +1804,7 @@ fn set_clip_command(
                     "none" => None,
                     text => Some(text.parse::<ControlSource>().map_err(usage)?),
                 };
-                c.controls = match &curve {
+                c.pan_controls = match &curve {
                     Some(source) => vec![source.clone()],
                     None => Vec::new(),
                 };
@@ -2033,8 +2033,8 @@ fn serialize(a: &Arrangement) -> String {
             }
             // So does a plug in its pan input. One source has a set form
             // today; more than one is a future surface.
-            if c.controls.len() == 1 {
-                let _ = writeln!(out, "set clip.{ti}.{}.curve {}", c.id, c.controls[0]);
+            if c.pan_controls.len() == 1 {
+                let _ = writeln!(out, "set clip.{ti}.{}.curve {}", c.id, c.pan_controls[0]);
             }
         }
         if let Some(name) = t.name() {
@@ -4040,7 +4040,7 @@ mod tests {
         let mut b = Arrangement::default();
         run_ok(&mut b, &["load", &path]);
         assert_eq!(serialize(&b), script);
-        assert_eq!(b.player.tracks()[0].clips()[0].controls.len(), 1);
+        assert_eq!(b.player.tracks()[0].clips()[0].pan_controls.len(), 1);
 
         // 'none' unplugs; the text round-trip forgets it again.
         assert_eq!(

@@ -187,11 +187,17 @@ struct ClipVoice {
 /// these, not a rebuild.
 #[derive(Debug, Clone)]
 struct ClipParams {
+    /// The modulated gain the `LiveGain` reads — the modulation point.
+    /// Written by the clip drive every sample as base plus sources, never by
+    /// an edit directly, so a curve and a static gain share one mechanism.
     gain: GainCell,
+    /// The static gain base: what a clip-gain edit writes.
+    gain_base: GainCell,
+    /// The control sources on the clip's gain, shared with the graph.
+    gain_controls: Arc<Mutex<Vec<ControlSource>>>,
     fade: Arc<Mutex<Fade>>,
     /// The modulated pan the panner reads — the modulation point. Written
-    /// by the pan drive every sample as base plus sources, never by an edit
-    /// directly, so a curve and a static pan share one mechanism.
+    /// by the clip drive every sample as base plus sources.
     pan: GainCell,
     /// The static pan base: what pan edits write — the clip's own
     /// placement, or its track's pan while the clip follows it.
@@ -200,10 +206,8 @@ struct ClipParams {
     /// a track pan lands on this clip's base too, until the clip is given a
     /// placement of its own.
     follow_track: bool,
-    /// The control sources driving this clip's pan, shared with the graph:
-    /// an edit is a store into this list, and the pan drive re-reads it
-    /// every few milliseconds.
-    controls: Arc<Mutex<Vec<ControlSource>>>,
+    /// The control sources on the clip's pan, shared with the graph.
+    pan_controls: Arc<Mutex<Vec<ControlSource>>>,
     /// How far into the clip the graph entered it, so a fade-in edited later
     /// is still measured from the clip's own start.
     into: Duration,
@@ -221,11 +225,13 @@ impl ClipParams {
         };
         Self {
             gain: GainCell::new(plan.gain),
+            gain_base: GainCell::new(plan.gain),
+            gain_controls: Arc::new(Mutex::new(plan.gain_controls.clone())),
             fade: Arc::new(Mutex::new(plan.fade)),
             pan: GainCell::new(base),
             pan_base: GainCell::new(base),
             follow_track: plan.placement.is_none(),
-            controls: Arc::new(Mutex::new(plan.controls.clone())),
+            pan_controls: Arc::new(Mutex::new(plan.pan_controls.clone())),
             into: plan.into,
         }
     }
@@ -499,6 +505,7 @@ impl Graph {
             Change::ClipParams(track, id) => self.land_clip_params(tracks, *track, *id),
             Change::ClipPan(track, id) => self.land_clip_pan(tracks, *track, *id),
             Change::ClipControls(track, id) => self.land_clip_controls(tracks, *track, *id),
+            Change::ClipGainControls(track, id) => self.land_clip_gain_controls(tracks, *track, *id),
             Change::Appended(track) => self.land_appended(tracks, at, *track),
             Change::Structure => false,
             // A group strip is baked into the graph when it is built; a
@@ -565,7 +572,7 @@ impl Graph {
         else {
             return true;
         };
-        queued.params.gain.set(clip.gain);
+        queued.params.gain_base.set(clip.gain);
         if let Ok(mut fade) = queued.params.fade.lock() {
             *fade = clip.fade;
         }
@@ -592,8 +599,32 @@ impl Graph {
         else {
             return true;
         };
-        if let Ok(mut controls) = queued.params.controls.lock() {
-            *controls = clip.controls.clone();
+        if let Ok(mut controls) = queued.params.pan_controls.lock() {
+            *controls = clip.pan_controls.clone();
+        }
+        true
+    }
+
+    /// A clip's gain control sources — a gain curve plugged, unplugged or
+    /// redrawn: one store into the list the clip drive reads, heard within
+    /// its next refresh.
+    fn land_clip_gain_controls(&mut self, tracks: &[Track], track: usize, id: u64) -> bool {
+        let Some(queued) = self
+            .voices
+            .iter_mut()
+            .find(|v| v.track == track)
+            .and_then(|v| v.clips.iter_mut().find(|c| c.id == id))
+        else {
+            return true;
+        };
+        let Some(clip) = tracks
+            .get(track)
+            .and_then(|t| t.clips().iter().find(|c| c.id == id))
+        else {
+            return true;
+        };
+        if let Ok(mut controls) = queued.params.gain_controls.lock() {
+            *controls = clip.gain_controls.clone();
         }
         true
     }
@@ -902,55 +933,73 @@ impl<I: Source> Source for Panner<I> {
     }
 }
 
-/// Drives a clip's pan cell from its control sources as the samples flow:
-/// every sample it writes `pan = base + Σ source(clip-local time)`, clamped
-/// to the field, so the panner downstream reads the modulated position. The
-/// static base (what pan edits write) is read per sample — a live pan is
-/// heard immediately; the sources are read from a shared list refreshed
-/// every few milliseconds, like a fade, so plugging or redrawing a curve
-/// lands on the running clip without a rebuild.
+/// Applies a clip's control sources to its parameter cells as the samples
+/// flow: every sample it writes `pan = clamp(base + Σ pan-sources)` and
+/// `gain = clamp(base + Σ gain-sources)` at clip-local time, so the panner
+/// and the live gain downstream read the modulated values. The static bases
+/// (what edits write) are read per sample — a live pan or gain is heard
+/// immediately; the sources are read from shared lists refreshed every few
+/// milliseconds, like a fade, so plugging or redrawing a curve lands on the
+/// running clip without a rebuild.
 ///
 /// Placed inside the clip's delay, so a curve starts at the clip itself and
 /// the silence leading to it is not swept. Both live and render build this
-/// chain through the same `make_source`, so a curve sounds offline exactly
-/// as it does on air.
-struct PanDrive<I> {
+/// chain through the same `make_source`, so curves sound offline exactly as
+/// they do on air.
+struct ClipDrive<I> {
     input: I,
     /// The modulated pan the panner reads.
     pan: GainCell,
-    /// The static base — what pan edits write.
-    base: GainCell,
-    /// The control sources, shared with the graph.
-    controls: Arc<Mutex<Vec<ControlSource>>>,
-    /// The sources as last read, so the mutex is not touched per sample.
-    sources: Vec<ControlSource>,
+    /// The static pan base — what pan edits write.
+    pan_base: GainCell,
+    /// The control sources on the pan.
+    pan_controls: Arc<Mutex<Vec<ControlSource>>>,
+    /// The pan sources as last read, so the mutex is not touched per sample.
+    pan_sources: Vec<ControlSource>,
+    /// The modulated gain the live gain reads.
+    gain: GainCell,
+    /// The static gain base — what a clip-gain edit writes.
+    gain_base: GainCell,
+    /// The control sources on the gain.
+    gain_controls: Arc<Mutex<Vec<ControlSource>>>,
+    /// The gain sources as last read.
+    gain_sources: Vec<ControlSource>,
     /// Clip-local time of the next sample: where the clip was entered, plus
     /// what has flowed since.
     at: Duration,
     /// Duration of one interleaved sample of `input`.
     per_sample: Duration,
-    /// Samples until `controls` is read again.
+    /// Samples until the source lists are read again.
     until_refresh: u32,
     /// Samples between reads: five milliseconds of this source's audio.
     refresh_every: u32,
 }
 
-impl<I: Source> PanDrive<I> {
+impl<I: Source> ClipDrive<I> {
     fn new(input: I, params: &ClipParams) -> Self {
         let per_frame = input.sample_rate().get() as u64 * input.channels().get() as u64;
         let per_sample = Duration::from_secs_f64(1.0 / per_frame as f64);
         let refresh_every = u32::try_from(per_frame / 200).unwrap_or(u32::MAX).max(1);
-        let sources = params
-            .controls
+        let pan_sources = params
+            .pan_controls
+            .lock()
+            .map(|c| c.clone())
+            .unwrap_or_default();
+        let gain_sources = params
+            .gain_controls
             .lock()
             .map(|c| c.clone())
             .unwrap_or_default();
         Self {
             input,
             pan: params.pan.clone(),
-            base: params.pan_base.clone(),
-            controls: params.controls.clone(),
-            sources,
+            pan_base: params.pan_base.clone(),
+            pan_controls: params.pan_controls.clone(),
+            pan_sources,
+            gain: params.gain.clone(),
+            gain_base: params.gain_base.clone(),
+            gain_controls: params.gain_controls.clone(),
+            gain_sources,
             at: params.into,
             per_sample,
             until_refresh: refresh_every,
@@ -959,7 +1008,7 @@ impl<I: Source> PanDrive<I> {
     }
 }
 
-impl<I: Source> Iterator for PanDrive<I> {
+impl<I: Source> Iterator for ClipDrive<I> {
     type Item = Sample;
 
     fn next(&mut self) -> Option<Sample> {
@@ -967,25 +1016,35 @@ impl<I: Source> Iterator for PanDrive<I> {
         if self.until_refresh == 0 {
             // A curve edited while this clip plays lands here, within one
             // refresh window of being set.
-            if let Ok(controls) = self.controls.lock() {
-                self.sources = controls.clone();
+            if let Ok(controls) = self.pan_controls.lock() {
+                self.pan_sources = controls.clone();
+            }
+            if let Ok(controls) = self.gain_controls.lock() {
+                self.gain_sources = controls.clone();
             }
             self.until_refresh = self.refresh_every;
         }
         self.until_refresh -= 1;
-        // parameter = static base + the sum of the active sources, clamped.
-        let offset = self
-            .sources
+        // parameter = static base + the sum of the active sources, clamped
+        // to the parameter's field.
+        let pan_offset = self
+            .pan_sources
             .iter()
             .fold(0.0f32, |sum, source| sum + source.value_at(self.at));
-        let pan = (self.base.get() + offset).clamp(-1.0, 1.0);
-        self.pan.set(pan);
+        self.pan
+            .set((self.pan_base.get() + pan_offset).clamp(-1.0, 1.0));
+        let gain_offset = self
+            .gain_sources
+            .iter()
+            .fold(0.0f32, |sum, source| sum + source.value_at(self.at));
+        self.gain
+            .set((self.gain_base.get() + gain_offset).clamp(0.0, 1.0));
         self.at += self.per_sample;
         Some(sample)
     }
 }
 
-impl<I: Source> Source for PanDrive<I> {
+impl<I: Source> Source for ClipDrive<I> {
     fn current_span_len(&self) -> Option<usize> {
         self.input.current_span_len()
     }
@@ -1020,7 +1079,7 @@ fn make_source(plan: &ClipPlan, params: &ClipParams) -> Result<Box<dyn Source + 
     // at the clip, not at the silence leading to it. The panner after the
     // delay turns whatever layout it sees into the stereo pair the bus
     // carries — silence pans to silence, so the gap's timing is untouched.
-    let driven = PanDrive::new(faded, params);
+    let driven = ClipDrive::new(faded, params);
     let placed = Panner::new(driven.delay(plan.delay), params.pan.clone());
     Ok(Box::new(LiveGain::new(
         placed,
@@ -3110,7 +3169,7 @@ mod tests {
         let mut track = Track::named("slide");
         let id = track.insert(clip_at(uri, 0, 2)).unwrap();
         let clip = track.clip_mut(id).unwrap();
-        clip.controls = vec![ControlSource::Curve(curve)];
+        clip.pan_controls = vec![ControlSource::Curve(curve)];
         clip.placement = Some(crate::bus::Placement::Stereo { position: base });
         vec![track]
     }
@@ -3208,6 +3267,79 @@ mod tests {
         assert!(ch_peak(&samples, 0, 200, 1_000) < 0.1);
         assert!(ch_peak(&samples, 0, 171_990, 1_000) > 0.4, "rendered late left");
         assert!(ch_peak(&samples, 1, 171_990, 1_000) < 0.1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_gain_curve_ducks_a_clip_as_it_plays() {
+        // The gain input is base + sources, like pan: a curve that starts
+        // at -1 ducks the clip to silence and rises back to full gain over
+        // its two seconds, live.
+        let dir = std::env::temp_dir().join(format!("bo-gain-curve-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tone = dir.join("tone.wav");
+        write_wav(&tone, 2.0, 440.0, 0.5);
+        let duck = Curve::new(vec![
+            Keyframe { at: Duration::ZERO, value: -1.0 },
+            Keyframe { at: Duration::from_secs(2), value: 0.0 },
+        ]);
+        let mut track = Track::named("duck");
+        let id = track.insert(clip_at(tone.to_str().unwrap(), 0, 2)).unwrap();
+        let clip = track.clip_mut(id).unwrap();
+        clip.gain_controls = vec![ControlSource::Curve(duck)];
+        // Hard left so one channel carries the whole tone.
+        clip.placement = Some(crate::bus::Placement::Stereo { position: -1.0 });
+        let tracks = [track];
+        let (mut graph, mut output) = graph_on_a_mixer();
+        graph.play(&tracks, &[], Duration::ZERO).unwrap();
+
+        let early = pull(&mut output, 2_205); // ~0..50 ms: near silence
+        assert!(ch_peak(&early, 0, 200, 1_000) < 0.1, "ducked at the start");
+        // Skip to the tail: gain has risen back to nearly full.
+        let _mid = pull(&mut output, 44_100 * 2 - 2_205 - 4_410);
+        let late = pull(&mut output, 2_205);
+        assert!(
+            ch_peak(&late, 0, 200, 1_000) > 0.4,
+            "risen back by the end"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_gain_curve_offsets_the_static_gain_and_is_redrawn_live() {
+        // Static clip gain 0.8 under a -0.3 curve lands at 0.5; redrawing
+        // the curve to -0.8 while the clip sounds ducks it to silence — a
+        // store into the running chain, like a fade edit.
+        let dir = std::env::temp_dir().join(format!("bo-gain-curve-edit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tone = dir.join("tone.wav");
+        write_wav(&tone, 2.0, 440.0, 0.5);
+        let uri = tone.to_str().unwrap();
+        let curve = |v: f32| Curve::new(vec![Keyframe { at: Duration::ZERO, value: v }]);
+        let build = |c: Curve| -> Vec<Track> {
+            let mut track = Track::named("g");
+            let id = track.insert(clip_at(uri, 0, 2)).unwrap();
+            let clip = track.clip_mut(id).unwrap();
+            clip.gain = 0.8;
+            clip.gain_controls = vec![ControlSource::Curve(c)];
+            clip.placement = Some(crate::bus::Placement::Stereo { position: -1.0 });
+            vec![track]
+        };
+        let tracks = build(curve(-0.3));
+        let id = tracks[0].clips()[0].id;
+        let (mut graph, mut output) = graph_on_a_mixer();
+        graph.play(&tracks, &[], Duration::ZERO).unwrap();
+        let first = pull(&mut output, 2_205);
+        let mid = ch_peak(&first, 0, 200, 1_000);
+        assert!((mid - 0.25).abs() < 5e-3, "0.5 gain on a 0.5 tone: {mid}");
+
+        let redrawn = build(curve(-0.8));
+        assert!(graph.land(&redrawn, graph.position(), &Change::ClipGainControls(0, id)));
+        let after = pull(&mut output, 4_410);
+        assert!(
+            ch_peak(&after, 0, 2_000, 1_000) < 1e-3,
+            "ducked to silence by the redraw"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

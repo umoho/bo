@@ -59,6 +59,8 @@ pub enum Change {
     /// unplugged. A running chain reads them through shared state, so the
     /// edit is a store, not a rebuild.
     ClipControls(usize, u64),
+    /// The same, for the clip's gain input.
+    ClipGainControls(usize, u64),
     /// Clips were placed past the end of a track's queued material.
     Appended(usize),
     /// The arrangement's shape changed: a clip was removed or moved, or the
