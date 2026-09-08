@@ -69,6 +69,11 @@ $ bo stop                     # end the session; the daemon cleans up
 ok: stopped
 ```
 
+`bo set` with no arguments prints the whole mix surface as a status line
+followed by one `var value` row per current value — the same registry `set`
+applies through — so an agent can read (or snapshot) the session in one
+command.
+
 Edits take effect as they are made: a gain or a fade goes into the chain that
 is playing it, and a clip placed past the end of a track's queue joins the
 running queue. `apply` is for the edits a running mix cannot take itself — a
