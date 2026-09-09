@@ -1,5 +1,5 @@
 //! End-to-end: the session client ([`bo::client::Bo`] over a
-//! [`bo::session::Session`]) reaches the real daemon over its Unix socket —
+//! [`bo::connection::Connection`]) reaches the real daemon over its Unix socket —
 //! the same arrangement the CLI drives — and typed replies come back typed.
 
 use std::path::{Path, PathBuf};
@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use bo::client::{Bo, Error, Slice, TrackRef};
-use bo::session::Session;
+use bo::connection::Connection;
 
 fn temp_dir() -> PathBuf {
     static N: AtomicUsize = AtomicUsize::new(0);
@@ -88,7 +88,7 @@ fn bo_put_reaches_the_daemon_and_shares_its_arrangement_with_the_cli() {
     let socket = dir.join("d.sock");
     let _daemon = spawn_daemon(&socket);
 
-    let mut bo = Bo::with_session(Session::at(&socket));
+    let mut bo = Bo::with_connection(Connection::at(&socket));
     // A closed window needs no file: nothing is probed.
     let put = bo
         .put(
@@ -107,7 +107,7 @@ fn bo_put_reaches_the_daemon_and_shares_its_arrangement_with_the_cli() {
     assert!(out.contains("00:00:10.000-00:00:20.000"), "{out}");
 
     // A second Bo shares the session too: ids stay stable and grow.
-    let mut other = Bo::with_session(Session::at(&socket));
+    let mut other = Bo::with_connection(Connection::at(&socket));
     let put = other
         .put(
             "voice.wav",
@@ -129,7 +129,7 @@ fn a_refused_put_comes_back_as_a_typed_overlap() {
     let socket = dir.join("d.sock");
     let _daemon = spawn_daemon(&socket);
 
-    let mut bo = Bo::with_session(Session::at(&socket));
+    let mut bo = Bo::with_connection(Connection::at(&socket));
     bo.put(
         "a.wav",
         Slice::window(Duration::ZERO, Duration::from_secs(10)),
@@ -162,7 +162,7 @@ fn session_default_spawns_the_daemon_on_demand() {
     let _sp = socket.to_string_lossy().into_owned();
 
     // Point the session at the real bo binary, like an embedded program would.
-    let mut bo = Bo::with_session(Session::at(&socket));
+    let mut bo = Bo::with_connection(Connection::at(&socket));
     unsafe { std::env::set_var("BO_DAEMON", env!("CARGO_BIN_EXE_bo")) };
     let put = bo
         .put(

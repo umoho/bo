@@ -2686,7 +2686,7 @@ fn handle_line(state: &Mutex<Arrangement>, line: &str, cwd: &str) -> (i32, Strin
     }
 }
 
-/// One JSON command (the typed wire [`bo::session::Session`] speaks): run it
+/// One JSON command (the typed wire [`bo::connection::Connection`] speaks): run it
 /// against the same arrangement, answer one JSON object. The exit code stays
 /// `0` — success and refusal both live in the reply's `ok` field.
 fn handle_json(state: &Mutex<Arrangement>, line: &str, cwd: &str) -> (i32, String, bool) {

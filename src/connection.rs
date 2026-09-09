@@ -1,23 +1,23 @@
-//! A session: where an arrangement lives, and how a client reaches it.
+//! A connection: how a client reaches a session.
 //!
-//! Today there is one kind of session: the daemon, reached over its Unix
-//! socket. The daemon owns the arrangement and the transport (like the CLI's
-//! session daemon: spawned on demand, self-cleaning, one arrangement that
-//! every [`Bo`](crate::client::Bo) — or `bo` invocation — shares). Windows
-//! is a later concern; the transport is the only thing that would change,
-//! never the commands or their replies.
+//! The session itself — the arrangement, the transport, the engine running
+//! commands — lives elsewhere (today: the daemon over its Unix socket). A
+//! [`Connection`] is what a client holds to talk to one: the socket path,
+//! and the on-demand spawn that brings the daemon up when it is not there.
 //!
-//! The wire is one JSON object per command on a line, answered by one JSON
-//! object, framed like the CLI's text protocol (`exit code` on the first
-//! line, the payload after). Durations travel as whole milliseconds, so the
-//! round trip is exact.
+//! The wire is one JSON [`Command`](bo_core::command::Command) per line,
+//! answered by one JSON [`Reply`](bo_core::command::Reply), framed like the
+//! CLI's text protocol (`exit code` on the first line, the payload after).
+//! Durations travel as whole milliseconds, so the round trip is exact.
+//! Transport may change (Windows, a pipe, in-process) — never the commands
+//! or their replies.
 //!
 //! ```
-//! use bo::session::Session;
+//! use bo::connection::Connection;
 //!
-//! let s = Session::default();   // the daemon on $TMPDIR/bo/daemon.sock
-//! let _ = Session::at("/tmp/mine.sock");
-//! # let _ = s;
+//! let c = Connection::default();   // the daemon on $TMPDIR/bo/daemon.sock
+//! let _ = Connection::at("/tmp/mine.sock");
+//! # let _ = c;
 //! ```
 
 use std::io::{Read, Write};
@@ -28,20 +28,20 @@ use std::process::{Command as ProcessCommand, Stdio};
 use std::time::{Duration, Instant};
 use std::{env, fs, thread};
 
-/// A client handle to a daemon session: the Unix socket it listens on, and
+/// A client handle to a session over its Unix socket: where it listens, and
 /// how to reach it (spawning the daemon on demand when it is not there).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Session {
+pub struct Connection {
     socket: PathBuf,
 }
 
-impl Default for Session {
+impl Default for Connection {
     fn default() -> Self {
         Self::at(default_socket())
     }
 }
 
-impl Session {
+impl Connection {
     /// The daemon on `$TMPDIR/bo/daemon.sock` — the session `bo` uses when
     /// no `--socket` says otherwise.
     #[must_use]
@@ -49,8 +49,8 @@ impl Session {
         default_socket()
     }
 
-    /// A session on a daemon listening at `path`. The daemon is spawned on
-    /// demand by the first request, and a stale socket is cleared first.
+    /// A connection to a daemon listening at `path`. The daemon is spawned
+    /// on demand by the first request, and a stale socket is cleared first.
     #[must_use]
     pub fn at(path: impl Into<PathBuf>) -> Self {
         Self {
@@ -58,7 +58,7 @@ impl Session {
         }
     }
 
-    /// The socket path this session speaks over.
+    /// The socket path this connection speaks over.
     #[must_use]
     pub fn socket(&self) -> &PathBuf {
         &self.socket
@@ -101,7 +101,7 @@ fn default_socket() -> PathBuf {
 
 /// Connect to the daemon, spawning it (and clearing a stale socket) when it
 /// is not there. The daemon binary is `$BO_DAEMON` when set — that is how
-/// tests and embedders point a library session at the real `bo` binary —
+/// tests and embedders point a library connection at the real `bo` binary —
 /// otherwise the current executable (the `bo` CLI itself).
 fn connect_or_spawn(socket: &PathBuf) -> Result<UnixStream, String> {
     if let Ok(stream) = UnixStream::connect(socket) {
@@ -148,18 +148,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn session_defaults_to_the_shared_socket() {
-        let s = Session::default();
+    fn connection_defaults_to_the_shared_socket() {
+        let c = Connection::default();
         assert_eq!(
-            s.socket(),
+            c.socket(),
             &env::temp_dir().join("bo").join("daemon.sock")
         );
     }
 
     #[test]
-    fn session_holds_its_socket() {
-        let s = Session::at("/tmp/bo-mine.sock");
-        assert_eq!(s.socket(), &PathBuf::from("/tmp/bo-mine.sock"));
+    fn connection_holds_its_socket() {
+        let c = Connection::at("/tmp/bo-mine.sock");
+        assert_eq!(c.socket(), &PathBuf::from("/tmp/bo-mine.sock"));
     }
 
     // A full round trip needs a real daemon and lives in tests/, where the
@@ -167,8 +167,8 @@ mod tests {
     #[test]
     fn a_request_against_nowhere_is_a_connect_error() {
         // A socket path in a directory that cannot exist → spawn fails fast.
-        let s = Session::at("/nonexistent-bo-dir/x.sock");
-        let err = s.request(&serde_json::json!({ "cmd": "put" })).unwrap_err();
+        let c = Connection::at("/nonexistent-bo-dir/x.sock");
+        let err = c.request(&serde_json::json!({ "cmd": "put" })).unwrap_err();
         assert!(err.contains("cannot") || err.contains("spawn"), "{err}");
     }
 }

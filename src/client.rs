@@ -1,4 +1,4 @@
-//! The client: [`Bo`], a typed handle on a [`session::Session`], forwarding
+//! The client: [`Bo`], a typed handle on a [`connection::Connection`], forwarding
 //! commands to the session's executor.
 //!
 //! Today the executor is the daemon on its Unix socket — the same
@@ -29,22 +29,23 @@
 //! # Ok::<(), bo::client::Error>(())
 //! ```
 
-use crate::session::Session;
+use crate::connection::Connection;
 
 // The command protocol, shared with the engine and the daemon; re-exported
 // here so `bo::client::Slice` reads as before.
 pub use bo_core::command::{Command, Error, Landed, Outcome, Overlap, PlacedClip, Put, Reply, Slice, TrackPos, TrackRef};
 
-/// A typed client on a [`Session`]: the arrangement lives there, commands
+/// A typed client on a [`Connection`]: the arrangement lives there, commands
 /// travel there, and the replies come back typed.
 ///
-/// [`Bo::new`] is the default session — the daemon on
+/// [`Bo::new`] is the default connection — the daemon on
 /// `$TMPDIR/bo/daemon.sock`, spawned on demand — the same session the CLI
 /// speaks to, so a program and a shell can work one arrangement. Any other
-/// session (another socket, later a process) is [`Bo::with_session`].
+/// connection (another socket, later a process session) is
+/// [`Bo::with_connection`].
 #[derive(Debug)]
 pub struct Bo {
-    session: Session,
+    connection: Connection,
 }
 
 impl Default for Bo {
@@ -54,17 +55,17 @@ impl Default for Bo {
 }
 
 impl Bo {
-    /// A client on the default session: the daemon on
+    /// A client on the default connection: the daemon on
     /// `$TMPDIR/bo/daemon.sock`, spawned on demand.
     #[must_use]
     pub fn new() -> Self {
-        Self::with_session(Session::default())
+        Self::with_connection(Connection::default())
     }
 
-    /// A client on a session of your own.
+    /// A client on a connection of your own.
     #[must_use]
-    pub fn with_session(session: Session) -> Self {
-        Self { session }
+    pub fn with_connection(connection: Connection) -> Self {
+        Self { connection }
     }
 
     /// Place a clip: the `from..to` window `slice` of source `uri`, on
@@ -91,7 +92,7 @@ impl Bo {
     /// `exec`; this is the client's half of that round trip.
     pub fn exec(&mut self, command: Command) -> Result<Outcome, Error> {
         let body = serde_json::to_value(&command).map_err(|e| Error::Daemon(e.to_string()))?;
-        let reply = self.session.request(&body).map_err(Error::Daemon)?;
+        let reply = self.connection.request(&body).map_err(Error::Daemon)?;
         match serde_json::from_str::<Reply>(&reply)
             .map_err(|e| Error::Daemon(format!("bad daemon reply: {e}")))?
         {
