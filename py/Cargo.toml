@@ -1,0 +1,19 @@
+[package]
+name = "pybo"
+version = "0.2.0"
+edition = "2024"
+description = "pyo3 binding of bo's Bo client — the arrangement/transport verbs over the daemon wire"
+license = "BSD-3-Clause"
+
+# A standalone crate on purpose: not a member of the workspace at the repo
+# root, so maturin builds only pybo (plus its path deps) and `cargo test
+# --workspace` at the root never needs a Python toolchain.
+[workspace]
+
+[lib]
+name = "pybo"
+crate-type = ["cdylib"]
+
+[dependencies]
+bo = { path = ".." }
+pyo3 = { version = "0.29", features = ["extension-module"] }

@@ -1,0 +1,15 @@
+[project]
+name = "pybo"
+version = "0.2.0"
+description = "pybo — the Python client of bo, an audio editor and mixer for agents (the bo::client::Bo surface over the daemon wire)"
+requires-python = ">=3.10"
+license = { text = "BSD-3-Clause" }
+keywords = ["audio", "daw", "cli", "agent", "mixer"]
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+]
+
+[build-system]
+requires = ["maturin>=1.0,<2"]
+build-backend = "maturin"
