@@ -7,7 +7,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use bo::client::{Bo, Clip, Error, TimecodeRange, TrackRef};
+use bo::client::{Bo, Clip, Error, TimecodeRange, TrackIndex};
 use bo::connection::Connection;
 
 fn temp_dir() -> PathBuf {
@@ -93,7 +93,7 @@ fn bo_put_reaches_the_daemon_and_shares_its_arrangement_with_the_cli() {
     let put = bo
         .put(
             Clip::of("bed.wav").trim(TimecodeRange::from((Duration::from_secs(10), Duration::from_secs(20)))),
-            TrackRef(0).at(Duration::from_secs(5)),
+            TrackIndex(0).at(Duration::from_secs(5)),
         )
         .expect("the daemon accepts the put");
     assert_eq!(put.track, 0);
@@ -110,7 +110,7 @@ fn bo_put_reaches_the_daemon_and_shares_its_arrangement_with_the_cli() {
     let put = other
         .put(
             Clip::of("voice.wav").trim(TimecodeRange::from((Duration::ZERO, Duration::from_secs(5)))),
-            TrackRef(1).at(Duration::ZERO),
+            TrackIndex(1).at(Duration::ZERO),
         )
         .expect("voice joins on a fresh track");
     assert_eq!(put.track, 1);
@@ -130,13 +130,13 @@ fn a_refused_put_comes_back_as_a_typed_overlap() {
     let mut bo = Bo::with_connection(Connection::at(&socket));
     bo.put(
         Clip::of("a.wav").trim(TimecodeRange::from((Duration::ZERO, Duration::from_secs(10)))),
-        TrackRef(0).at(Duration::ZERO),
+        TrackIndex(0).at(Duration::ZERO),
     )
     .unwrap();
     let err = bo
         .put(
             Clip::of("b.wav").trim(TimecodeRange::from((Duration::ZERO, Duration::from_secs(10)))),
-            TrackRef(0).at(Duration::ZERO),
+            TrackIndex(0).at(Duration::ZERO),
         )
         .unwrap_err();
     match err {
@@ -163,7 +163,7 @@ fn session_default_spawns_the_daemon_on_demand() {
     let put = bo
         .put(
             Clip::of("a.wav").trim(TimecodeRange::from((Duration::ZERO, Duration::from_secs(1)))),
-            TrackRef(0).at(Duration::ZERO),
+            TrackIndex(0).at(Duration::ZERO),
         )
         .expect("the first request spawns the daemon");
     assert_eq!(put.clip.id, 0);
@@ -195,7 +195,7 @@ fn transport_verbs_round_trip_through_the_daemon() {
     let mut bo = Bo::with_connection(Connection::at(&socket));
     bo.put(
         Clip::of("a.wav").trim(TimecodeRange::from((Duration::ZERO, Duration::from_secs(10)))),
-        TrackRef(0).at(Duration::ZERO),
+        TrackIndex(0).at(Duration::ZERO),
     )
     .unwrap();
 

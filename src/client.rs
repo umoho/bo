@@ -19,12 +19,12 @@
 //! render.
 //!
 //! ```no_run
-//! use bo::client::{Bo, Clip, TrackRef};
+//! use bo::client::{Bo, Clip, TrackIndex};
 //! use std::time::Duration;
 //!
 //! let mut bo = Bo::new();   // the default connection: the shared daemon
 //! let clip = Clip::of("bed.wav").trim("1:00-2:00".parse()?);
-//! let put = bo.put(clip, TrackRef(0).at(Duration::from_secs(30)))?;
+//! let put = bo.put(clip, TrackIndex(0).at(Duration::from_secs(30)))?;
 //! assert_eq!(put.track, 0);
 //! # Ok::<(), bo::client::Error>(())
 //! ```
@@ -194,10 +194,10 @@ impl Clip {
 
 /// A track, addressed by its index. A `put` grows the session to fit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct TrackRef(pub usize);
+pub struct TrackIndex(pub usize);
 
-impl TrackRef {
-    /// A position on this track: `TrackRef(0).at(t)` — the CLI's `0@t`.
+impl TrackIndex {
+    /// A position on this track: `TrackIndex(0).at(t)` — the CLI's `0@t`.
     #[must_use]
     pub const fn at(self, at: Duration) -> TrackPosition {
         TrackPosition {
@@ -207,19 +207,19 @@ impl TrackRef {
     }
 }
 
-impl From<usize> for TrackRef {
+impl From<usize> for TrackIndex {
     fn from(track: usize) -> Self {
         Self(track)
     }
 }
 
-impl From<TrackRef> for usize {
-    fn from(track: TrackRef) -> Self {
+impl From<TrackIndex> for usize {
+    fn from(track: TrackIndex) -> Self {
         track.0
     }
 }
 
-impl fmt::Display for TrackRef {
+impl fmt::Display for TrackIndex {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
     }
