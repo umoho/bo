@@ -1,56 +1,103 @@
-# Command redesign (0.2)
+# Command design (0.2)
 
-The command surface is being replanned. This is the design the text CLI,
-the typed client and the daemon all converge on; 0.2 is the breaking marker.
+The command surface, as it stands: what executes where, what each verb
+does, and which surfaces speak it. The breaking redesign happened in 0.2;
+this file is the contract the crates converge on.
 
 ## Principles
 
 1. **One executor.** The engine is the only place a command runs:
-   `Session::exec(Command) -> Result<Outcome, Error>`. Nothing above it
-   edits an arrangement directly.
+   `engine::Session::exec(Command) -> Result<Outcome, Error>`. Nothing
+   above it edits an arrangement directly.
 2. **Commands speak the model.** Payloads are uris, `Duration`s (whole
    milliseconds on the wire), track/clip indices, bus ids — never
    client-side conveniences (parsed windows, `track@pos` sugar, display
    strings).
-3. **Text is a translator, not a second implementation.** A text command
-   maps its grammar onto a `Command` (or a query) and renders the typed
-   reply back into canonical text. No text layer may hold execution logic.
+3. **Clients are translators, not second implementations.** A client maps
+   its own ergonomics onto a `Command` (or a read) and renders the typed
+   reply back into its own shape. No client holds execution logic.
 4. **Semantics are tested at the engine.** The behaviour specs live in
-   engine/exec tests; the text layer keeps thin grammar/rendering tests.
+   engine/exec tests; clients keep thin grammar/rendering tests.
 5. **Reading is a command too.** Arrangement state is reachable through
    `Get` (a tree), not by touching engine objects.
+6. **The engine and the `bo` lib are frozen.** 0.2.x surface work happens
+   in clients and the binary face, not in `bo-core`/`bo-engine`/`bo` lib.
 
 ## Where execution lives
 
 ```
 core::command   Command / Outcome / Reply / data   (model units, serde, ms)
-engine::Session exec + lifecycle (backend choice, clock)   — the only public engine item
-client::Bo      typed sugar -> Command over Connection
-daemon (bin)    Session host: serve lines -> translate -> exec -> render
-text CLI (bin)  same grammar -> same Command (thin)
+engine::Session exec + lifecycle (backend choice, clock)     — the only executor
+bo lib          client::Bo: typed sugar -> Command over a Connection (daemon wire)
+daemon (bin)    Session host: JSON lines in -> exec -> JSON lines out; host-level
+                snapshot ops (history lives here)
+pybo            pyo3 binding of the bo-lib Bo surface, for Python (uv/maturin)
+mini CLI (bin)  play pause resume seek stop load — thin translator over the
+                same wire, for audition and restore from a shell
 ```
 
-## Command catalog
+The daemon speaks only the typed JSON wire: one
+[`Command`](bo_core::command::Command) per line, preceded by the caller's
+working directory (relative paths resolve against the caller, never the
+daemon's), answered by one JSON [`Reply`](bo_core::command::Reply). It is
+spawned on demand by the clients and the CLI, and cleans up its socket
+when playback finishes, on `stop`, or after an idle timeout.
 
-Text grammar on the left is the *planned* surface; existing `bo` text
-grammar is being replanned onto it.
+## The surfaces
 
-| text (planned)        | Command | Outcome | status |
-|---|---|---|---|
-| `put …` | `Insert { uri, from, to?, on: OnTrack }` | `Inserted { track, clip, landed }` | done |
-| `play` / `pause` / `resume` / `seek t` / `stop` / `apply` | same-name commands | `Played` / `Paused{at}` / … / `Applied` | done |
-| `take …`        | `Remove { track, clip: ClipHere }` | `Removed { track, clip, landed }` | done |
-| `move …` | `Move { track, clip: ClipHere, to: OnTrack }` | `Moved { from_track, to_track, clip, landed }` | done |
-| `route …`        | `Route { track, bus: RouteBus }` (Master/Group/New) | `Routed { track, bus, landed }` | done |
-| `ls` / `at t`          | `Get { path }` | `Outcome::Tree(JSON)` | done |
-| `set <path> <value>`   | `Set { path, patcher }` — state zone, deep patch | `Outcome::Set(Set{ path, patched, landed })` | done |
-| ~~`probe uri`~~ | removed — measurement is upstream tooling (Python / ffmpeg); engine still measures internally for open-end inserts | |
-| `render file [range]`  | `Render { file, from?, to? }` | `Rendered { file, duration_ms }` | done (range/measure/mono next) |
-| ~~`check`~~ | removed — source verification is upstream tooling too | |
-| `save`/`load` | `{version, history: [Command], playhead}` — daemon logs, load stages atomically | `Outcome::Snapshot/Loaded` | done |
-| `check <file>`  | dry-run validation of a `.bo` snapshot | `Outcome::Checked` / `Error::Check` | done |
+### Mini CLI — `bo play pause resume seek stop load`
 
-## Set / Get — the arrangement as a tree
+The shell face is deliberately small: arrangement editing is code, not
+text. The CLI keeps the transport verbs and restore-from-snapshot, so a
+finished session can be auditioned or rebuilt from a terminal:
+
+| text | Command | Outcome |
+|---|---|---|
+| `play` | `Play` | `Played { tracks, clips, end, playhead }` |
+| `pause` | `Pause` | `Paused { at }` |
+| `resume` | `Resume` | `Resumed { at }` |
+| `seek <t>` | `Seek { at }` | `Seeked { at }` |
+| `stop` | `Stop` | `Stopped` |
+| `load <file>` | `Load { snapshot }` | `Loaded` |
+
+(`daemon --socket PATH` is the hidden subcommand clients spawn.) A
+`load` restores the snapshot the clients write with `save`.
+
+### Clients — the arrangement verbs
+
+Everything that builds or tunes an arrangement lives in a typed client,
+because that is where control flow and computed decisions belong:
+
+| verb | Command | Outcome |
+|---|---|---|
+| `put` | `Insert { uri, from, to?, on }` | `Inserted { track, clip, landed }` |
+| `take` | `Remove { track, clip: ClipHere }` | `Removed { … }` |
+| `move` | `Move { track, clip, to }` | `Moved { … }` |
+| `route` | `Route { track, bus: RouteBus }` | `Routed { … }` |
+| `get` | `Get { path }` | `Outcome::Tree(JSON)` |
+| `set` | `Set { path, patcher }` | `Set { path, patched, landed }` |
+| `render` | `Render { file, from?, to?, measure, mono }` | `Rendered { … }` |
+| `reset` | `Reset` | `Outcome::Reset` |
+| `apply` | `Apply` | `Applied` |
+| transport | `Play`/`Pause`/…/`Seek`/`Stop` | same outcomes as the CLI |
+| `save`/`load`/`check` | `Snapshot`/`Load`/`Check` | snapshot trio (host-level) |
+
+Two clients today, sharing one vocabulary:
+
+* **Rust** — `bo::client::Bo`: `put(Clip, Destination)`, `take(ClipOnTrack)`,
+  `route(TrackIndex, BusIndex)`, `set(path, Value)`, `get(path)`, …
+  ([`bo::client`](bo::client)).
+* **Python** — `pybo` (a pyo3 extension built by uv/maturin, in `py/`),
+  binding only the `Bo` struct and its value types: `Timecode`, `trim`,
+  `Track(n).at(t)`, the same verbs. Times accept seconds (`1.23`) or
+  lenient text (`"1:02.5"`) and format as `HH:MM:SS.fff`; durations in
+  replies and the tree are whole milliseconds. Both speak to the same
+  daemon, so Python, Rust and the CLI share one arrangement on a socket.
+
+Measurement (`probe`, source `check`) is upstream tooling — Python /
+ffmpeg — not a command.
+
+## Get / Set — the arrangement as a tree
 
 Reading is one `Get(path)` returning JSON: the whole tree (`""`), a
 subtree, or a leaf. Durations are whole milliseconds; ids are stable and
@@ -77,54 +124,45 @@ names) — the tree is there precisely so the patch can go **deep**:
   (curve keyframes), `null` clears the input;
 - structure (`track[]`, `bus[]` membership) and clip membership have **no
   set entry**: they are edited by verbs (`Insert`, `Remove`, `Move`,
-  `Route`) only, so a `clips` key in a track patch is refused.
+  `Route`, `Reset`) only, so a `clips` key in a track patch is refused.
 
-Paths are the tree's own (`master.volume`, `track.N`, `track.N.clips.M`,
-`track.N.clips.M.gain_control.rate`, `bus.N.muted`) — shared by text, typed
-client and daemon, defined once in core. A clip is addressed by its index
-in the track's ordered list; its stable id rides inside the object. (Dotted
-paths split on `.`, so curve keyframes whose timecodes carry decimals are
-patched by object merge at the control path, never as a deeper path.)
+Paths are the tree's own (`master.volume`, `track.N`,
+`track.N.clips.M`, `track.N.clips.M.gain_control.rate`, `bus.N.muted`) —
+shared by text, typed client and Python, defined once in core. A clip is
+addressed by its index in the track's ordered list; its stable id rides
+inside the object. (Dotted paths split on `.`, so curve keyframes whose
+timecodes carry decimals are patched by object merge at the control path,
+never as a deeper path.)
 
 Writable today: master volume; `track.N.{name,volume,pan,muted}`;
 `bus.N.{name,volume,muted}`; `track.N.clips.M.{gain, fade_in, fade_out,
 pan, pan_control, gain_control}` (pan/controls deep as above).
 
-## Replies
+## Snapshots
 
-Every reply is produced from the typed `Outcome`/`Error`/tree, never
-hand-written twice. Shapes stay stable:
+A snapshot is `{ version, history: [Command], playhead }`. The daemon logs
+every mutating command it executes, so `save` is the session's own
+history; `load` stages the history on a silent arrangement first (a
+failing script leaves the live session untouched) and only then commits;
+`check` validates a snapshot file without touching the session. Hosts
+intercept `Snapshot`/`Load`/`Check` — the engine refuses them
+(`Error::Host`).
+
+## Mini-CLI reply conventions
+
+Replies are rendered from the typed `Outcome`/`Error`, never hand-written
+twice:
 
 - status line `ok:` / `err:`;
-- timecodes `HH:MM:SS.fff`, gains two decimals;
-- one `note:` line when an edit waits for the next `apply`;
-- a clip is one signature line `clip #{id} 'uri' from-to @ at` (+ non-defaults).
+- timecodes `HH:MM:SS.fff`;
+- exit codes: `0` ok, `1` refused, `2` usage.
 
-The old text grammar's properties (`set track.N.*`, `bo set` listing) is
-replaced by the tree (`Get`/`Set`), which also gives the typed client and
-Python one shared read/write vocabulary.
-
-## Migration
-
-Per-command fold, each step green:
-
-1. text put/transport → `Command`; delete execution bodies; daemon serves
-   through `Session`; replies rendered from `Outcome`. (done)
-2. `Remove`, `Move`, `Route` commands + their text; semantics tests in
-   engine. (done)
-3. tree `Get`/`Set` with deep patch; `ls`/`at`/`set` text become rendering
-   of the tree. (engine done; the text surface is still the old one)
-4. `Probe` dropped (upstream tooling); `Render` (file + trim/measure/mono)
-   done; `save`/`load`/`check` done as versioned command-log snapshots.
-5. **The CLI switches to the new API** (next): cli.rs becomes a thin
-   translator — parse text -> Command, go through bo::client::Bo, render
-   replies from Outcome/tree. The daemon speaks only the typed wire; the
-   legacy text dispatch, reply grammar and their tests are deleted.
-6. Close the engine: `pub use session::Session;` only; delete
-   `player_mut` and the transitional exports.
+The CLI writes no arrangement state itself; a `play` on an empty
+arrangement is refused rather than silently finishing.
 
 ## Version policy
 
-Breaking surface changes bump the minor (0.2.x). The text grammar is
-replanned freely within 0.2; when it stabilizes, 0.3 would only carry
-additive text/command changes.
+Breaking surface changes bump the minor (0.2.x). The engine and the `bo`
+lib are frozen for the rest of 0.2; clients and the binary face are
+replanned freely. The snapshot format is versioned (`SNAPSHOT_VERSION`),
+so future formats can change shape without guessing.
