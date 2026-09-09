@@ -20,7 +20,7 @@ pub mod session;
 pub mod timeline;
 
 use bo_core::bus::{Bus, BusRef, Group};
-use bo_core::command::{Command, Error, Inserted, Outcome, Overlap, PlacedClip, Played, Routed};
+use bo_core::command::{Command, Error, Inserted, Outcome, Overlap, PlacedClip, Played, RouteBus, Routed};
 use bo_core::track::{Clip, Fade, Source, Track};
 
 /// Why a backend could not do what it was told: data, shared with the
@@ -661,24 +661,40 @@ pub fn exec<B: Backend>(player: &mut Player<B>, command: Command) -> Result<Outc
                 landed,
             }))
         }
-        Command::NewBus { name } => {
-            let id = player.add_group(name);
-            Ok(Outcome::Bus { id })
-        }
         Command::Route { track, bus } => {
+            // Resolve the track first, so a bad index creates no stray bus.
             if track >= player.tracks().len() {
                 return Err(Error::NoTrack(track));
             }
-            if let BusRef::Group(id) = bus
-                && player.group(id).is_none()
-            {
-                return Err(Error::NoBus(id));
-            }
-            player.tracks_mut()[track].set_bus(bus);
+            let target = match bus {
+                RouteBus::Master => BusRef::Master,
+                RouteBus::Group(id) => {
+                    if player.group(id).is_none() {
+                        return Err(Error::NoBus(id));
+                    }
+                    BusRef::Group(id)
+                }
+                RouteBus::New { name } => {
+                    if let Some(name) = &name {
+                        if name == "master" {
+                            return Err(Error::Bus("'master' is reserved for the master bus".into()));
+                        }
+                        if let Some(other) = player.groups().iter().find(|g| g.name() == Some(name.as_str()))
+                        {
+                            return Err(Error::Bus(format!(
+                                "a bus named {name:?} already exists as #{}",
+                                other.id()
+                            )));
+                        }
+                    }
+                    BusRef::Group(player.add_group(name))
+                }
+            };
+            player.tracks_mut()[track].set_bus(target);
             // Routing is structure: no running graph can take it, so it
             // lands at the next apply's rebuild.
             let landed = player.changed(Change::Structure);
-            Ok(Outcome::Routed(Routed { track, bus, landed }))
+            Ok(Outcome::Routed(Routed { track, bus: target, landed }))
         }
         Command::Play => {
             player.play().map_err(Error::Backend)?;

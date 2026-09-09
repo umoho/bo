@@ -3,7 +3,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use bo_core::command::{Applied, Command, Error, Inserted, Landed, Outcome};
+use bo_core::command::{Applied, Command, Error, Inserted, Landed, Outcome, RouteBus};
 use bo_engine::{exec, Player, Silent};
 
 fn write_test_wav(path: &Path, seconds: f32) {
@@ -234,7 +234,7 @@ fn exec_routes_tracks_into_buses() {
     // A route to a missing track or bus is refused, no trace.
     match exec(
         &mut p,
-        Command::Route { track: 9, bus: BusRef::Group(0) },
+        Command::Route { track: 9, bus: RouteBus::Group(0) },
     )
     .unwrap_err()
     {
@@ -243,7 +243,7 @@ fn exec_routes_tracks_into_buses() {
     }
     match exec(
         &mut p,
-        Command::Route { track: 0, bus: BusRef::Group(7) },
+        Command::Route { track: 0, bus: RouteBus::Group(7) },
     )
     .unwrap_err()
     {
@@ -252,28 +252,50 @@ fn exec_routes_tracks_into_buses() {
     }
     assert_eq!(p.tracks()[0].bus(), BusRef::Master, "refusals leave no trace");
 
-    // NewBus creates and names; route joins; structure lands at apply.
-    let Outcome::Bus { id } = exec(&mut p, Command::NewBus { name: Some("music".into()) }).unwrap()
-    else {
-        panic!("expected a bus id");
-    };
-    assert_eq!(id, 0);
+    // A first-mention New routes and creates; structure lands at apply.
     let Outcome::Routed(routed) = exec(
         &mut p,
-        Command::Route { track: 0, bus: BusRef::Group(id) },
+        Command::Route {
+            track: 0,
+            bus: RouteBus::New { name: Some("music".into()) },
+        },
     )
     .unwrap()
     else {
         panic!("expected Routed");
     };
+    assert_eq!(routed.bus, BusRef::Group(0));
     assert_eq!(routed.landed, Landed::Pending);
     assert_eq!(p.tracks()[0].bus(), BusRef::Group(0));
     assert!(!p.groups()[0].muted());
+    assert_eq!(p.groups()[0].name(), Some("music"));
+
+    // A duplicate name is refused, leaving the routing untouched.
+    match exec(
+        &mut p,
+        Command::Route { track: 0, bus: RouteBus::New { name: Some("music".into()) } },
+    )
+    .unwrap_err()
+    {
+        Error::Bus(msg) => assert!(msg.contains("already exists"), "{msg}"),
+        other => panic!("expected a bus-name error, got {other:?}"),
+    }
+    assert_eq!(p.groups().len(), 1, "no stray bus");
+
+    // Routing into the fresh group by id joins the same bus.
+    let Outcome::Routed(_) = exec(
+        &mut p,
+        Command::Route { track: 0, bus: RouteBus::Group(0) },
+    )
+    .unwrap()
+    else {
+        panic!("expected Routed");
+    };
 
     // Back to the master.
     let Outcome::Routed(routed) = exec(
         &mut p,
-        Command::Route { track: 0, bus: BusRef::Master },
+        Command::Route { track: 0, bus: RouteBus::Master },
     )
     .unwrap()
     else {

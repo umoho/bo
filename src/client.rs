@@ -37,10 +37,10 @@ use crate::connection::Connection;
 
 // The command protocol, shared with the engine and the daemon.
 pub use bo_core::command::{
-    Applied, Command, Error, Inserted, Landed, Outcome, Overlap, PlacedClip, Played, Reply,
-    Routed,
+    Applied, Command, Error, Inserted, Landed, Outcome, Overlap, PlacedClip, Played, Reply, Routed,
 };
 pub use bo_core::bus::BusRef;
+use bo_core::command::RouteBus;
 
 /// A timecode: a point in time, parsed from the lenient forms the whole
 /// tool speaks — `SS`, `MM:SS` or `HH:MM:SS` with an optional `.fff`
@@ -244,13 +244,15 @@ impl From<(usize, Duration)> for TrackPosition {
     }
 }
 
-/// A bus to route into: the master, or a group bus by its stable id.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A bus to route into: the master, an existing group bus, or a fresh one.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BusIndex {
     /// The master bus — routing a track here sends it back out.
     Master,
-    /// A group bus, by the id [`Bo::new_bus`] returned.
+    /// A group bus that already exists, by id.
     Group(u64),
+    /// A fresh group bus ([`NewBus`]).
+    New(NewBus),
 }
 
 impl BusIndex {
@@ -273,12 +275,29 @@ impl From<u64> for BusIndex {
     }
 }
 
-impl From<BusIndex> for BusRef {
-    fn from(bus: BusIndex) -> Self {
-        match bus {
-            BusIndex::Master => BusRef::Master,
-            BusIndex::Group(id) => BusRef::Group(id),
-        }
+/// A fresh group bus to create and route into on its first mention, named
+/// or not — the CLI's `route <track> <name>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewBus(Option<String>);
+
+impl NewBus {
+    /// A fresh group bus named `name` (unique, never `master`).
+    #[must_use]
+    pub fn with_name(name: impl Into<String>) -> Self {
+        Self(Some(name.into()))
+    }
+}
+
+impl Default for NewBus {
+    /// A fresh, unnamed group bus.
+    fn default() -> Self {
+        Self(None)
+    }
+}
+
+impl From<NewBus> for BusIndex {
+    fn from(bus: NewBus) -> Self {
+        Self::New(bus)
     }
 }
 
@@ -385,26 +404,22 @@ impl Bo {
         }
     }
 
-    /// Create a group bus (named, when a name is given) and return its id.
-    pub fn new_bus(&mut self, name: Option<&str>) -> Result<u64, Error> {
-        match self.exec(Command::NewBus {
-            name: name.map(str::to_string),
-        })? {
-            Outcome::Bus { id } => Ok(id),
-            other => Err(unexpected(&other)),
-        }
-    }
-
-    /// Route a track's output into a bus — a group bus, or back to the
-    /// master. Structure: it lands at the next `apply`.
+    /// Route a track's output into a bus — the master, an existing group
+    /// bus, or a fresh one ([`NewBus`], created and routed on its first
+    /// mention). Structure: it lands at the next `apply`.
     pub fn route(
         &mut self,
         track: TrackIndex,
-        to: BusIndex,
+        to: impl Into<BusIndex>,
     ) -> Result<Routed, Error> {
+        let bus = match to.into() {
+            BusIndex::Master => RouteBus::Master,
+            BusIndex::Group(id) => RouteBus::Group(id),
+            BusIndex::New(bus) => RouteBus::New { name: bus.0 },
+        };
         match self.exec(Command::Route {
             track: track.0,
-            bus: to.into(),
+            bus,
         })? {
             Outcome::Routed(routed) => Ok(routed),
             other => Err(unexpected(&other)),

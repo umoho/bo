@@ -112,13 +112,11 @@ pub enum Command {
         at: Duration,
         track: usize,
     },
-    /// Create a group bus (named, when a name is given) and return its id.
-    NewBus {
-        name: Option<String>,
-    },
     /// Route a track's output into a bus — a group bus, or back to the
-    /// master. Structure: it lands at the next `apply`.
-    Route { track: usize, bus: BusRef },
+    /// master; a [`RouteBus::New`] creates the group on its first mention
+    /// (the CLI's `route <track> <name>`). Structure: it lands at the next
+    /// `apply`.
+    Route { track: usize, bus: RouteBus },
     /// Start playback from the current playhead.
     Play,
     /// Hold position and silence output.
@@ -166,6 +164,18 @@ pub enum Applied {
     NotPlaying,
 }
 
+/// Where a route sends a track: an existing bus, or a new group bus.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "bus", rename_all = "snake_case")]
+pub enum RouteBus {
+    /// The master bus — route back out.
+    Master,
+    /// A group bus that already exists, by id.
+    Group(u64),
+    /// A fresh group bus, named by `name` (the CLI's first-mention create).
+    New { name: Option<String> },
+}
+
 /// What a route did, echoed ([`Command::Route`]).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Routed {
@@ -182,8 +192,6 @@ pub struct Routed {
 pub enum Outcome {
     /// A clip was inserted ([`Command::Insert`]).
     Inserted(Inserted),
-    /// A group bus was created ([`Command::NewBus`]).
-    Bus { id: u64 },
     /// A track was routed ([`Command::Route`]).
     Routed(Routed),
     /// Playback started ([`Command::Play`]).
@@ -310,8 +318,8 @@ pub enum Error {
     NoTrack(usize),
     /// A command addressed a group bus that does not exist.
     NoBus(u64),
-    /// A command addressed a bus whose name is reserved.
-    BusName(String),
+    /// A bus-name rule was refused ('master' reserved, a duplicate name).
+    Bus(String),
     /// An open-ended insert whose source could not be measured.
     Probe { uri: String, why: String },
     /// The placement collided with a resident clip.
@@ -329,7 +337,7 @@ impl fmt::Display for Error {
             Self::Parse(msg) => f.write_str(msg),
             Self::NoTrack(track) => write!(f, "no track {track}"),
             Self::NoBus(id) => write!(f, "no bus {id}"),
-            Self::BusName(name) => write!(f, "'{name}' is reserved for the master bus"),
+            Self::Bus(msg) => f.write_str(msg),
             Self::Probe { uri, why } => write!(f, "cannot measure {uri}: {why}"),
             Self::Overlap(overlap) => write!(f, "{overlap}"),
             Self::Backend(err) => write!(f, "{err}"),

@@ -7,7 +7,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use bo::client::{Bo, BusRef, Clip, Error, Landed, TimecodeRange, TrackIndex};
+use bo::client::{Bo, BusIndex, BusRef, Clip, Error, Landed, TimecodeRange, TrackIndex};
 use bo::connection::Connection;
 
 fn temp_dir() -> PathBuf {
@@ -221,14 +221,12 @@ fn transport_verbs_round_trip_through_the_daemon() {
 
 #[test]
 fn buses_and_routing_round_trip_through_the_daemon() {
-    use bo::client::{BusIndex, TrackIndex};
+    use bo::client::{NewBus, TrackIndex};
     let dir = temp_dir();
     let socket = dir.join("d.sock");
     let _daemon = spawn_daemon(&socket);
 
     let mut bo = Bo::with_connection(Connection::at(&socket));
-    let id = bo.new_bus(Some("music")).expect("a fresh bus");
-    assert_eq!(id, 0);
 
     bo.put(
         Clip::of("a.wav").trim(TimecodeRange::from((Duration::ZERO, Duration::from_secs(10)))),
@@ -237,8 +235,8 @@ fn buses_and_routing_round_trip_through_the_daemon() {
     .unwrap();
 
     let routed = bo
-        .route(TrackIndex(0), BusIndex::group(id))
-        .expect("route joins the group");
+        .route(TrackIndex(0), NewBus::with_name("music"))
+        .expect("first mention creates and routes");
     assert_eq!(routed.bus, BusRef::Group(0));
     assert_eq!(routed.landed, Landed::Pending, "structure waits for apply");
 
