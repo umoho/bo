@@ -1,157 +1,156 @@
 # bo
 
-> An audio editor, mixer, and player for agents. Build tracks, place clips,
-> tune the mix, then play it live or render it to a file — from a Python
-> script, a Rust program, or the shell. Not a DAW yet, but this is the shape
-> one would grow from.
+An audio editing and mixing engine for automated agents. `bo` maintains an
+arrangement — clips placed on stacked tracks, routed into buses — inside a
+persistent daemon session, and exposes that session through a typed
+command protocol. Clients in Rust and Python issue arrangement verbs;
+the bundled command-line front end provides transport control and
+snapshot restore.
 
 [English](README.md) | [中文](README.zh-CN.md)
 
-**bo** is a command-driven audio engine. You describe a session — clips
-placed on stacked tracks, each clip a slice of an audio source — tune it,
-and hear the result through `play` (your sound device) or `render`
-(offline, to a wav file). There is no project file: the arrangement lives
-in a daemon session and is written out as a **snapshot** (`save`) and
-rebuilt from it (`load`).
+## Architecture
 
-## Two faces, one session
+Execution is centralized. The engine is the single executor of
+`Session::exec(Command)`; the data model and the command vocabulary live
+in `bo-core`. All clients reach the same daemon over a Unix socket and
+share one arrangement per socket.
 
-The engine and the data model are the spine; everything above them speaks
-a typed command wire to the same daemon, so every face shares one
-arrangement per socket.
-
-* **Code is the editor.** Arrangement verbs — placing, taking, moving,
-  routing, patching, rendering — live in typed clients:
-  * **Python**: [`pybo`](py/) (a pyo3 extension, managed with uv). See the
-    [quick start](#quick-start-python) below.
-  * **Rust**: `bo::client::Bo` in this crate.
-* **The shell is the transport.** The mini CLI keeps what a terminal is
-  for — audition and restore:
-  ```console
-  $ bo play | pause | resume | seek <t> | stop | load <snapshot.bo>
-  ```
-
-The daemon is spawned on demand by whichever client first touches a
-socket (`$TMPDIR/bo/daemon.sock` by default; `--socket` or `socket=...`
-for another), and cleans up after itself when playback finishes, on
-`stop`, or after `BO_IDLE_TIMEOUT` seconds of silence (default 600; `0`
-disables). It exits and removes its socket when done.
-
-## Quick start (Python)
-
-```python
-import pybo
-
-bo = pybo.Bo()                                  # the shared daemon
-bo.put(pybo.trim("voice.wav", "0:30-1:00"),     # a slice of a source
-       pybo.Track(0).at("0:00"))                # on track 0 at the start
-bo.put("bed.wav", pybo.Track(1).at("0:00"))     # a whole source (probed)
-bo.route(on=1, bus="music")                     # several tracks under one bus
-bo.route(on=0, bus="music")
-bo.set("bus.0.volume", 0.35)                    # one knob ducks the whole bus
-bo.set("track.0.volume", 0.4)
-bo.get("track.1")                               # read the tree back
-bo.render("mix.wav")
-bo.save("show.bo")                              # a snapshot for later
+```
+engine          Session: executes commands, drives transport and backends
+daemon (bin)    hosts a Session; speaks typed JSON over a Unix socket;
+                records command history and performs snapshot operations
+bo lib          bo::client::Bo: typed client over the daemon wire
+pybo            Python binding (pyo3, managed by uv) of the Bo surface
+mini CLI        bo play|pause|resume|seek|stop|load <snapshot>
 ```
 
-Times are one dialect everywhere: `Timecode(1.23)` and `Timecode("1.23")`
-are 1.23 seconds, `Timecode("1:02.5")` is a minute and change, and
-`str(t)` is `HH:MM:SS.fff`. Durations in replies and the tree are whole
-milliseconds. A `put` of a whole source is probed (its end resolved)
-where the arrangement lives; a closed `trim(...)` span touches no disk
-until it plays or renders. Errors are typed (`pybo.BoError`).
+The engine's public surface is `Session`. The daemon is the only consumer
+of the engine in this repository; arrangement edits never bypass the
+command path.
 
-Restore and audition from the shell:
+## Interfaces
+
+### Clients (arrangement editing)
+
+Arrangement verbs are issued from code, where control flow and computed
+decisions belong:
+
+- **Python** — [`pybo`](py/), a pyo3 extension built with uv. It binds the
+  `Bo` surface and its value types. Times are accepted as seconds or
+  lenient text and rendered as `HH:MM:SS.fff`; wire durations are whole
+  milliseconds.
+- **Rust** — `bo::client::Bo` in this crate.
+
+The full verb set is `put`, `take`, `move`, `route`, `set`, `get`,
+`render`, `reset`, `apply`, the transport verbs, and the snapshot trio
+`save`/`load`/`check`. Structure is edited exclusively through these
+verbs; the arrangement is read and patched through `get`/`set`.
+
+### Command-line front end
+
+The shell interface is restricted to operations that a terminal performs
+well: auditioning and restoring a session.
 
 ```console
-$ bo load show.bo
-ok: loaded 'show.bo'
-$ bo play
-ok: 2 tracks, 2 clips, ends 00:01:00.000, playing from 00:00:00.000
-$ bo stop
-ok: stopped
+$ bo play | pause | resume | seek <t> | stop | load <snapshot.bo>
 ```
 
-Exit codes: `0` ok, `1` refused, `2` usage. The arrangement verbs that
-were once text commands — `put`, `ls`, `set`, `render`, `save`, … — are
-now client calls; `bo help` documents the shell surface.
+Exit codes: `0` success, `1` refused operation, `2` usage error.
 
-## The model
+## Session lifecycle
 
-* **Source → Clip → Track**: a clip is a `from..to` slice of a source
-  parked at a track timecode (`at`); tracks never overlap their own clips
-  and stack across the mix. Ids are stable per track and never reused.
-* **A source is a gesture** — a curve, an LFO or a sidechain plugs into a
-  clip's pan or gain input (`track.N.clips.M.pan_control` /
-  `gain_control`):
-  `{"type":"curve","0":1,"3.2":-1}`, `{"type":"lfo","shape":"sine",
-  "rate":1,"depth":0.5}`, `{"type":"sidechain","bus":"group.0"}` — the
-  parameter rides the static base plus the source, identically live and
-  rendered.
-* **Group buses**: `route` several tracks into one bus; one strip
-  (volume, mute) controls the group before the master hears them — a
-  radio music bus or voice bus.
-* **Read/write as a tree**: `get("")` returns the whole arrangement
-  (tracks, clips, buses, transport) as JSON; `set("track.0", …)` deep
-  patches the state zone. Structure is edited by the verbs only.
+The daemon is spawned on demand by the first client that addresses a
+socket (`$TMPDIR/bo/daemon.sock` by default; override with `--socket` or
+`socket=`). It terminates and removes its socket when playback finishes,
+on `stop`, or after `BO_IDLE_TIMEOUT` seconds without commands while idle
+(default 600; `0` disables). Relative source paths and render targets are
+resolved against the working directory of the invoking process.
 
-## Editing while it plays
+## Time model
 
-A gain, a fade, a pan or a mute lands on the running mix as it is set; a
-clip placed past a track's queue joins it. What a running graph cannot
-take — a clip taken or moved, a re-route — waits (`landed: pending`) for
-an `apply`, which rebuilds from where the audio really is.
+All surfaces speak one time dialect. `Timecode` accepts seconds
+(`1.23`), lenient text (`SS`, `MM:SS`, `HH:MM:SS`, optional `.fff`
+fraction), and formats canonically as `HH:MM:SS.fff`. Durations in
+replies and in the arrangement tree are whole milliseconds.
+
+A `put` of a whole source is probed at the session (its end is resolved
+by decoding); a `trim` with a closed span does not access the source
+until playback or render.
+
+## Data model
+
+- **Source → Clip → Track.** A clip is a `from..to` slice of a source
+  positioned at a track timecode (`at`). Clips on one track do not
+  overlap; tracks stack in the mix. Clip identifiers are stable per track
+  and never reused.
+- **Control sources.** A curve, an LFO, or a sidechain may be connected
+  to a clip's pan or gain input (`track.N.clips.M.pan_control`,
+  `track.N.clips.M.gain_control`). The parameter is the static base plus
+  the sum of its sources, evaluated identically in live playback and
+  offline render.
+- **Group buses.** `route` directs a track's output into a group bus; a
+  single strip (volume, mute) controls the group before the signal
+  reaches the master.
+- **Reading and writing the arrangement.** `get("")` returns the full
+  arrangement as JSON (tracks, clips, buses, transport). `set(path, …)`
+  applies a deep patch to the state zone. Structural membership is not
+  patchable; it is modified through the verbs.
+
+## Editing semantics
+
+State edits (gain, fades, pan, mute) are applied to a running mix as they
+are issued. Clips appended past the end of a track's queue join that
+queue immediately. Edits a running graph cannot express — removing or
+moving a clip, rerouting — are held pending and take effect at the next
+`apply`, which rebuilds the graph from the current playback position.
 
 ## Snapshots
 
-A snapshot (`save`) is the session's own command history plus its
-playhead: a versioned, replayable script. `load` stages it atomically — a
-failing snapshot leaves the session untouched — and `check` validates a
-snapshot file without touching the session.
+A snapshot is the session's own command history plus its playhead: a
+versioned, replayable script. `save` writes it; `load` stages it on a
+silent session first, so a failing snapshot leaves the current session
+untouched, then commits atomically; `check` validates a snapshot file
+without modifying the session.
 
-## Layout
+## Repository layout
 
 ```
-core/      model units: Command/Outcome, the tree, timecode text
-engine/    the only executor: Session::exec over a transport/backend
-bo lib     client::Bo over a Connection (daemon wire); frozen for 0.2
-src/cli.rs the mini CLI (transport + load)
-src/daemon.rs  the daemon: JSON wire in, JSON wire out, host-level snapshots
-py/        pybo: pyo3 binding of the Bo surface (uv + maturin)
+core/         data model and command vocabulary
+engine/       Session: the single executor; nothing else is public
+bo lib        client::Bo over a Connection (daemon wire)
+src/cli.rs    mini command-line front end (transport and load)
+src/daemon.rs daemon: typed JSON wire, host-level snapshots
+py/           pybo: pyo3 binding of the Bo surface (uv + maturin)
+scripts/      install.sh / uninstall.sh
 ```
 
-## Install
+## Installation
 
-Requires **Rust 1.88+** for the engine, CLI and daemon; **uv** for the
-Python binding.
-
-Install both faces for this machine:
+Prerequisites: **Rust 1.88+** for the engine, the daemon, and the CLI;
+**uv** for the Python binding.
 
 ```console
-$ ./scripts/install.sh      # bo CLI/daemon (cargo install) + pybo (Python)
-$ ./scripts/uninstall.sh    # the reverse
+$ ./scripts/install.sh      # installs the bo binary (cargo install) and pybo
+$ ./scripts/uninstall.sh    # removes both
 ```
 
-`bo` lands in `~/.cargo/bin`. pybo is built as one abi3 wheel (Python
-≥ 3.10, any CPython) and installed into `$BO_PYTHON`, the active
-virtualenv, or `python3` — add `BO_PIP_BREAK=1` when that interpreter
-refuses pip operations (PEP 668). The bo binary must be on `PATH` for
-pybo to spawn its daemon; an installed `bo` is enough.
+`bo` is installed to `~/.cargo/bin`. `pybo` is built as a single abi3
+wheel (Python ≥ 3.10) and installed into `$BO_PYTHON`, the active
+virtualenv, or `python3`. If the target interpreter is externally managed
+(PEP 668), set `BO_PIP_BREAK=1`. The `bo` binary must be reachable on
+`PATH` for `pybo` to spawn its daemon.
 
-Or build from the checkout directly:
+To build from the checkout instead:
 
 ```console
-$ cargo build --release          # the bo CLI/daemon
-$ cd py && uv sync               # pybo into .venv
-$ uv run pytest                  # pybo's test suite
+$ cargo build --release
+$ cd py && uv sync
+$ uv run pytest
 ```
 
-The Python host finds the daemon binary by itself (this checkout's
-`target/…/bo`, then `PATH`), so a script needs no setup beyond an import.
-
-Set `BO_BACKEND=silent` for deterministic headless sessions and CI;
-without an audio device the daemon falls back to silence with a note.
+`BO_BACKEND=silent` selects a deterministic headless backend for tests
+and CI; without an audio device the daemon falls back to silence.
 
 ## License
 
