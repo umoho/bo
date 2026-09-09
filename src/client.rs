@@ -1,14 +1,15 @@
-//! The command surface as a library: a [`Bo`] session you drive with typed
-//! calls.
+//! The command surface as a library: [`Bo`], the typed client you drive.
 //!
 //! The CLI speaks one command per invocation to a long-running daemon; this
 //! module is the same vocabulary in process. [`Bo`] owns the arrangement and
 //! the transport (like the daemon does) and each method is one command —
 //! place a clip with [`Bo::put`], tune it, play it, render it.
 //!
-//! A [`Bo`] is its own session, born stopped and empty on the silent
-//! backend, so nothing needs a sound device. Make it audible with
-//! [`Bo::with_backend`] and a real backend.
+//! A [`Bo`] is born stopped and empty on the silent backend, so nothing
+//! needs a sound device. Make it audible with [`Bo::with_backend`] and a
+//! real backend. (When a [`session::Session`] — the daemon on its Unix
+//! socket — arrives, `Bo` will attach to one instead of owning the
+//! arrangement itself; this in-process form stays as the process session.)
 //!
 //! # Placing a clip
 //!
@@ -21,14 +22,14 @@
 //! until play or render.
 //!
 //! ```no_run
-//! use bo::session::{Bo, Slice, TrackRef};
+//! use bo::client::{Bo, Slice, TrackRef};
 //! use std::time::Duration;
 //!
 //! let mut bo = Bo::new();
 //! // The 1:00–2:00 window of the file, on track 0 at 30 s in:
 //! let put = bo.put("bed.wav", "1:00-2:00".parse()?, TrackRef(0).at(Duration::from_secs(30)))?;
 //! assert_eq!(put.track, 0);
-//! # Ok::<(), bo::session::Error>(())
+//! # Ok::<(), bo::client::Error>(())
 //! ```
 
 use std::fmt;

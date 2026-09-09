@@ -21,14 +21,14 @@
 //!   answers *where the sound goes*; it holds no content.
 //! * [`engine`] — [`engine::Player`]: transport state over stacked tracks,
 //!   with an [`engine::Backend`] seam for whatever actually makes sound.
-//! * [`session`] — the command surface as a library: a [`session::Bo`] you
+//! * [`client`] — the command surface as a library: a [`client::Bo`] you
 //!   drive with typed calls, the CLI's verbs without the daemon.
 //! * [`time`] — the timecode text both layers speak: a lenient
 //!   `SS`/`MM:SS`/`HH:MM:SS` parse and the canonical `HH:MM:SS.fff` form.
 
 pub mod bus;
+pub mod client;
 pub mod time;
 pub mod control;
 pub mod engine;
-pub mod session;
 pub mod track;
