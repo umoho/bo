@@ -16,6 +16,7 @@ use std::time::Duration;
 
 pub mod measure;
 pub mod rodio;
+pub mod session;
 pub mod timeline;
 
 use bo_core::bus::{Bus, Group};

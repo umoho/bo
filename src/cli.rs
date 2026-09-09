@@ -128,9 +128,10 @@ use std::time::{Duration, Instant};
 use bo::bus::{BusRef, Group};
 use bo::engine::rodio::{
     measure, probe, probe_sources, render_and_measure, render_and_measure_mono, render_to_file,
-    render_to_file_mono, Probing, Rodio, SourceLength,
+    render_to_file_mono, Probing, SourceLength,
 };
-use bo::engine::{Applied, Backend, BackendError, Change, Landed, Player, Silent, State};
+use bo::engine::{Applied, Change, Landed, Player, State};
+use bo::engine::session::Runtime;
 use bo::control::ControlSource;
 use bo::track::{Clip, Fade, FadeShape, Source, Track};
 use clap::error::ErrorKind;
@@ -330,7 +331,7 @@ struct Spec {
 /// daemon's runtime backend.
 #[derive(Debug)]
 struct Arrangement {
-    player: Player<AnyBackend>,
+    player: Player<Runtime>,
     /// `BO_IDLE_TIMEOUT` seconds, set by the daemon at startup (default
     /// 600, `0` disables). Reported on `ls` so a quiet session cannot
     /// silently time out.
@@ -339,110 +340,15 @@ struct Arrangement {
 
 impl Default for Arrangement {
     fn default() -> Self {
-        Self::with_backend(AnyBackend::silent())
+        Self::with_backend(Runtime::silent())
     }
 }
 
 impl Arrangement {
-    fn with_backend(backend: AnyBackend) -> Self {
+    fn with_backend(backend: Runtime) -> Self {
         Self {
             player: Player::new(backend),
             idle_timeout: 600,
-        }
-    }
-}
-
-/// The daemon's runtime backend: real audio when the device opened, silence
-/// otherwise (forced by `BO_BACKEND=silent`, or when no device exists).
-#[derive(Debug)]
-enum AnyBackend {
-    /// Headless. The `String` is why, when a device was wanted but absent.
-    Silent(Silent, Option<String>),
-    /// Real audio.
-    Rodio(Rodio),
-}
-
-impl AnyBackend {
-    /// The forced/test backend.
-    fn silent() -> Self {
-        Self::Silent(Silent::default(), None)
-    }
-
-    /// What the daemon should use at startup: rodio unless `BO_BACKEND=silent`
-    /// says otherwise, falling back to silence when no device can be opened.
-    fn for_daemon() -> Self {
-        if std::env::var("BO_BACKEND").as_deref() == Ok("silent") {
-            return Self::silent();
-        }
-        match Rodio::try_new() {
-            Ok(rodio) => Self::Rodio(rodio),
-            Err(e) => Self::Silent(Silent::default(), Some(format!("no audio device: {e}"))),
-        }
-    }
-
-    fn name(&self) -> &'static str {
-        match self {
-            Self::Silent(..) => "silent",
-            Self::Rodio(..) => "rodio",
-        }
-    }
-
-    /// Why playback is silent, when it is a fallback rather than a choice.
-    fn note(&self) -> Option<&str> {
-        match self {
-            Self::Silent(_, note) => note.as_deref(),
-            Self::Rodio(..) => None,
-        }
-    }
-}
-
-impl Backend for AnyBackend {
-    fn play(&mut self, tracks: &[Track], groups: &[Group], at: Duration) -> Result<(), BackendError> {
-        match self {
-            Self::Silent(backend, _) => backend.play(tracks, groups, at),
-            Self::Rodio(backend) => backend.play(tracks, groups, at),
-        }
-    }
-
-    fn pause(&mut self) {
-        match self {
-            Self::Silent(backend, _) => backend.pause(),
-            Self::Rodio(backend) => backend.pause(),
-        }
-    }
-
-    fn resume(&mut self) {
-        match self {
-            Self::Silent(backend, _) => backend.resume(),
-            Self::Rodio(backend) => backend.resume(),
-        }
-    }
-
-    fn stop(&mut self) {
-        match self {
-            Self::Silent(backend, _) => backend.stop(),
-            Self::Rodio(backend) => backend.stop(),
-        }
-    }
-
-    fn set_volume(&mut self, volume: f32) {
-        match self {
-            Self::Silent(backend, _) => backend.set_volume(volume),
-            Self::Rodio(backend) => backend.set_volume(volume),
-        }
-    }
-
-    fn land(&mut self, tracks: &[Track], at: Duration, change: &Change) -> bool {
-        match self {
-            Self::Silent(backend, _) => backend.land(tracks, at, change),
-            Self::Rodio(backend) => backend.land(tracks, at, change),
-        }
-    }
-
-    fn position(&self) -> Option<Duration> {
-        match self {
-            Self::Silent(backend, _) => backend.position(),
-            Self::Rodio(backend) => backend.position(),
         }
     }
 }
@@ -1528,7 +1434,7 @@ fn route_command(a: &mut Arrangement, track: usize, bus: &str) -> Result<Output,
 }
 
 /// The id of the group bus named `name`, when one exists.
-fn group_named(player: &Player<AnyBackend>, name: &str) -> Option<u64> {
+fn group_named(player: &Player<Runtime>, name: &str) -> Option<u64> {
     player
         .groups()
         .iter()
@@ -2551,7 +2457,7 @@ fn connect_or_spawn(socket: &Path) -> Result<UnixStream, String> {
 /// The daemon: bind the socket, serve commands, advance the clock, and exit
 /// (cleaning up the socket) when playback finishes or is stopped.
 fn daemon_main(socket: &Path) -> i32 {
-    daemon_main_with(socket, AnyBackend::for_daemon())
+    daemon_main_with(socket, Runtime::open())
 }
 
 /// The idle timeout from `BO_IDLE_TIMEOUT` seconds (default 600; 0 disables):
@@ -2567,7 +2473,7 @@ fn idle_timeout() -> Duration {
 
 /// The daemon over a specific backend; tests pass a silent one so no audio
 /// device is ever opened.
-fn daemon_main_with(socket: &Path, backend: AnyBackend) -> i32 {
+fn daemon_main_with(socket: &Path, backend: Runtime) -> i32 {
     if let Some(parent) = socket.parent()
         && let Err(e) = std::fs::create_dir_all(parent)
     {
@@ -2728,7 +2634,7 @@ fn json_reply(reply: &bo_core::command::Reply) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bo::engine::{BackendEvent, State};
+    use bo::engine::{BackendEvent, Silent, State};
     use rodio::Source as _;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -3134,7 +3040,7 @@ mod tests {
 
     #[test]
     fn play_reports_a_silent_fallback_note() {
-        let mut a = Arrangement::with_backend(AnyBackend::Silent(
+        let mut a = Arrangement::with_backend(Runtime::Silent(
             Silent::default(),
             Some("no audio device: x".to_string()),
         ));
@@ -3309,12 +3215,12 @@ mod tests {
     /// How many times the backend was asked to plan a mix.
     fn plays(a: &Arrangement) -> usize {
         match a.player.backend() {
-            AnyBackend::Silent(s, _) => s
+            Runtime::Silent(s, _) => s
                 .events
                 .iter()
                 .filter(|e| **e == BackendEvent::Play)
                 .count(),
-            AnyBackend::Rodio(_) => unreachable!("tests use the silent backend"),
+            Runtime::Rodio(_) => unreachable!("tests use the silent backend"),
         }
     }
 
@@ -3531,7 +3437,7 @@ mod tests {
         let socket = dir.join("d.sock");
         let handle = {
             let socket = socket.clone();
-            thread::spawn(move || daemon_main_with(&socket, AnyBackend::silent()))
+            thread::spawn(move || daemon_main_with(&socket, Runtime::silent()))
         };
         wait_until("socket", || UnixStream::connect(&socket).is_ok());
 
@@ -3952,7 +3858,7 @@ mod tests {
         // daemon's audio backend with a bare silent one — the next play
         // reported "backend silent" and made no sound. The backend's note
         // is the marker: a real daemon carries it (or rodio itself).
-        let mut a = Arrangement::with_backend(AnyBackend::Silent(
+        let mut a = Arrangement::with_backend(Runtime::Silent(
             Silent::default(),
             Some("no audio device: x".to_string()),
         ));
@@ -4170,7 +4076,7 @@ mod tests {
 
         let handle = {
             let socket = socket.clone();
-            thread::spawn(move || daemon_main_with(&socket, AnyBackend::silent()))
+            thread::spawn(move || daemon_main_with(&socket, Runtime::silent()))
         };
         wait_until("socket", || UnixStream::connect(&socket).is_ok());
 
