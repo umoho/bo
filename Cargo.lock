@@ -111,11 +111,22 @@ dependencies = [
 name = "bo"
 version = "0.1.0"
 dependencies = [
+ "bo-core",
  "clap",
  "hound",
  "rodio",
  "serde_json",
  "shlex",
+ "tempfile",
+]
+
+[[package]]
+name = "bo-core"
+version = "0.1.0"
+dependencies = [
+ "hound",
+ "rodio",
+ "serde_json",
  "tempfile",
 ]
 

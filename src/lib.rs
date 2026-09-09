@@ -1,37 +1,18 @@
-//! `bo` — an audio editor and mixer for agents.
+//! `bo` — an audio editor and mixer for agents, as a library.
 //!
-//! One command per action, from a shell or driven by an agent: build a
-//! session out of stacked tracks, each holding clips that slice an audio
-//! source; tune the mix; then audition it live or render it offline. Not a
-//! DAW yet — but this data model is the spine a CLI DAW would grow from.
+//! The data model and engine live in [`bo_core`] (re-exported here, so
+//! `bo::track` still reads as before). This crate adds the two surfaces on
+//! top of that spine:
 //!
-//! Three modules, split along the one seam the model keeps clean:
-//!
-//! * [`track`] — the content layer: [`track::Source`] → [`track::Clip`] →
-//!   [`track::Track`], slices of audio sources laid on non-overlapping
-//!   timelines. Content answers *what* plays and *when*; it holds no signal
-//!   state.
-//! * [`control`] — the control sources that modulate a clip's parameters as
-//!   they play: the curve, the LFO and the sidechain, each one serializable
-//!   JSON object (its text form, the registry [`control::ControlSource`]).
-//! * [`bus`] — the signal layer: [`bus::Output`] (a track's edge into the
-//!   mix, carrying gain, mute and placement) and the bus nodes it feeds —
-//!   the master ([`bus::Bus`]) and the group buses ([`bus::Group`]) several
-//!   tracks can be routed into so one strip ducks them together. Signal
-//!   answers *where the sound goes*; it holds no content.
-//! * [`engine`] — [`engine::Player`]: transport state over stacked tracks,
-//!   with an [`engine::Backend`] seam for whatever actually makes sound.
-//! * [`client`] — the typed client on a session: [`client::Bo`] puts clips
-//!   and tunes a session like the CLI does, minus the reply grammar.
 //! * [`session`] — a session: today the daemon on its Unix socket, spawned
 //!   on demand, speaking a typed JSON wire ([`session::Session`]).
-//! * [`time`] — the timecode text both layers speak: a lenient
-//!   `SS`/`MM:SS`/`HH:MM:SS` parse and the canonical `HH:MM:SS.fff` form.
+//! * [`client`] — the typed client on a session: [`client::Bo`] puts clips
+//!   and tunes a session like the CLI does, minus the reply grammar.
+//!
+//! The binary crate in this package (`bo` on the command line) is the text
+//! front-end and, for now, the daemon's home.
 
-pub mod bus;
+pub use bo_core::{bus, control, engine, time, track};
+
 pub mod client;
-pub mod time;
-pub mod control;
-pub mod engine;
 pub mod session;
-pub mod track;
