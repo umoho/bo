@@ -37,17 +37,17 @@ grammar is being replanned onto it.
 
 | text (planned)        | Command | Outcome | status |
 |---|---|---|---|
-| `put uri[,from-to] [trk[@at]]` | `Insert { uri, from, to?, at, track }` | `Inserted { track, clip, landed }` | done |
+| `put …` | `Insert { uri, from, to?, on: OnTrack }` | `Inserted { track, clip, landed }` | done |
 | `play` / `pause` / `resume` / `seek t` / `stop` / `apply` | same-name commands | `Played` / `Paused{at}` / … / `Applied` | done |
-| `take trk clip`        | `Remove { track, id }` | `Removed { track, clip, landed }` | new |
-| `move trk clip trk2@at2` | `Move { from_track, id, to_track, at }` | `Moved { … }` | new |
-| `route trk bus`        | `Route { track, bus }` (name → group id in engine) | `Routed { … }` | new |
-| `set <path> <value>`   | `Set { path, value }` — state zone, patch | `Set { path, value, landed }` | new |
-| `render file [range]`  | `Render { file?, range?, measure?, mono? }` | `Rendered { duration, stats? }` | new |
-| `probe uri`            | `Probe { uri }` | `Probed { length, channels }` | new |
-| `ls` / `at t`          | `Get { path }` | tree JSON | new |
+| `take …`        | `Remove { track, clip: ClipHere }` | `Removed { track, clip, landed }` | done |
+| `move …` | `Move { track, clip: ClipHere, to: OnTrack }` | `Moved { from_track, to_track, clip, landed }` | done |
+| `route …`        | `Route { track, bus: RouteBus }` (Master/Group/New) | `Routed { track, bus, landed }` | done |
+| `ls` / `at t`          | `Get { path }` | tree JSON | in progress |
+| `set <path> <value>`   | `Set { path, value }` — state zone, patch | `Set { path, value, landed }` | next |
+| `render file [range]`  | `Render { file?, range?, measure?, mono? }` | `Rendered { duration, stats? }` | next |
+| `probe uri`            | `Probe { uri }` | `Probed { length, channels }` | next |
 | `check`                | revisit: `Check` over sources | — | design |
-| `save`/`load`          | snapshot: `Get` whole tree ↔ `Set`/structure replay | — | design |
+| `save`/`load`          | snapshot: `Get` whole tree ↔ replay | — | design |
 
 ## Set / Get — the arrangement as a tree
 
