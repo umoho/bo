@@ -23,7 +23,7 @@ pub mod timeline;
 
 use bo_core::bus::{Bus, BusRef, Group, Placement};
 use bo_core::control::ControlSource;
-use bo_core::command::{ClipHere, Command, Error, Inserted, Moved, OnTrack, Outcome, Overlap, PlacedClip, Played, Removed, RouteBus, Routed, Set};
+use bo_core::command::{ClipHere, Command, Error, Inserted, Moved, OnTrack, Outcome, Overlap, PlacedClip, Played, Probed, Removed, Rendered, RouteBus, Routed, Set};
 use bo_core::track::{Clip, Fade, Source, Track};
 
 /// Why a backend could not do what it was told: data, shared with the
@@ -824,6 +824,36 @@ pub fn exec<B: Backend>(player: &mut Player<B>, command: Command) -> Result<Outc
             let (patched, landed) = apply_patch(player, &path, &patcher)?;
             Ok(Outcome::Set(Set { path, patched, landed }))
         }
+        Command::Probe { uri } => {
+            let probing = crate::rodio::measure(&uri)
+                .map_err(|why| Error::Probe { uri: uri.clone(), why })?;
+            Ok(Outcome::Probed(Probed {
+                uri,
+                length_ms: ms_of(probing.length.duration()),
+                estimated: matches!(
+                    probing.length,
+                    crate::rodio::SourceLength::Estimated(_)
+                ),
+                channels: probing.channels,
+            }))
+        }
+        Command::Render { file, from, to } => {
+            let path = std::path::PathBuf::from(&file);
+            let from = from.unwrap_or_default();
+            let duration = rodio::render_to_file(
+                player.tracks(),
+                player.groups(),
+                &path,
+                from,
+                to,
+                player.volume(),
+            )
+            .map_err(Error::Render)?;
+            Ok(Outcome::Rendered(Rendered {
+                file,
+                duration_ms: ms_of(duration),
+            }))
+        }
         Command::Play => {
             player.play().map_err(Error::Backend)?;
             Ok(Outcome::Played(Played {
@@ -1240,6 +1270,11 @@ fn arrangement_tree(player: &Player<impl Backend>) -> Value {
         "track": tracks,
         "bus": buses,
     })
+}
+
+/// A duration as whole milliseconds.
+fn ms_of(d: Duration) -> u64 {
+    d.as_secs() * 1000 + u64::from(d.subsec_millis())
 }
 
 /// Descend a dotted path (`track.0.clips.1.gain`) through a tree value.

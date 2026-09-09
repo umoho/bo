@@ -2610,8 +2610,11 @@ fn handle_json(state: &Mutex<Arrangement>, line: &str, cwd: &str) -> (i32, Strin
             )
         }
     };
-    if let bo_core::command::Command::Insert { uri, .. } = &mut command {
-        *uri = absolutize(uri, cwd);
+    match &mut command {
+        bo_core::command::Command::Insert { uri, .. }
+        | bo_core::command::Command::Probe { uri, .. } => *uri = absolutize(uri, cwd),
+        bo_core::command::Command::Render { file, .. } => *file = absolutize(file, cwd),
+        _ => {}
     }
     let mut a = state.lock().unwrap();
     let reply = match bo::engine::exec(&mut a.player, command) {

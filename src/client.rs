@@ -37,7 +37,7 @@ use crate::connection::Connection;
 
 // The command protocol, shared with the engine and the daemon.
 pub use bo_core::command::{
-    Applied, Command, Error, Inserted, Landed, Moved, Outcome, Overlap, PlacedClip, Played, Removed, Reply, Routed, Set,
+    Applied, Command, Error, Inserted, Landed, Moved, Outcome, Overlap, PlacedClip, Played, Probed, Removed, Rendered, Reply, Routed, Set,
 };
 pub use bo_core::bus::BusRef;
 use bo_core::command::{ClipHere, OnTrack, RouteBus};
@@ -491,6 +491,23 @@ impl Bo {
             patcher,
         })? {
             Outcome::Set(set) => Ok(set),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// Measure a source: its length and channel count.
+    pub fn probe(&mut self, uri: &str) -> Result<Probed, Error> {
+        match self.exec(Command::Probe { uri: uri.to_string() })? {
+            Outcome::Probed(probed) => Ok(probed),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// Mix the arrangement to a wav file at `file`.
+    pub fn render(&mut self, file: impl AsRef<std::path::Path>) -> Result<Rendered, Error> {
+        let file = file.as_ref().to_string_lossy().into_owned();
+        match self.exec(Command::Render { file, from: None, to: None })? {
+            Outcome::Rendered(rendered) => Ok(rendered),
             other => Err(unexpected(&other)),
         }
     }

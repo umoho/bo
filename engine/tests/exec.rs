@@ -729,3 +729,56 @@ fn exec_set_patches_clip_pan_and_controls() {
         other => panic!("expected Value, got {other:?}"),
     }
 }
+
+#[test]
+fn exec_probes_and_renders() {
+    let mut p = player();
+    let uri = src("a.wav"); // a real 0.5 s mono wav
+    exec(
+        &mut p,
+        insert(&uri, Duration::ZERO, Duration::from_secs_f64(0.5), Duration::ZERO, 0),
+    )
+    .unwrap();
+
+    let Outcome::Probed(probed) = exec(&mut p, Command::Probe { uri: uri.clone() }).unwrap()
+    else {
+        panic!("expected Probed")
+    };
+    assert_eq!(probed.length_ms, 500);
+    assert_eq!(probed.channels, 1);
+    assert!(!probed.estimated, "a wav header states its length");
+
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out.wav");
+    let file = out.to_string_lossy().into_owned();
+    let Outcome::Rendered(rendered) = exec(
+        &mut p,
+        Command::Render { file: file.clone(), from: None, to: None },
+    )
+    .unwrap()
+    else {
+        panic!("expected Rendered")
+    };
+    assert_eq!(rendered.duration_ms, 500);
+    assert!(std::fs::metadata(&out).unwrap().len() > 0, "the wav was written");
+
+    // A clip whose source is dead refuses the render.
+    exec(
+        &mut p,
+        insert("no-such-source.wav", Duration::ZERO, Duration::from_secs(1), Duration::ZERO, 1),
+    )
+    .unwrap();
+    match exec(
+        &mut p,
+        Command::Render {
+            file: dir.path().join("bad.wav").to_string_lossy().into_owned(),
+            from: None,
+            to: None,
+        },
+    )
+    .unwrap_err()
+    {
+        Error::Render(msg) => assert!(msg.contains("no-such-source"), "{msg}"),
+        other => panic!("expected a render refusal, got {other:?}"),
+    }
+}

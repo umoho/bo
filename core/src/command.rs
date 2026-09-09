@@ -146,6 +146,16 @@ pub enum Command {
     /// Patch the arrangement's state zone: a leaf scalar, or a merge over a
     /// strip ([`Set`]). Structure is edited by the other verbs only.
     Set { path: String, patcher: Value },
+    /// Measure a source: its length and channel count.
+    Probe { uri: String },
+    /// Mix the arrangement — or a range of it — to a wav file.
+    Render {
+        file: String,
+        #[serde(with = "ms_opt")]
+        from: Option<Duration>,
+        #[serde(with = "ms_opt")]
+        to: Option<Duration>,
+    },
     /// Start playback from the current playhead.
     Play,
     /// Hold position and silence output.
@@ -269,6 +279,29 @@ pub struct Moved {
     pub landed: Landed,
 }
 
+/// What probing learned, echoed ([`Command::Probe`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Probed {
+    /// The measured source.
+    pub uri: String,
+    /// Its length, whole milliseconds.
+    pub length_ms: u64,
+    /// Whether the length was estimated by decoding rather than stated by
+    /// the container.
+    pub estimated: bool,
+    /// Interleaved channels per frame.
+    pub channels: u16,
+}
+
+/// What a render produced, echoed ([`Command::Render`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Rendered {
+    /// Where the wav went.
+    pub file: String,
+    /// How long the rendered range is.
+    pub duration_ms: u64,
+}
+
 /// The result of a [`Command`], as data.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Outcome {
@@ -282,6 +315,10 @@ pub enum Outcome {
     Tree(serde_json::Value),
     /// The arrangement was patched ([`Command::Set`]).
     Set(Set),
+    /// A source was measured ([`Command::Probe`]).
+    Probed(Probed),
+    /// A range was rendered ([`Command::Render`]).
+    Rendered(Rendered),
     /// A track was routed ([`Command::Route`]).
     Routed(Routed),
     /// Playback started ([`Command::Play`]).
@@ -414,6 +451,8 @@ pub enum Error {
     Path(String),
     /// A patch value was refused (type, range, an unknown key).
     Value(String),
+    /// A render was refused.
+    Render(String),
     /// A bus-name rule was refused ('master' reserved, a duplicate name).
     Bus(String),
     /// An open-ended insert whose source could not be measured.
@@ -436,6 +475,7 @@ impl fmt::Display for Error {
             Self::NoClip(what) => write!(f, "no clip {what}"),
             Self::Path(path) => write!(f, "no such path {path:?}"),
             Self::Value(msg) => f.write_str(msg),
+            Self::Render(msg) => f.write_str(msg),
             Self::Bus(msg) => f.write_str(msg),
             Self::Probe { uri, why } => write!(f, "cannot measure {uri}: {why}"),
             Self::Overlap(overlap) => write!(f, "{overlap}"),
