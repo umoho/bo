@@ -1,6 +1,6 @@
 [package]
 name = "bo-core"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "bo's data model — the structures the engine, the daemon and the client are all built on"
 keywords = ["audio", "daw", "cli", "agent", "mixer"]

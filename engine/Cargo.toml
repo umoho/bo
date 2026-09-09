@@ -1,6 +1,6 @@
 [package]
 name = "bo-engine"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "bo's engine — the actual execution on top of the data model: transport, backends, playback and render"
 keywords = ["audio", "daw", "cli", "agent", "mixer"]
