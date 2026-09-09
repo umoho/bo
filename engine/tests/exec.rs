@@ -48,8 +48,7 @@ fn insert(uri: &str, from: Duration, to: Duration, at: Duration, track: usize) -
         uri: uri.to_string(),
         from,
         to: Some(to),
-        at,
-        on: OnTrack::Track(track),
+        on: OnTrack::Track { index: track, at },
     }
 }
 
@@ -59,8 +58,10 @@ fn insert_open(uri: &str, track: usize) -> Command {
         uri: uri.to_string(),
         from: Duration::ZERO,
         to: None,
-        at: Duration::ZERO,
-        on: OnTrack::Track(track),
+        on: OnTrack::Track {
+            index: track,
+            at: Duration::ZERO,
+        },
     }
 }
 
@@ -179,8 +180,7 @@ fn exec_insert_on_a_fresh_track_uses_the_playhead() {
             uri: uri.clone(),
             from: Duration::ZERO,
             to: Some(Duration::from_secs(2)),
-            at: Duration::ZERO, // ignored for a fresh track
-            on: OnTrack::New,
+            on: OnTrack::New { at: None },
         },
     )
     .unwrap();
@@ -196,13 +196,13 @@ fn exec_insert_on_a_fresh_track_uses_the_playhead() {
             uri,
             from: Duration::ZERO,
             to: Some(Duration::from_secs(2)),
-            at: Duration::ZERO,
-            on: OnTrack::New,
+            on: OnTrack::New { at: Some(Duration::from_secs(7)) },
         },
     )
     .unwrap();
     let put = inserted_outcome(outcome);
     assert_eq!(put.track, 1);
+    assert_eq!(put.clip.at, Duration::from_secs(7), "a fresh track honors an explicit at");
 }
 
 #[test]

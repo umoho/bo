@@ -245,13 +245,13 @@ impl From<(usize, Duration)> for TrackPosition {
 }
 
 /// Where a clip lands: on an existing track at a timecode, or on a fresh
-/// one (at the playhead) — the CLI's bare `put`.
+/// one — the CLI's bare `put` (or `put uri @pos`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PutOn {
     /// An existing track at a timecode.
     Track(TrackPosition),
-    /// A fresh track, appended; the clip lands at the playhead.
-    NewTrack,
+    /// A fresh track, appended ([`NewTrack`]).
+    NewTrack(NewTrack),
 }
 
 impl From<TrackPosition> for PutOn {
@@ -261,19 +261,33 @@ impl From<TrackPosition> for PutOn {
 }
 
 impl From<NewTrack> for PutOn {
-    fn from(_: NewTrack) -> Self {
-        Self::NewTrack
+    fn from(track: NewTrack) -> Self {
+        Self::NewTrack(track)
     }
 }
 
-/// A fresh track for a clip ([`PutOn::NewTrack`]) — the marker type so
-/// `put(clip, NewTrack::default())` reads like the CLI's bare `put`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NewTrack;
+/// A fresh track for a clip ([`PutOn::NewTrack`]). `default()` lands at the
+/// playhead (the CLI's bare `put`); [`NewTrack::at`] places it at a time —
+/// the CLI's `put uri @pos`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewTrack {
+    /// Where on the timeline the fresh track's clip lands; `None` = the
+    /// playhead.
+    pub at: Option<Timecode>,
+}
+
+impl NewTrack {
+    /// A fresh track whose clip lands at `at`.
+    #[must_use]
+    pub fn at(at: impl Into<Timecode>) -> Self {
+        Self { at: Some(at.into()) }
+    }
+}
 
 impl Default for NewTrack {
+    /// A fresh track; the clip lands at the playhead.
     fn default() -> Self {
-        Self
+        Self { at: None }
     }
 }
 
@@ -377,17 +391,16 @@ impl Bo {
     /// [`Inserted::landed`].
     pub fn put(&mut self, clip: Clip, to: impl Into<PutOn>) -> Result<Inserted, Error> {
         let Clip { uri, from, to: to_in } = clip;
-        let (at, on) = match to.into() {
-            PutOn::Track(position) => (position.at, OnTrack::Track(position.track)),
-            PutOn::NewTrack => (Duration::ZERO, OnTrack::New),
+        let on = match to.into() {
+            PutOn::Track(position) => OnTrack::Track {
+                index: position.track,
+                at: position.at,
+            },
+            PutOn::NewTrack(track) => OnTrack::New {
+                at: track.at.map(Timecode::duration),
+            },
         };
-        match self.exec(Command::Insert {
-            uri,
-            from,
-            to: to_in,
-            at,
-            on,
-        })? {
+        match self.exec(Command::Insert { uri, from, to: to_in, on })? {
             Outcome::Inserted(inserted) => Ok(inserted),
             other => Err(unexpected(&other)),
         }
@@ -511,15 +524,16 @@ mod tests {
             uri: clip.uri,
             from: clip.from,
             to: clip.to,
-            at: to.at,
-            on: OnTrack::Track(to.track),
+            on: OnTrack::Track { index: to.track, at: to.at },
         };
         assert_eq!(cmd, Command::Insert {
             uri: "a.wav".to_string(),
             from: Duration::ZERO,
             to: Some(Duration::from_secs(5)),
-            at: Duration::from_secs(9),
-            on: OnTrack::Track(3),
+            on: OnTrack::Track {
+                index: 3,
+                at: Duration::from_secs(9),
+            },
         });
     }
 }

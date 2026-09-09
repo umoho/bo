@@ -225,8 +225,7 @@ mod tests {
                 uri: "a.wav".to_string(),
                 from: Duration::ZERO,
                 to: Some(Duration::from_secs(10)),
-                at: Duration::ZERO,
-                on: OnTrack::Track(0),
+                on: OnTrack::Track { index: 0, at: Duration::ZERO },
             })
             .unwrap()
         else {

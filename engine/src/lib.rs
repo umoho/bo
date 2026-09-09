@@ -601,13 +601,7 @@ impl<B: Backend> Player<B> {
 /// the arrangement exactly as it was.
 pub fn exec<B: Backend>(player: &mut Player<B>, command: Command) -> Result<Outcome, Error> {
     match command {
-        Command::Insert {
-            uri,
-            from,
-            to,
-            at,
-            on,
-        } => {
+        Command::Insert { uri, from, to, on } => {
             // An open end plays to the source's end; resolve that end now,
             // so every clip has a known finite length and none can silently
             // block its track. Same refusal the CLI makes.
@@ -619,17 +613,17 @@ pub fn exec<B: Backend>(player: &mut Player<B>, command: Command) -> Result<Outc
                 })?,
             };
             // Resolve the track: by index (created on demand like the
-            // CLI's), or a fresh one — whose clip lands at the playhead.
+            // CLI's), or a fresh one — at the given time, or the playhead.
             let (track, at) = match on {
-                OnTrack::Track(i) => {
-                    while player.tracks().len() <= i {
+                OnTrack::Track { index, at } => {
+                    while player.tracks().len() <= index {
                         player.add_track(Track::new());
                     }
-                    (i, at)
+                    (index, at)
                 }
-                OnTrack::New => {
+                OnTrack::New { at } => {
                     let i = player.add_track(Track::new());
-                    (i, player.playhead())
+                    (i, at.unwrap_or_else(|| player.playhead()))
                 }
             };
             let clip = Clip::sliced(Arc::new(Source::new(&uri)), from, to)

@@ -99,17 +99,14 @@ pub enum Landed {
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Command {
     /// Insert a clip into a track, like the model's `Track::insert`: the
-    /// `from .. to` span of source `uri` is placed on `on` at track-time
-    /// `at` (`at` is the playhead for [`OnTrack::New`]). `to: None` means
-    /// the source's end, resolved by probing when the command runs.
+    /// `from .. to` span of source `uri` is placed on `on`. `to: None`
+    /// means the source's end, resolved by probing when the command runs.
     Insert {
         uri: String,
         #[serde(with = "ms")]
         from: Duration,
         #[serde(with = "ms_opt")]
         to: Option<Duration>,
-        #[serde(with = "ms")]
-        at: Duration,
         on: OnTrack,
     },
     /// Route a track's output into a bus — a group bus, or back to the
@@ -134,13 +131,22 @@ pub enum Command {
     Apply,
 }
 
-/// Which track a clip lands on: an existing one, or a fresh one.
+/// Which track a clip lands on: an existing one at a timecode, or a fresh
+/// one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OnTrack {
-    /// The track with this index, grown to fit if it does not exist.
-    Track(usize),
-    /// A fresh track, appended — the clip lands at the playhead.
-    New,
+    /// The track with this index (grown to fit if it does not exist), at
+    /// this track time.
+    Track {
+        index: usize,
+        #[serde(with = "ms")]
+        at: Duration,
+    },
+    /// A fresh track, appended — at `at`, or the playhead when `None`.
+    New {
+        #[serde(with = "ms_opt")]
+        at: Option<Duration>,
+    },
 }
 
 /// What playback is about to play ([`Command::Play`]).
@@ -387,8 +393,10 @@ mod tests {
             uri: "bed.wav".to_string(),
             from: Duration::from_secs(60),
             to: Some(Duration::from_secs(120)),
-            at: Duration::from_millis(30_000),
-            on: OnTrack::Track(2),
+            on: OnTrack::Track {
+                index: 2,
+                at: Duration::from_millis(30_000),
+            },
         };
         let text = serde_json::to_string(&cmd).unwrap();
         assert_eq!(
