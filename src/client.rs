@@ -545,6 +545,26 @@ impl Bo {
         Ok(snapshot)
     }
 
+    /// Read and validate a snapshot at `path` without touching the session:
+    /// the daemon stages the history and reports every problem. Refuses
+    /// versions this build does not read.
+    pub fn check(&mut self, path: impl AsRef<std::path::Path>) -> Result<(), Error> {
+        let text = std::fs::read_to_string(path.as_ref())
+            .map_err(|e| Error::Value(format!("cannot read {}: {e}", path.as_ref().display())))?;
+        let snapshot: Snapshot = serde_json::from_str(&text)
+            .map_err(|e| Error::Value(format!("bad snapshot {}: {e}", path.as_ref().display())))?;
+        if snapshot.version != SNAPSHOT_VERSION {
+            return Err(Error::Version(format!(
+                "snapshot version {} — this build reads {}",
+                snapshot.version, SNAPSHOT_VERSION
+            )));
+        }
+        match self.exec(Command::Check { snapshot })? {
+            Outcome::Checked => Ok(()),
+            other => Err(unexpected(&other)),
+        }
+    }
+
     /// Replace the session from a snapshot at `path`, atomically: the
     /// history is staged by the daemon, so a failing script leaves the
     /// session untouched. Refuses versions this build does not read.

@@ -2630,6 +2630,33 @@ fn handle_json(state: &Mutex<Arrangement>, line: &str, cwd: &str) -> (i32, Strin
             Ok(()) => bo_core::command::Reply::Ok(bo_core::command::Outcome::Loaded),
             Err(e) => bo_core::command::Reply::Err(e),
         },
+        Cmd::Check { snapshot } => {
+            use bo_core::command::Error;
+            if snapshot.version != bo_core::command::SNAPSHOT_VERSION {
+                return (
+                    0,
+                    json_reply(&bo_core::command::Reply::Err(Error::Version(format!(
+                        "snapshot version {} — this build reads {}",
+                        snapshot.version,
+                        bo_core::command::SNAPSHOT_VERSION
+                    )))),
+                    false,
+                );
+            }
+            let mut staged = Arrangement::default();
+            let mut problems = Vec::new();
+            for (i, command) in snapshot.history.iter().enumerate() {
+                if let Err(e) = bo::engine::exec(&mut staged.player, command.clone()) {
+                    problems.push(format!("#{} {}", i + 1, e));
+                }
+            }
+            let reply = if problems.is_empty() {
+                bo_core::command::Reply::Ok(bo_core::command::Outcome::Checked)
+            } else {
+                bo_core::command::Reply::Err(Error::Check(problems.join("\n")))
+            };
+            return (0, json_reply(&reply), false);
+        }
         _ => {
             match &mut command {
                 Cmd::Insert { uri, .. } => *uri = absolutize(uri, cwd),

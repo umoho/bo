@@ -153,6 +153,9 @@ pub enum Command {
     /// Replace the arrangement from a snapshot, atomically: the history is
     /// staged first, so a failing script leaves the session untouched.
     Load { snapshot: Snapshot },
+    /// Validate a snapshot without touching the session: the history is
+    /// staged and every failure reported.
+    Check { snapshot: Snapshot },
     /// Patch the arrangement's state zone: a leaf scalar, or a merge over a
     /// strip ([`Set`]). Structure is edited by the other verbs only.
     Set { path: String, patcher: Value },
@@ -354,6 +357,8 @@ pub enum Outcome {
     Snapshot(Snapshot),
     /// An arrangement was loaded ([`Command::Load`]).
     Loaded,
+    /// A snapshot validated clean ([`Command::Check`]).
+    Checked,
     /// A track was routed ([`Command::Route`]).
     Routed(Routed),
     /// Playback started ([`Command::Play`]).
@@ -492,6 +497,8 @@ pub enum Error {
     Version(String),
     /// A host-level command reached the engine (it is handled by the host).
     Host(String),
+    /// A snapshot failed validation; the message lists every problem.
+    Check(String),
     /// A bus-name rule was refused ('master' reserved, a duplicate name).
     Bus(String),
     /// An open-ended insert whose source could not be measured.
@@ -517,6 +524,7 @@ impl fmt::Display for Error {
             Self::Render(msg) => f.write_str(msg),
             Self::Version(msg) => f.write_str(msg),
             Self::Host(msg) => f.write_str(msg),
+            Self::Check(msg) => write!(f, "check failed:\n{msg}"),
             Self::Bus(msg) => f.write_str(msg),
             Self::Probe { uri, why } => write!(f, "cannot measure {uri}: {why}"),
             Self::Overlap(overlap) => write!(f, "{overlap}"),

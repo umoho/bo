@@ -372,3 +372,46 @@ fn save_and_load_round_trip_through_the_daemon() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn check_validates_a_snapshot_file() {
+    let dir = temp_dir();
+    let socket = dir.join("d.sock");
+    let _daemon = spawn_daemon(&socket);
+
+    let mut bo = Bo::with_connection(Connection::at(&socket));
+    let snap = dir.join("ok.bo");
+    bo.put(
+        Clip::of("a.wav").trim(TimecodeRange::from((Duration::ZERO, Duration::from_secs(10)))),
+        TrackIndex(0).at(Duration::ZERO),
+    )
+    .unwrap();
+    bo.save(&snap).unwrap();
+    bo.check(&snap).unwrap();
+
+    // An overlapping second insert makes the snapshot invalid.
+    let mut bad = serde_json::from_str::<serde_json::Value>(
+        &std::fs::read_to_string(&snap).unwrap(),
+    )
+    .unwrap();
+    let mut history = bad["history"].as_array().unwrap().clone();
+    history.push(serde_json::json!({
+        "cmd": "insert",
+        "uri": "a.wav",
+        "from": 0,
+        "to": 5000,
+        "on": { "Track": { "index": 0, "at": 0 } },
+    }));
+    bad["history"] = serde_json::Value::Array(history);
+    let file = dir.join("bad.bo");
+    std::fs::write(&file, bad.to_string()).unwrap();
+    match bo.check(&file) {
+        Err(Error::Check(msg)) => assert!(msg.contains("#2"), "{msg}"),
+        other => panic!("expected a Check error, got {other:?}"),
+    }
+    // Check never touched the session.
+    let tree = bo.get("").unwrap();
+    assert_eq!(tree["track"][0]["clips"].as_array().unwrap().len(), 1);
+
+    std::fs::remove_dir_all(&dir).ok();
+}

@@ -897,7 +897,7 @@ pub fn exec<B: Backend>(player: &mut Player<B>, command: Command) -> Result<Outc
         }
         // Host-level: the daemon (which logs the history) intercepts these
         // before the engine sees them; reaching here is a host bug.
-        Command::Snapshot | Command::Load { .. } => {
+        Command::Snapshot | Command::Load { .. } | Command::Check { .. } => {
             Err(Error::Host("snapshot commands are handled by the host".into()))
         }
     }
