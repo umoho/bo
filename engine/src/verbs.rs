@@ -9,8 +9,8 @@ use std::sync::Arc;
 use bo_core::command::{Error, Overlap, PlacedClip, Put, Slice, TrackPos};
 use bo_core::track::{Clip, Fade, Source, Track};
 
-use crate::engine::rodio::probe;
-use crate::engine::{Backend, Change, Player};
+use crate::rodio::probe;
+use crate::{Backend, Change, Player};
 
 /// Place a clip into a player-owned arrangement: the `from..to` window
 /// `slice` of source `uri`, on `on.track` at track-time `on.at`.
@@ -81,7 +81,7 @@ pub fn put_on<B: Backend>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::{Landed, Player, Silent};
+    use crate::{Landed, Player, Silent};
     use std::path::Path;
     use std::time::Duration;
 

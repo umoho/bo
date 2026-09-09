@@ -38,9 +38,9 @@ use rodio::source::from_factory;
 use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink, Player, Sample, Source};
 
 use bo_core::bus::{BusRef, Group};
-use crate::engine::measure::{Measurement, Meter};
-use crate::engine::timeline::{ClipPlan, Timeline};
-use crate::engine::{Backend, BackendError, Change};
+use crate::measure::{Measurement, Meter};
+use crate::timeline::{ClipPlan, Timeline};
+use crate::{Backend, BackendError, Change};
 use bo_core::control::ControlSource;
 use bo_core::track::{Fade, Track};
 
@@ -1891,7 +1891,7 @@ pub fn probe_sources(tracks: &[Track]) -> Vec<(String, Result<Probing, String>)>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::Player;
+    use crate::Player;
     use bo_core::control::{Curve, Keyframe, Lfo, LfoShape, Sidechain};
     use bo_core::track::{Clip, Source, Track};
     use rodio::Source as _;

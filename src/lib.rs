@@ -15,7 +15,7 @@
 //! the text front-end and, for now, the daemon's home.
 
 pub use bo_core::{bus, control, time, track};
-pub use bo_engine::engine;
+pub use bo_engine as engine;
 
 pub mod client;
 pub mod session;
