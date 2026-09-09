@@ -43,7 +43,15 @@ PIP_BREAK=()
 if [ "${BO_PIP_BREAK:-0}" = 1 ]; then
   PIP_BREAK=(--break-system-packages)
 fi
-"$PY" -m pip install --force-reinstall --no-deps "${PIP_BREAK[@]+"${PIP_BREAK[@]}"}" "$WHEEL"
-"$PY" -c "import pybo; print('== pybo', pybo.version(), 'importable from', '$PY')"
+if "$PY" -m pip install --force-reinstall --no-deps "${PIP_BREAK[@]+"${PIP_BREAK[@]}"}" "$WHEEL"; then
+  "$PY" -c "import pybo; print('== pybo', pybo.version(), 'importable from', '$PY')"
+else
+  echo >&2
+  echo "error: pip refused to install pybo into $PY — that interpreter is externally" >&2
+  echo "managed (PEP 668). Choose one:" >&2
+  echo "  - install into a virtual environment:  uv venv && uv pip install $WHEEL" >&2
+  echo "  - accept the risk on this interpreter:  BO_PIP_BREAK=1 $0" >&2
+  exit 1
+fi
 
 echo "== done. Try: bo --help  /  $PY -c 'import pybo'  —  uninstall: ./scripts/uninstall.sh =="
