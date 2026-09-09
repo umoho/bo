@@ -147,9 +147,11 @@ fn connect_or_spawn(socket: &PathBuf) -> Result<UnixStream, String> {
 ///    connection at the real `bo` binary;
 /// 2. the current executable, when it is the `bo` CLI itself (`bo`, or
 ///    `bo.exe` on Windows);
-/// 3. a `bo` on `PATH`;
-/// 4. a `bo` built in this checkout — `target/{debug,release}/bo` walking
-///    up from the working directory.
+/// 3. a `bo` built in this checkout — `target/{debug,release}/bo` walking
+///    up from the working directory (a host that runs from inside the repo
+///    must use the build it was just compiled with, not a stale `PATH`
+///    install);
+/// 4. a `bo` on `PATH` (the installed case).
 ///
 /// The last two are what let a host that is *not* the bo binary — a Python
 /// interpreter running pybo, an embedding host — spawn the daemon on demand
@@ -165,14 +167,6 @@ fn daemon_binary() -> Result<PathBuf, String> {
     {
         return Ok(exe);
     }
-    if let Some(paths) = env::var_os("PATH") {
-        for dir in env::split_paths(&paths) {
-            let candidate = dir.join(daemon_name());
-            if is_executable(&candidate) {
-                return Ok(candidate);
-            }
-        }
-    }
     if let Ok(cwd) = env::current_dir() {
         for dir in cwd.ancestors() {
             for profile in ["debug", "release"] {
@@ -180,6 +174,14 @@ fn daemon_binary() -> Result<PathBuf, String> {
                 if is_executable(&candidate) {
                     return Ok(candidate);
                 }
+            }
+        }
+    }
+    if let Some(paths) = env::var_os("PATH") {
+        for dir in env::split_paths(&paths) {
+            let candidate = dir.join(daemon_name());
+            if is_executable(&candidate) {
+                return Ok(candidate);
             }
         }
     }
