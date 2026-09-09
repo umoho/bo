@@ -47,7 +47,8 @@ grammar is being replanned onto it.
 | ~~`probe uri`~~ | removed — measurement is upstream tooling (Python / ffmpeg); engine still measures internally for open-end inserts | |
 | `render file [range]`  | `Render { file, from?, to? }` | `Rendered { file, duration_ms }` | done (range/measure/mono next) |
 | ~~`check`~~ | removed — source verification is upstream tooling too | |
-| `save`/`load`          | snapshot: `Get` whole tree ↔ replay | — | design |
+| `save`/`load` | `{version, history: [Command], playhead}` — daemon logs, load stages atomically | `Outcome::Snapshot/Loaded` | done |
+| `check <file>`  | dry-run validation of a `.bo` snapshot | `Outcome::Checked` / `Error::Check` | done |
 
 ## Set / Get — the arrangement as a tree
 
@@ -113,10 +114,13 @@ Per-command fold, each step green:
    engine. (done)
 3. tree `Get`/`Set` with deep patch; `ls`/`at`/`set` text become rendering
    of the tree. (engine done; the text surface is still the old one)
-4. `Probe`, `Render` (file/whole range) (done); `Render` range/measure/mono
-   still to wire; then revisit `check`/`save`/`load` as snapshot
-   round-trips of the tree.
-5. Close the engine: `pub use session::Session;` only; delete
+4. `Probe` dropped (upstream tooling); `Render` (file + trim/measure/mono)
+   done; `save`/`load`/`check` done as versioned command-log snapshots.
+5. **The CLI switches to the new API** (next): cli.rs becomes a thin
+   translator — parse text -> Command, go through bo::client::Bo, render
+   replies from Outcome/tree. The daemon speaks only the typed wire; the
+   legacy text dispatch, reply grammar and their tests are deleted.
+6. Close the engine: `pub use session::Session;` only; delete
    `player_mut` and the transitional exports.
 
 ## Version policy
