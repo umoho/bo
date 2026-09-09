@@ -132,9 +132,11 @@ use bo::engine::rodio::{
 };
 use bo::engine::{Applied, Backend, BackendError, Change, Landed, Player, Silent, State};
 use bo::control::ControlSource;
+use bo::client::put_on as put_on_session;
 use bo::track::{Clip, Fade, FadeShape, Source, Track};
 use clap::error::ErrorKind;
 use clap::{Parser, Subcommand};
+use serde_json::{json, Value};
 
 mod reply;
 
@@ -2663,8 +2665,13 @@ fn serve_loop(
 }
 
 /// One command over the wire: parse, dispatch, and frame the reply. The third
-/// value says whether this command ends the daemon's session.
+/// value says whether this command ends the daemon's session. A line that
+/// opens with `{` is the typed JSON protocol the session client speaks;
+/// anything else is the CLI's text grammar.
 fn handle_line(state: &Mutex<Arrangement>, line: &str, cwd: &str) -> (i32, String, bool) {
+    if line.trim_start().starts_with('{') {
+        return handle_json(state, line, cwd);
+    }
     let args = match tokenize(line) {
         Ok(args) => args,
         Err(e) => return (2, frame_err(&e), false),
@@ -2679,6 +2686,116 @@ fn handle_line(state: &Mutex<Arrangement>, line: &str, cwd: &str) -> (i32, Strin
         Ok(out) => (0, out.to_string(), ends_session),
         Err((code, msg)) => (code, frame_err(&msg), ends_session),
     }
+}
+
+/// One JSON command (the typed wire [`bo::session::Session`] speaks): run it
+/// against the same arrangement, answer one JSON object. The exit code stays
+/// `0` — success and refusal both live in the reply's `ok` field.
+fn handle_json(state: &Mutex<Arrangement>, line: &str, cwd: &str) -> (i32, String, bool) {
+    let v: Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        Err(e) => return (0, json_err("parse", &e.to_string()), false),
+    };
+    let mut a = state.lock().unwrap();
+    let out = match v.get("cmd").and_then(Value::as_str) {
+        Some("put") => json_put(&mut a, &v, cwd),
+        Some(other) => json_err("other", &format!("unknown cmd {other:?}")),
+        None => json_err("parse", "missing cmd"),
+    };
+    (0, out, false)
+}
+
+/// The typed `put`: shared [`put_on_session`] — the same implementation a
+/// process session would run — answering typed Put or typed Error.
+fn json_put(a: &mut Arrangement, v: &Value, cwd: &str) -> String {
+    let uri = v.get("uri").and_then(Value::as_str).unwrap_or_default();
+    let track = v.get("track").and_then(Value::as_u64).unwrap_or(0) as usize;
+    let from_ms = match v.get("from_ms").and_then(Value::as_u64) {
+        Some(ms) => ms,
+        None => return json_err("parse", "missing from_ms"),
+    };
+    let to_ms = v.get("to_ms").and_then(Value::as_u64);
+    let at_ms = v.get("at_ms").and_then(Value::as_u64).unwrap_or(0);
+    if uri.is_empty() {
+        return json_err("parse", "missing uri");
+    }
+    let uri = absolutize(uri, cwd);
+    let slice = bo::client::Slice {
+        from: Duration::from_millis(from_ms),
+        to: to_ms.map(Duration::from_millis),
+    };
+    let on = bo::client::TrackPos {
+        track,
+        at: Duration::from_millis(at_ms),
+    };
+    match put_on_session(&mut a.player, &uri, slice, on) {
+        Ok(put) => json!({
+            "ok": true,
+            "track": put.track,
+            "id": put.clip.id,
+            "uri": put.clip.uri,
+            "from_ms": ms_of(put.clip.from),
+            "to_ms": ms_of(put.clip.to),
+            "at_ms": ms_of(put.clip.at),
+            "landed": match put.landed {
+                Landed::Live => "live",
+                Landed::Pending => "pending",
+            },
+        })
+        .to_string(),
+        Err(e) => json_error(&e),
+    }
+}
+
+/// A typed error as the wire's `{ok:false, error:{kind,…}}` object.
+fn json_error(e: &bo::client::Error) -> String {
+    use bo::client::Error as ClientError;
+    match e {
+        ClientError::Overlap(o) => json!({
+            "ok": false,
+            "error": {
+                "kind": "overlap",
+                "track": o.track,
+                "at_ms": ms_of(o.at),
+                "conflict": o.conflict,
+                "conflict_at_ms": ms_of(o.conflict_at),
+                "conflict_end_ms": ms_of(o.conflict_end),
+                "next_free_ms": ms_of(o.next_free),
+                "message": o.to_string(),
+            },
+        })
+        .to_string(),
+        ClientError::Probe { uri, why } => json!({
+            "ok": false,
+            "error": {
+                "kind": "probe",
+                "uri": uri,
+                "why": why,
+                "message": format!("cannot measure {uri}: {why}"),
+            },
+        })
+        .to_string(),
+        ClientError::Parse(msg) => json_err("parse", msg),
+        other => json!({
+            "ok": false,
+            "error": { "kind": "other", "message": other.to_string() },
+        })
+        .to_string(),
+    }
+}
+
+/// `{ok:false, error:{kind, message}}`.
+fn json_err(kind: &str, message: &str) -> String {
+    json!({
+        "ok": false,
+        "error": { "kind": kind, "message": message },
+    })
+    .to_string()
+}
+
+/// A duration as whole milliseconds — the wire's exact unit.
+fn ms_of(d: Duration) -> u64 {
+    d.as_secs() * 1000 + u64::from(d.subsec_millis())
 }
 
 #[cfg(test)]

@@ -1,15 +1,9 @@
 //! The command surface as a library: [`Bo`], the typed client you drive.
 //!
-//! The CLI speaks one command per invocation to a long-running daemon; this
-//! module is the same vocabulary in process. [`Bo`] owns the arrangement and
-//! the transport (like the daemon does) and each method is one command —
-//! place a clip with [`Bo::put`], tune it, play it, render it.
-//!
-//! A [`Bo`] is born stopped and empty on the silent backend, so nothing
-//! needs a sound device. Make it audible with [`Bo::with_backend`] and a
-//! real backend. (When a [`session::Session`] — the daemon on its Unix
-//! socket — arrives, `Bo` will attach to one instead of owning the
-//! arrangement itself; this in-process form stays as the process session.)
+//! [`Bo`] is a handle on a [`session::Session`] — today, the daemon on its
+//! Unix socket, the same arrangement every `bo` invocation shares. Each
+//! method is one command, carrying the CLI's semantics without its reply
+//! grammar: place a clip with [`Bo::put`], then tune, play and render it.
 //!
 //! # Placing a clip
 //!
@@ -17,15 +11,15 @@
 //! manages — bo does not open or probe it unless it must), a [`Slice`] (the
 //! `from..to` window into that source, or the whole source), and a
 //! [`TrackPos`] (a track and a timecode). A clip with an open end (a slice
-//! whose `to` is `None`) is measured when it is put, because only decoding
-//! the source can say where it ends; a closed slice touches no disk at all
-//! until play or render.
+//! whose `to` is `None`) is measured where the arrangement lives, because
+//! only decoding the source can say where it ends; a closed slice touches no
+//! disk at all until play or render.
 //!
 //! ```no_run
 //! use bo::client::{Bo, Slice, TrackRef};
 //! use std::time::Duration;
 //!
-//! let mut bo = Bo::new();
+//! let mut bo = Bo::new();   // the default session: the shared daemon
 //! // The 1:00–2:00 window of the file, on track 0 at 30 s in:
 //! let put = bo.put("bed.wav", "1:00-2:00".parse()?, TrackRef(0).at(Duration::from_secs(30)))?;
 //! assert_eq!(put.track, 0);
@@ -37,47 +31,41 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::engine::rodio::probe;
-use crate::engine::{Backend, BackendError, Change, Landed, Player, Silent};
+use crate::engine::{Backend, BackendError, Change, Landed, Player};
+use crate::session::Session;
 use crate::time;
 use crate::track::{Clip, Fade, Source, Track};
 
-/// A session: an arrangement (stacked tracks of clips) and a transport.
+/// A typed client on a [`Session`]: the arrangement lives there, commands
+/// travel there, and the replies come back typed.
 ///
-/// [`Bo::new`] is a fresh session on the silent backend — deterministic,
-/// needs no device, and makes no sound; swap in a real backend (e.g.
-/// `engine::rodio::Rodio`) with [`Bo::with_backend`] to hear it.
-///
-/// Methods are the CLI verbs with the CLI's semantics, minus the reply
-/// grammar: an edit a running graph can take lands as it is made, one it
-/// cannot waits for the next `apply` — the [`Landed`] report says which.
+/// [`Bo::new`] is the default session — the daemon on
+/// `$TMPDIR/bo/daemon.sock`, spawned on demand — the same session the CLI
+/// speaks to, so a program and a shell can work one arrangement. Any other
+/// session (another socket, later a process) is [`Bo::with_session`].
 #[derive(Debug)]
-pub struct Bo<B: Backend = Silent> {
-    player: Player<B>,
+pub struct Bo {
+    session: Session,
 }
 
-impl Default for Bo<Silent> {
+impl Default for Bo {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Bo<Silent> {
-    /// A fresh, empty session: the silent backend, stopped at zero.
+impl Bo {
+    /// A client on the default session: the daemon on
+    /// `$TMPDIR/bo/daemon.sock`, spawned on demand.
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            player: Player::default(),
-        }
+        Self::with_session(Session::default())
     }
-}
 
-impl<B: Backend> Bo<B> {
-    /// A session that plays through `backend` (e.g. `rodio::Rodio::try_new()`).
+    /// A client on a session of your own.
     #[must_use]
-    pub fn with_backend(backend: B) -> Self {
-        Self {
-            player: Player::new(backend),
-        }
+    pub fn with_session(session: Session) -> Self {
+        Self { session }
     }
 
     /// Place a clip: the `from..to` window `slice` of source `uri`, on
@@ -85,85 +73,87 @@ impl<B: Backend> Bo<B> {
     ///
     /// A refused put — a slice with no end whose source cannot be measured,
     /// or a placement that collides with a resident clip — is an `Err` and
-    /// leaves the session exactly as it was.
-    ///
-    /// The track is grown to fit: `put(uri, slice, TrackRef(7).at(..))`
-    /// creates the missing tracks. A clip placed past the end of a running
-    /// track's queue joins that queue as it is placed; anything else waits
-    /// for an `apply` — see [`Put::landed`].
+    /// leaves the session exactly as it was. The track is grown to fit. A
+    /// clip placed past the end of a running track's queue joins that queue
+    /// as it is placed; anything else waits for an `apply` — see
+    /// [`Put::landed`].
     pub fn put(&mut self, uri: &str, slice: Slice, on: TrackPos) -> Result<Put, Error> {
-        // An open slice plays to the source's end; resolve that end now, so
-        // every clip has a known finite length and none can silently block
-        // its track. Same refusal the CLI makes.
-        let to = match slice.to {
-            Some(to) => to,
-            None => probe(uri).map_err(|why| Error::Probe {
-                uri: uri.to_string(),
-                why,
-            })?,
-        };
-        // The track is addressed by index, created on demand like the CLI's.
-        while self.player.tracks().len() <= on.track {
-            self.player.add_track(Track::new());
-        }
-        let clip = Clip::sliced(Arc::new(Source::new(uri)), slice.from, to)
-            .at(on.at)
-            .gain(1.0)
-            .fade(Fade::default());
-        // Refuse a collision before inserting anything: a rejected put
-        // leaves no trace, and says where the clip could go instead.
-        let view = &self.player.tracks()[on.track];
-        if let Some(conflict) = view.clips().iter().find(|c| c.overlaps(&clip)) {
-            return Err(Error::Overlap(Overlap {
-                track: on.track,
-                at: clip.at,
-                conflict: conflict.id,
-                conflict_at: conflict.at,
-                conflict_end: conflict.end(),
-                next_free: view.next_free_start(clip.at, clip.duration()),
-            }));
-        }
-        let id = self.player.tracks_mut()[on.track]
-            .insert(clip)
-            .expect("pre-checked: the insert cannot collide");
-        // Placement past the queued tail joins the running graph; the rest
-        // waits for an apply — exactly what the daemon does.
-        let landed = self.player.changed(Change::Appended(on.track));
-        Ok(Put {
-            track: on.track,
-            clip: PlacedClip {
-                id,
-                uri: uri.to_string(),
-                at: on.at,
-                from: slice.from,
-                to,
-                gain: 1.0,
-                fade: Fade::default(),
-            },
-            landed,
-        })
-    }
-
-    /// The tracks, in order.
-    #[must_use]
-    pub fn tracks(&self) -> &[Track] {
-        self.player.tracks()
-    }
-
-    /// The whole arrangement's length: the latest end across tracks.
-    #[must_use]
-    pub fn duration(&self) -> Duration {
-        self.player.duration()
-    }
-
-    /// The playhead timecode.
-    #[must_use]
-    pub fn playhead(&self) -> Duration {
-        self.player.playhead()
+        let request = serde_json::json!({
+            "cmd": "put",
+            "uri": uri,
+            "from_ms": ms(slice.from),
+            "to_ms": slice.to.map(ms),
+            "track": on.track,
+            "at_ms": ms(on.at),
+        });
+        let reply = self.session.request(&request).map_err(Error::Daemon)?;
+        decode_put(&reply)
     }
 }
 
-/// A track, addressed by its index. `put` grows the session to fit.
+/// Place a clip into a player-owned arrangement, exactly as
+/// [`Bo::put`] does over the session. The one implementation both the
+/// daemon's typed endpoint and a future process session run; the CLI's own
+/// `put` carries the same semantics.
+pub fn put_on<B: Backend>(
+    player: &mut Player<B>,
+    uri: &str,
+    slice: Slice,
+    on: TrackPos,
+) -> Result<Put, Error> {
+    // An open slice plays to the source's end; resolve that end now, so
+    // every clip has a known finite length and none can silently block its
+    // track. Same refusal the CLI makes.
+    let to = match slice.to {
+        Some(to) => to,
+        None => probe(uri).map_err(|why| Error::Probe {
+            uri: uri.to_string(),
+            why,
+        })?,
+    };
+    // The track is addressed by index, created on demand like the CLI's.
+    while player.tracks().len() <= on.track {
+        player.add_track(Track::new());
+    }
+    let clip = Clip::sliced(Arc::new(Source::new(uri)), slice.from, to)
+        .at(on.at)
+        .gain(1.0)
+        .fade(Fade::default());
+    // Refuse a collision before inserting anything: a rejected put leaves no
+    // trace, and says where the clip could go instead.
+    let view = &player.tracks()[on.track];
+    if let Some(conflict) = view.clips().iter().find(|c| c.overlaps(&clip)) {
+        return Err(Error::Overlap(Overlap {
+            track: on.track,
+            at: clip.at,
+            conflict: conflict.id,
+            conflict_at: conflict.at,
+            conflict_end: conflict.end(),
+            next_free: view.next_free_start(clip.at, clip.duration()),
+        }));
+    }
+    let id = player.tracks_mut()[on.track]
+        .insert(clip)
+        .expect("pre-checked: the insert cannot collide");
+    // Placement past the queued tail joins the running graph; the rest waits
+    // for an apply — exactly what the daemon does.
+    let landed = player.changed(Change::Appended(on.track));
+    Ok(Put {
+        track: on.track,
+        clip: PlacedClip {
+            id,
+            uri: uri.to_string(),
+            at: on.at,
+            from: slice.from,
+            to,
+            gain: 1.0,
+            fade: Fade::default(),
+        },
+        landed,
+    })
+}
+
+/// A track, addressed by its index. A `put` grows the session to fit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TrackRef(pub usize);
 
@@ -305,7 +295,7 @@ pub struct PlacedClip {
     pub fade: Fade,
 }
 
-/// Why a [`Bo::put`] was refused.
+/// Why a put was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Overlap {
     /// The track the clip wanted.
@@ -351,6 +341,8 @@ pub enum Error {
     Overlap(Overlap),
     /// A backend refused the request (play, seek, apply).
     Backend(BackendError),
+    /// The daemon could not be reached, or its reply could not be read.
+    Daemon(String),
 }
 
 impl fmt::Display for Error {
@@ -360,6 +352,7 @@ impl fmt::Display for Error {
             Self::Probe { uri, why } => write!(f, "cannot measure {uri}: {why}"),
             Self::Overlap(overlap) => write!(f, "{overlap}"),
             Self::Backend(err) => write!(f, "{err}"),
+            Self::Daemon(msg) => f.write_str(msg),
         }
     }
 }
@@ -379,9 +372,107 @@ impl From<BackendError> for Error {
     }
 }
 
+/// A duration as whole milliseconds — the wire's exact unit.
+fn ms(d: Duration) -> u64 {
+    d.as_secs() * 1000 + u64::from(d.subsec_millis())
+}
+
+/// Decode a daemon reply to a put into a [`Put`] or a typed [`Error`].
+fn decode_put(reply: &str) -> Result<Put, Error> {
+    let v: serde_json::Value = serde_json::from_str(reply)
+        .map_err(|e| Error::Daemon(format!("bad daemon reply: {e}")))?;
+    if v.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Err(decode_error(&v));
+    }
+    let get = |key: &str| {
+        v.get(key)
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| Error::Daemon(format!("bad daemon reply: missing {key}")))
+    };
+    let id = get("id")?;
+    let from = Duration::from_millis(get("from_ms")?);
+    let to = Duration::from_millis(get("to_ms")?);
+    let at = Duration::from_millis(get("at_ms")?);
+    let landed = match v.get("landed").and_then(serde_json::Value::as_str) {
+        Some("live") => Landed::Live,
+        Some("pending") => Landed::Pending,
+        other => {
+            return Err(Error::Daemon(format!(
+                "bad daemon reply: landed {other:?}"
+            )))
+        }
+    };
+    Ok(Put {
+        track: get("track")? as usize,
+        clip: PlacedClip {
+            id,
+            uri: v
+                .get("uri")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| Error::Daemon("bad daemon reply: missing uri".to_string()))?
+                .to_string(),
+            at,
+            from,
+            to,
+            gain: 1.0,
+            fade: Fade::default(),
+        },
+        landed,
+    })
+}
+
+/// Decode the daemon's error object into the typed [`Error`].
+fn decode_error(v: &serde_json::Value) -> Error {
+    let error = v.get("error").cloned().unwrap_or(serde_json::Value::Null);
+    let kind = error
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("other");
+    let message = |fallback: &str| {
+        error
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(fallback)
+            .to_string()
+    };
+    let dur = |key: &str| {
+        error
+            .get(key)
+            .and_then(serde_json::Value::as_u64)
+            .map(Duration::from_millis)
+    };
+    match kind {
+        "overlap" => Error::Overlap(Overlap {
+            track: error
+                .get("track")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as usize,
+            at: dur("at_ms").unwrap_or_default(),
+            conflict: error
+                .get("conflict")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            conflict_at: dur("conflict_at_ms").unwrap_or_default(),
+            conflict_end: dur("conflict_end_ms").unwrap_or_default(),
+            next_free: dur("next_free_ms").unwrap_or_default(),
+        }),
+        "probe" => Error::Probe {
+            uri: error
+                .get("uri")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            why: message("cannot measure the source"),
+        },
+        "parse" => Error::Parse(message("bad request")),
+        _ => Error::Daemon(message("the daemon refused the request")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::Silent;
     use std::path::Path;
 
     fn write_test_wav(path: &Path, seconds: f32) {
@@ -420,42 +511,66 @@ mod tests {
         path.to_string_lossy().into_owned()
     }
 
+    /// The shared put semantics, headless: `put_on` over a silent player.
+    fn player() -> Player<Silent> {
+        Player::default()
+    }
+
     #[test]
     fn put_places_a_windowed_clip_on_a_track() {
-        let mut bo = Bo::new();
+        let mut p = player();
         let uri = src("a.wav");
-        let put = bo
-            .put(&uri, Slice::window(Duration::ZERO, Duration::from_secs_f64(0.2)), TrackRef(0).at(Duration::ZERO))
-            .unwrap();
+        let put = put_on(
+            &mut p,
+            &uri,
+            Slice::window(Duration::ZERO, Duration::from_secs_f64(0.2)),
+            TrackRef(0).at(Duration::ZERO),
+        )
+        .unwrap();
         assert_eq!(put.track, 0);
         assert_eq!(put.clip.id, 0);
-        assert_eq!(bo.tracks().len(), 1);
-        assert_eq!(bo.tracks()[0].clips().len(), 1);
-        assert_eq!(bo.tracks()[0].clips()[0].duration(), Duration::from_secs_f64(0.2));
+        assert_eq!(p.tracks().len(), 1);
+        assert_eq!(p.tracks()[0].clips().len(), 1);
+        assert_eq!(
+            p.tracks()[0].clips()[0].duration(),
+            Duration::from_secs_f64(0.2)
+        );
         // Stopped transport: the placement waits for a play, not a rebuild.
         assert_eq!(put.landed, Landed::Pending);
     }
 
     #[test]
     fn an_open_slice_is_probed_to_the_sources_end() {
-        let mut bo = Bo::new();
+        let mut p = player();
         let uri = src("a.wav");
-        let put = bo.put(&uri, Slice::whole(), TrackRef(0).at(Duration::ZERO)).unwrap();
+        let put = put_on(&mut p, &uri, Slice::whole(), TrackRef(0).at(Duration::ZERO)).unwrap();
         assert_eq!(put.clip.from, Duration::ZERO);
-        assert!(!put.clip.to.is_zero(), "an open slice resolves to a finite end");
+        assert!(
+            !put.clip.to.is_zero(),
+            "an open slice resolves to a finite end"
+        );
         assert_eq!(put.clip.to, Duration::from_secs_f64(0.5));
     }
 
     #[test]
     fn a_collision_refuses_and_leaves_no_trace() {
-        let mut bo = Bo::new();
+        let mut p = player();
         let uri = src("a.wav");
         let zero = Duration::ZERO;
-        bo.put(&uri, Slice::window(Duration::ZERO, Duration::from_secs_f64(0.2)), TrackRef(0).at(zero))
-            .unwrap();
-        let err = bo
-            .put(&uri, Slice::window(Duration::ZERO, Duration::from_secs_f64(0.2)), TrackRef(0).at(zero))
-            .unwrap_err();
+        put_on(
+            &mut p,
+            &uri,
+            Slice::window(Duration::ZERO, Duration::from_secs_f64(0.2)),
+            TrackRef(0).at(zero),
+        )
+        .unwrap();
+        let err = put_on(
+            &mut p,
+            &uri,
+            Slice::window(Duration::ZERO, Duration::from_secs_f64(0.2)),
+            TrackRef(0).at(zero),
+        )
+        .unwrap_err();
         match err {
             Error::Overlap(overlap) => {
                 assert_eq!(overlap.track, 0);
@@ -464,31 +579,53 @@ mod tests {
             }
             other => panic!("expected an overlap, got {other:?}"),
         }
-        assert_eq!(bo.tracks()[0].clips().len(), 1, "a refused put leaves no trace");
-        assert_eq!(bo.duration(), Duration::from_secs_f64(0.2));
+        assert_eq!(
+            p.tracks()[0].clips().len(),
+            1,
+            "a refused put leaves no trace"
+        );
+        assert_eq!(p.duration(), Duration::from_secs_f64(0.2));
     }
 
     #[test]
     fn butt_joined_clips_share_a_track_in_order() {
-        let mut bo = Bo::new();
+        let mut p = player();
         let uri = src("a.wav");
         let d = Duration::from_secs_f64(0.2);
-        bo.put(&uri, Slice::window(Duration::ZERO, d), TrackRef(0).at(Duration::ZERO)).unwrap();
-        let put = bo.put(&uri, Slice::window(Duration::ZERO, d), TrackRef(0).at(d)).unwrap();
+        put_on(
+            &mut p,
+            &uri,
+            Slice::window(Duration::ZERO, d),
+            TrackRef(0).at(Duration::ZERO),
+        )
+        .unwrap();
+        let put = put_on(
+            &mut p,
+            &uri,
+            Slice::window(Duration::ZERO, d),
+            TrackRef(0).at(d),
+        )
+        .unwrap();
         assert_eq!(put.clip.id, 1);
-        assert_eq!(bo.tracks()[0].clips().len(), 2);
-        assert_eq!(bo.tracks()[0].clips()[1].at, d);
-        assert_eq!(bo.duration(), d + d);
+        assert_eq!(p.tracks()[0].clips().len(), 2);
+        assert_eq!(p.tracks()[0].clips()[1].at, d);
+        assert_eq!(p.duration(), d + d);
     }
 
     #[test]
-    fn tracks_grow_to_fit_and_the_playhead_is_the_default_position() {
-        let mut bo = Bo::new();
+    fn tracks_grow_to_fit() {
+        let mut p = player();
         let uri = src("a.wav");
         let d = Duration::from_secs_f64(0.2);
-        let put = bo.put(&uri, Slice::window(Duration::ZERO, d), TrackRef(4).at(Duration::ZERO)).unwrap();
+        let put = put_on(
+            &mut p,
+            &uri,
+            Slice::window(Duration::ZERO, d),
+            TrackRef(4).at(Duration::ZERO),
+        )
+        .unwrap();
         assert_eq!(put.track, 4);
-        assert_eq!(bo.tracks().len(), 5, "missing tracks are created");
+        assert_eq!(p.tracks().len(), 5, "missing tracks are created");
     }
 
     #[test]
@@ -497,11 +634,20 @@ mod tests {
             "1:00-2:00".parse::<Slice>().unwrap(),
             Slice::window(Duration::from_secs(60), Duration::from_secs(120))
         );
-        assert_eq!("1:00-".parse::<Slice>().unwrap(), Slice {
-            from: Duration::from_secs(60),
-            to: None,
-        });
+        assert_eq!(
+            "1:00-".parse::<Slice>().unwrap(),
+            Slice {
+                from: Duration::from_secs(60),
+                to: None,
+            }
+        );
         assert!("1:00".parse::<Slice>().is_err(), "needs a -");
         assert!("x-y".parse::<Slice>().is_err(), "bad timecode");
+    }
+
+    #[test]
+    fn ms_round_trips_through_milliseconds() {
+        let d = Duration::from_secs_f64(61.234);
+        assert_eq!(Duration::from_millis(ms(d)), d);
     }
 }

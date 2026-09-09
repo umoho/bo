@@ -21,8 +21,10 @@
 //!   answers *where the sound goes*; it holds no content.
 //! * [`engine`] — [`engine::Player`]: transport state over stacked tracks,
 //!   with an [`engine::Backend`] seam for whatever actually makes sound.
-//! * [`client`] — the command surface as a library: a [`client::Bo`] you
-//!   drive with typed calls, the CLI's verbs without the daemon.
+//! * [`client`] — the typed client on a session: [`client::Bo`] puts clips
+//!   and tunes a session like the CLI does, minus the reply grammar.
+//! * [`session`] — a session: today the daemon on its Unix socket, spawned
+//!   on demand, speaking a typed JSON wire ([`session::Session`]).
 //! * [`time`] — the timecode text both layers speak: a lenient
 //!   `SS`/`MM:SS`/`HH:MM:SS` parse and the canonical `HH:MM:SS.fff` form.
 
@@ -31,4 +33,5 @@ pub mod client;
 pub mod time;
 pub mod control;
 pub mod engine;
+pub mod session;
 pub mod track;
