@@ -84,6 +84,17 @@ py/        pybo：Bo 面的 pyo3 绑定（uv + maturin）
 
 引擎、CLI、daemon 需要 **Rust 1.88+**；Python 绑定需要 **uv**。
 
+一台机器装齐两面：
+
+```console
+$ ./scripts/install.sh             # cargo install：把 bo CLI/daemon 装进系统
+$ ./scripts/install.sh --pybo      # 再装 pybo 到你的 Python
+```
+
+`bo` 落在 `~/.cargo/bin`。pybo 构建成单个 abi3 wheel（Python ≥ 3.10，任意 CPython），装进 `$BO_PYTHON`、当前虚拟环境或 `python3`——如果目标解释器拒绝系统安装（PEP 668），加 `BO_PIP_BREAK=1`。pybo 要拉起 daemon 需要 `bo` 在 `PATH` 上；装好的 `bo` 即可。
+
+或者直接从 checkout 构建：
+
 ```console
 $ cargo build --release          # bo CLI/daemon
 $ cd py && uv sync               # pybo 装进 .venv

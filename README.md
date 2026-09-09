@@ -126,6 +126,21 @@ py/        pybo: pyo3 binding of the Bo surface (uv + maturin)
 Requires **Rust 1.88+** for the engine, CLI and daemon; **uv** for the
 Python binding.
 
+Install both faces for this machine:
+
+```console
+$ ./scripts/install.sh             # cargo installs the bo CLI/daemon binary
+$ ./scripts/install.sh --pybo      # also installs pybo into your Python
+```
+
+`bo` lands in `~/.cargo/bin`. pybo is built as one abi3 wheel (Python
+≥ 3.10, any CPython) and installed into `$BO_PYTHON`, the active
+virtualenv, or `python3` — add `BO_PIP_BREAK=1` when that interpreter
+refuses system installs (PEP 668). The bo binary must be on `PATH` for
+pybo to spawn its daemon; an installed `bo` is enough.
+
+Or build from the checkout directly:
+
 ```console
 $ cargo build --release          # the bo CLI/daemon
 $ cd py && uv sync               # pybo into .venv
