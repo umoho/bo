@@ -161,6 +161,28 @@ twice:
 The CLI writes no arrangement state itself; a `play` on an empty
 arrangement is refused rather than silently finishing.
 
+## Deferred (frozen for 0.2)
+
+Known debt, recorded rather than fixed while the engine, `bo` lib and core
+are frozen:
+
+- **A placed-clip echo loses gain/fades on the wire.** `PlacedClip::gain`
+  and `PlacedClip::fade` keep `#[serde(skip)]` in core (`Fade` has no
+  serde), so a `Remove`/`Move`/`Insert` reply decoded by a *wire* client
+  echoes full gain and no fades even when the clip carries non-defaults.
+  The arrangement itself is correct — only the echo is lossy; in-memory
+  hosts (`Session`, engine tests) read the true values. Fixing it means
+  giving `track::Fade`/`FadeShape` serde and dropping the skips — deferred
+  while core is frozen.
+- **Open-ended inserts depend on the source.** An `Insert` with `to: None`
+  is resolved by decoding at the engine, so whole-source puts and any
+  `save`/`load`/`check` replay of them require the source file to be
+  present where the session runs. Environment-dependent by design.
+- **No patch entries for fade levels.** The 0.2 state zone patches
+  `fade_in`/`fade_out` as whole milliseconds only; the old grammar's
+  `fade_in_from`/`fade_out_to`/`fade_shape` have no `Set` path (only
+  `FadeShape::Linear` exists today).
+
 ## Version policy
 
 Breaking surface changes bump the minor (0.2.x). The engine and the `bo`
