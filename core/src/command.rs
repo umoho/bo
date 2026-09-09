@@ -216,6 +216,51 @@ pub enum Command {
         slice: Slice,
         on: TrackPos,
     },
+    /// Start playback from the current playhead.
+    Play,
+    /// Hold position and silence output.
+    Pause,
+    /// Continue from where `pause` left off.
+    Resume,
+    /// Jump the playhead; a running transport is re-planned from there.
+    Seek {
+        #[serde(with = "ms")]
+        at: Duration,
+    },
+    /// Stop and rewind to zero.
+    Stop,
+    /// Make every pending edit audible.
+    Apply,
+}
+
+/// What playback is about to play ([`Command::Play`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Played {
+    /// Number of tracks with clips.
+    pub tracks: usize,
+    /// Total clips.
+    pub clips: usize,
+    /// When the arrangement ends.
+    #[serde(with = "ms")]
+    pub end: Duration,
+    /// Where playback started from.
+    #[serde(with = "ms")]
+    pub playhead: Duration,
+}
+
+/// What [`Command::Apply`] did. Data, shared with the engine's transport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Applied {
+    /// Nothing was waiting.
+    Nothing,
+    /// `n` edits landed on the running graph; it was not rebuilt.
+    Live(usize),
+    /// `live` edits landed and the rest needed a graph rebuilt from `at`.
+    Rebuilt { live: usize, #[serde(with = "ms")] at: Duration },
+    /// The transport is stopped: there is no graph, so every edit stays
+    /// pending until it plays.
+    NotPlaying,
 }
 
 /// The result of a [`Command`], as data.
@@ -223,6 +268,27 @@ pub enum Command {
 pub enum Outcome {
     /// A clip was placed ([`Command::Put`]).
     Put(Put),
+    /// Playback started ([`Command::Play`]).
+    Played(Played),
+    /// The transport paused ([`Command::Pause`]).
+    Paused {
+        #[serde(with = "ms")]
+        at: Duration,
+    },
+    /// The transport resumed ([`Command::Resume`]).
+    Resumed {
+        #[serde(with = "ms")]
+        at: Duration,
+    },
+    /// The transport stopped and rewound ([`Command::Stop`]).
+    Stopped,
+    /// The playhead moved ([`Command::Seek`]).
+    Seeked {
+        #[serde(with = "ms")]
+        at: Duration,
+    },
+    /// Pending edits were made audible ([`Command::Apply`]).
+    Applied(Applied),
 }
 
 /// A command's reply over the wire: the [`Outcome`] or the [`Error`].

@@ -3,7 +3,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use bo_core::command::{Command, Error, Landed, Outcome, Slice, TrackPos};
+use bo_core::command::{Applied, Command, Error, Landed, Outcome, Slice, TrackPos};
 use bo_engine::{exec, Player, Silent};
 
 fn write_test_wav(path: &Path, seconds: f32) {
@@ -50,6 +50,14 @@ fn put(uri: &str, slice: Slice, on: TrackPos) -> Command {
     }
 }
 
+/// The Put payload of an outcome, or a panic — tests only ask for puts.
+fn put_outcome(outcome: Outcome) -> bo_core::command::Put {
+    match outcome {
+        Outcome::Put(put) => put,
+        other => panic!("expected a Put outcome, got {other:?}"),
+    }
+}
+
 fn player() -> Player<Silent> {
     Player::default()
 }
@@ -67,7 +75,7 @@ fn exec_put_places_a_windowed_clip_on_a_track() {
         ),
     )
     .unwrap();
-    let Outcome::Put(put) = outcome;
+    let put = put_outcome(outcome);
     assert_eq!(put.track, 0);
     assert_eq!(put.clip.id, 0);
     assert_eq!(p.tracks().len(), 1);
@@ -89,7 +97,7 @@ fn exec_put_probes_an_open_slice_to_the_sources_end() {
         put(&uri, Slice::whole(), TrackPos::from((0, Duration::ZERO))),
     )
     .unwrap();
-    let Outcome::Put(put) = outcome;
+    let put = put_outcome(outcome);
     assert_eq!(put.clip.from, Duration::ZERO);
     assert!(
         !put.clip.to.is_zero(),
@@ -160,7 +168,7 @@ fn exec_put_butt_joins_clips_in_order() {
         ),
     )
     .unwrap();
-    let Outcome::Put(put) = outcome;
+    let put = put_outcome(outcome);
     assert_eq!(put.clip.id, 1);
     assert_eq!(p.tracks()[0].clips().len(), 2);
     assert_eq!(p.tracks()[0].clips()[1].at, d);
@@ -181,7 +189,60 @@ fn exec_put_grows_tracks_to_fit() {
         ),
     )
     .unwrap();
-    let Outcome::Put(put) = outcome;
+    let put = put_outcome(outcome);
     assert_eq!(put.track, 4);
     assert_eq!(p.tracks().len(), 5, "missing tracks are created");
+}
+
+#[test]
+fn exec_drives_the_transport() {
+    let mut p = player();
+    let uri = src("a.wav");
+    exec(
+        &mut p,
+        put(
+            &uri,
+            Slice::window(Duration::ZERO, Duration::from_secs(10)),
+            TrackPos::from((0, Duration::ZERO)),
+        ),
+    )
+    .unwrap();
+
+    let Outcome::Played(played) = exec(&mut p, Command::Play).unwrap() else {
+        panic!("expected Played");
+    };
+    assert_eq!(played.tracks, 1);
+    assert_eq!(played.clips, 1);
+    assert_eq!(played.end, Duration::from_secs(10));
+    assert!(p.is_playing());
+
+    let Outcome::Seeked { at } = exec(&mut p, Command::Seek { at: Duration::from_secs(4) }).unwrap()
+    else {
+        panic!("expected Seeked");
+    };
+    assert_eq!(at, Duration::from_secs(4));
+    assert_eq!(p.playhead(), Duration::from_secs(4), "a running transport is re-planned");
+
+    // A structural edit while playing waits; apply rebuilds for it.
+    assert_eq!(p.changed(bo_engine::Change::Structure), Landed::Pending);
+    let Outcome::Applied(Applied::Rebuilt { live, at }) =
+        exec(&mut p, Command::Apply).unwrap()
+    else {
+        panic!("expected a rebuild");
+    };
+    assert_eq!(live, 0);
+    assert_eq!(at, Duration::from_secs(4));
+
+    let Outcome::Paused { at } = exec(&mut p, Command::Pause).unwrap() else {
+        panic!("expected Paused");
+    };
+    assert_eq!(at, Duration::from_secs(4));
+
+    let Outcome::Resumed { .. } = exec(&mut p, Command::Resume).unwrap() else {
+        panic!("expected Resumed");
+    };
+    let Outcome::Stopped = exec(&mut p, Command::Stop).unwrap() else {
+        panic!("expected Stopped");
+    };
+    assert_eq!(p.state(), bo_engine::State::Stopped);
 }

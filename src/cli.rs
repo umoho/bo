@@ -2704,8 +2704,9 @@ fn handle_json(state: &Mutex<Arrangement>, line: &str, cwd: &str) -> (i32, Strin
             )
         }
     };
-    let bo_core::command::Command::Put { uri, .. } = &mut command;
-    *uri = absolutize(uri, cwd);
+    if let bo_core::command::Command::Put { uri, .. } = &mut command {
+        *uri = absolutize(uri, cwd);
+    }
     let mut a = state.lock().unwrap();
     let reply = match bo::engine::exec(&mut a.player, command) {
         Ok(outcome) => bo_core::command::Reply::Ok(outcome),

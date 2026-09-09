@@ -190,3 +190,37 @@ fn session_default_spawns_the_daemon_on_demand() {
     }
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn transport_verbs_round_trip_through_the_daemon() {
+    let dir = temp_dir();
+    let socket = dir.join("d.sock");
+    let _daemon = spawn_daemon(&socket);
+
+    let mut bo = Bo::with_connection(Connection::at(&socket));
+    bo.put(
+        "a.wav",
+        Slice::window(Duration::ZERO, Duration::from_secs(10)),
+        TrackRef(0).at(Duration::ZERO),
+    )
+    .unwrap();
+
+    let played = bo.play().expect("play");
+    assert_eq!(played.clips, 1);
+    assert_eq!(played.end, Duration::from_secs(10));
+
+    bo.seek(Duration::from_secs(4)).unwrap();
+    let at = bo.pause().unwrap();
+    assert_eq!(at, Duration::from_secs(4));
+    bo.resume().unwrap();
+
+    // The daemon's own transport agrees.
+    let out = bo_cli(&socket, &["ls"]);
+    assert!(out.contains("playing") || out.contains("stopped"), "{out}");
+
+    bo.stop().unwrap();
+    let out = bo_cli(&socket, &["ls"]);
+    assert!(out.contains("stopped, playhead at 00:00:00.000"), "{out}");
+
+    std::fs::remove_dir_all(&dir).ok();
+}

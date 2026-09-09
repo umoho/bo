@@ -19,7 +19,7 @@ pub mod rodio;
 pub mod timeline;
 
 use bo_core::bus::{Bus, Group};
-use bo_core::command::{Command, Error, Outcome, Overlap, PlacedClip, Put};
+use bo_core::command::{Command, Error, Outcome, Overlap, PlacedClip, Played, Put};
 use bo_core::track::{Clip, Fade, Source, Track};
 
 /// Why a backend could not do what it was told: data, shared with the
@@ -59,19 +59,9 @@ pub enum Change {
     GroupGain(u64),
 }
 
-/// What [`Player::apply`] did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Applied {
-    /// Nothing was waiting.
-    Nothing,
-    /// `n` edits landed on the running graph; it was not rebuilt.
-    Live(usize),
-    /// `live` edits landed and the rest needed a graph rebuilt from `at`.
-    Rebuilt { live: usize, at: Duration },
-    /// The transport is stopped: there is no graph, so every edit stays
-    /// pending until it plays.
-    NotPlaying,
-}
+/// What [`Player::apply`] did: data, shared with the command protocol
+/// ([`bo_core::command::Applied`]).
+pub use bo_core::command::Applied;
 
 /// The thing that makes sound.
 ///
@@ -663,9 +653,41 @@ pub fn exec<B: Backend>(player: &mut Player<B>, command: Command) -> Result<Outc
                 landed,
             }))
         }
+        Command::Play => {
+            player.play().map_err(Error::Backend)?;
+            Ok(Outcome::Played(Played {
+                tracks: player.tracks().iter().filter(|t| !t.is_empty()).count(),
+                clips: player.tracks().iter().map(|t| t.len()).sum(),
+                end: player.duration(),
+                playhead: player.playhead(),
+            }))
+        }
+        Command::Pause => {
+            player.pause();
+            Ok(Outcome::Paused {
+                at: player.playhead(),
+            })
+        }
+        Command::Resume => {
+            player.resume().map_err(Error::Backend)?;
+            Ok(Outcome::Resumed {
+                at: player.playhead(),
+            })
+        }
+        Command::Seek { at } => {
+            player.seek(at).map_err(Error::Backend)?;
+            Ok(Outcome::Seeked { at })
+        }
+        Command::Stop => {
+            player.stop();
+            Ok(Outcome::Stopped)
+        }
+        Command::Apply => {
+            let applied = player.apply().map_err(Error::Backend)?;
+            Ok(Outcome::Applied(applied))
+        }
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

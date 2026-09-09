@@ -29,11 +29,21 @@
 //! # Ok::<(), bo::client::Error>(())
 //! ```
 
+use std::time::Duration;
+
 use crate::connection::Connection;
 
 // The command protocol, shared with the engine and the daemon; re-exported
 // here so `bo::client::Slice` reads as before.
-pub use bo_core::command::{Command, Error, Landed, Outcome, Overlap, PlacedClip, Put, Reply, Slice, TrackPos, TrackRef};
+pub use bo_core::command::{
+    Applied, Command, Error, Landed, Outcome, Overlap, PlacedClip, Played, Put, Reply, Slice,
+    TrackPos, TrackRef,
+};
+
+/// The reply was not the one this call asked for.
+fn unexpected(outcome: &Outcome) -> Error {
+    Error::Daemon(format!("unexpected daemon reply: {outcome:?}"))
+}
 
 /// A typed client on a [`Connection`]: the arrangement lives there, commands
 /// travel there, and the replies come back typed.
@@ -84,6 +94,55 @@ impl Bo {
             on,
         })? {
             Outcome::Put(put) => Ok(put),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// Start playback from the current playhead.
+    pub fn play(&mut self) -> Result<Played, Error> {
+        match self.exec(Command::Play)? {
+            Outcome::Played(played) => Ok(played),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// Hold position and silence output; the position is where it stopped.
+    pub fn pause(&mut self) -> Result<Duration, Error> {
+        match self.exec(Command::Pause)? {
+            Outcome::Paused { at } => Ok(at),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// Continue from where [`Bo::pause`] left off.
+    pub fn resume(&mut self) -> Result<Duration, Error> {
+        match self.exec(Command::Resume)? {
+            Outcome::Resumed { at } => Ok(at),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// Stop and rewind to zero.
+    pub fn stop(&mut self) -> Result<(), Error> {
+        match self.exec(Command::Stop)? {
+            Outcome::Stopped => Ok(()),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// Jump the playhead.
+    pub fn seek(&mut self, at: Duration) -> Result<(), Error> {
+        match self.exec(Command::Seek { at })? {
+            Outcome::Seeked { .. } => Ok(()),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// Make every pending edit audible.
+    pub fn apply(&mut self) -> Result<Applied, Error> {
+        match self.exec(Command::Apply)? {
+            Outcome::Applied(applied) => Ok(applied),
+            other => Err(unexpected(&other)),
         }
     }
 
