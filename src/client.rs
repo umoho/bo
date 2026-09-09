@@ -19,12 +19,11 @@
 //! render.
 //!
 //! ```no_run
-//! use bo::client::{Bo, Clip, Slice, TrackRef};
+//! use bo::client::{Bo, Clip, TrackRef};
 //! use std::time::Duration;
 //!
 //! let mut bo = Bo::new();   // the default connection: the shared daemon
-//! let window: Slice = "1:00-2:00".parse()?;
-//! let clip = Clip::whole("bed.wav").windowed(window);
+//! let clip = Clip::of("bed.wav").trim(Duration::from_secs(60), Duration::from_secs(120));
 //! let put = bo.put(clip, TrackRef(0).at(Duration::from_secs(30)))?;
 //! assert_eq!(put.track, 0);
 //! # Ok::<(), bo::client::Error>(())
@@ -61,7 +60,7 @@ pub struct Clip {
 impl Clip {
     /// The whole of `uri` (its end resolved by probing at placement).
     #[must_use]
-    pub fn whole(uri: impl Into<String>) -> Self {
+    pub fn of(uri: impl Into<String>) -> Self {
         Self {
             uri: uri.into(),
             from: Duration::ZERO,
@@ -69,84 +68,28 @@ impl Clip {
         }
     }
 
-    /// A `from .. to` window of `uri`.
+    /// Trim the material to the `from .. to` span of its source.
     #[must_use]
-    pub fn window(uri: impl Into<String>, from: Duration, to: Duration) -> Self {
-        Self {
-            uri: uri.into(),
-            from,
-            to: Some(to),
-        }
-    }
-
-    /// Narrow the material to a window (builder form).
-    #[must_use]
-    pub fn windowed(mut self, window: impl Into<Slice>) -> Self {
-        let window = window.into();
-        self.from = window.from;
-        self.to = window.to;
+    pub const fn trim(mut self, from: Duration, to: Duration) -> Self {
+        self.from = from;
+        self.to = Some(to);
         self
     }
-}
 
-/// A `from..to` window, parsed from text. Client vocabulary for [`Clip`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct Slice {
-    /// In-point, measured into the source.
-    pub from: Duration,
-    /// Out-point, measured into the source; `None` = the source's end.
-    pub to: Option<Duration>,
-}
-
-impl Slice {
-    /// The whole source.
+    /// Trim the material to start at `from`, running to the source's end.
     #[must_use]
-    pub fn whole() -> Self {
-        Self {
-            from: Duration::ZERO,
-            to: None,
-        }
+    pub const fn trim_to_end(mut self, from: Duration) -> Self {
+        self.from = from;
+        self.to = None;
+        self
     }
 
-    /// A closed `from .. to` window.
+    /// Trim the material to the source's first `to`.
     #[must_use]
-    pub const fn window(from: Duration, to: Duration) -> Self {
-        Self { from, to: Some(to) }
-    }
-}
-
-impl fmt::Display for Slice {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}-{}", bo_core::time::format(self.from), match self.to {
-            Some(to) => bo_core::time::format(to),
-            None => String::new(),
-        })
-    }
-}
-
-impl std::str::FromStr for Slice {
-    type Err = Error;
-
-    /// Parse `from-to`, or `from-` for the source's end. Timecodes are
-    /// `SS`, `MM:SS` or `HH:MM:SS` with an optional `.fff` fraction.
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let s = s.trim();
-        let (from, to) = s.split_once('-').ok_or_else(|| {
-            Error::Parse(format!("bad slice {s:?}: expected from-to"))
-        })?;
-        let from = bo_core::time::parse(from).map_err(Error::Parse)?;
-        let to = if to.trim().is_empty() {
-            None
-        } else {
-            Some(bo_core::time::parse(to).map_err(Error::Parse)?)
-        };
-        Ok(Self { from, to })
-    }
-}
-
-impl From<(Duration, Duration)> for Slice {
-    fn from((from, to): (Duration, Duration)) -> Self {
-        Self::window(from, to)
+    pub const fn trim_from_begin(mut self, to: Duration) -> Self {
+        self.from = Duration::ZERO;
+        self.to = Some(to);
+        self
     }
 }
 
@@ -326,25 +269,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn slice_text_parses_closed_open_and_bad() {
-        assert_eq!(
-            "1:00-2:00".parse::<Slice>().unwrap(),
-            Slice::window(Duration::from_secs(60), Duration::from_secs(120))
-        );
-        assert_eq!(
-            "1:00-".parse::<Slice>().unwrap(),
-            Slice {
-                from: Duration::from_secs(60),
-                to: None,
-            }
-        );
-        assert!("1:00".parse::<Slice>().is_err(), "needs a -");
-        assert!("x-y".parse::<Slice>().is_err(), "bad timecode");
-    }
-
-    #[test]
     fn material_and_placement_expand_into_a_flat_command() {
-        let clip = Clip::whole("a.wav").windowed((Duration::ZERO, Duration::from_secs(5)));
+        let clip = Clip::of("a.wav").trim(Duration::ZERO, Duration::from_secs(5));
         let to = TrackPosition::from((3, Duration::from_secs(9)));
         let cmd = Command::Insert {
             uri: clip.uri,
