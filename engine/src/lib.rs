@@ -11,15 +11,16 @@
 //! mix can never drift out of sync with the arrangement.
 
 use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
 
 pub mod measure;
 pub mod rodio;
-pub mod verbs;
 pub mod timeline;
 
 use bo_core::bus::{Bus, Group};
-use bo_core::track::{Clip, Track};
+use bo_core::command::{Command, Error, Outcome, Overlap, PlacedClip, Put};
+use bo_core::track::{Clip, Fade, Source, Track};
 
 /// Why a backend could not do what it was told: data, shared with the
 /// command vocabulary ([`bo_core::command`]).
@@ -599,6 +600,69 @@ impl<B: Backend> Player<B> {
     #[must_use]
     pub fn is_finished(&self) -> bool {
         self.playhead() >= self.duration()
+    }
+}
+
+/// Execute one [`Command`] against a player-owned arrangement: the engine's
+/// single mouth. Every executor runs commands through here — the daemon
+/// after decoding them off its wire, a process session directly. A refused
+/// command (an unmeasurable source, a collision) is an [`Error`] and leaves
+/// the arrangement exactly as it was.
+pub fn exec<B: Backend>(player: &mut Player<B>, command: Command) -> Result<Outcome, Error> {
+    match command {
+        Command::Put { uri, slice, on } => {
+            // An open slice plays to the source's end; resolve that end now,
+            // so every clip has a known finite length and none can silently
+            // block its track. Same refusal the CLI makes.
+            let to = match slice.to {
+                Some(to) => to,
+                None => rodio::probe(&uri).map_err(|why| Error::Probe {
+                    uri: uri.clone(),
+                    why,
+                })?,
+            };
+            // The track is addressed by index, created on demand like the
+            // CLI's.
+            while player.tracks().len() <= on.track {
+                player.add_track(Track::new());
+            }
+            let clip = Clip::sliced(Arc::new(Source::new(&uri)), slice.from, to)
+                .at(on.at)
+                .gain(1.0)
+                .fade(Fade::default());
+            // Refuse a collision before inserting anything: a rejected put
+            // leaves no trace, and says where the clip could go instead.
+            let view = &player.tracks()[on.track];
+            if let Some(conflict) = view.clips().iter().find(|c| c.overlaps(&clip)) {
+                return Err(Error::Overlap(Overlap {
+                    track: on.track,
+                    at: clip.at,
+                    conflict: conflict.id,
+                    conflict_at: conflict.at,
+                    conflict_end: conflict.end(),
+                    next_free: view.next_free_start(clip.at, clip.duration()),
+                }));
+            }
+            let id = player.tracks_mut()[on.track]
+                .insert(clip)
+                .expect("pre-checked: the insert cannot collide");
+            // Placement past the queued tail joins the running graph; the
+            // rest waits for an apply — exactly what the daemon does.
+            let landed = player.changed(Change::Appended(on.track));
+            Ok(Outcome::Put(Put {
+                track: on.track,
+                clip: PlacedClip {
+                    id,
+                    uri: uri.clone(),
+                    at: on.at,
+                    from: slice.from,
+                    to,
+                    gain: 1.0,
+                    fade: Fade::default(),
+                },
+                landed,
+            }))
+        }
     }
 }
 
