@@ -21,7 +21,8 @@ pub mod rodio;
 pub mod session;
 pub mod timeline;
 
-use bo_core::bus::{Bus, BusRef, Group};
+use bo_core::bus::{Bus, BusRef, Group, Placement};
+use bo_core::control::ControlSource;
 use bo_core::command::{ClipHere, Command, Error, Inserted, Moved, OnTrack, Outcome, Overlap, PlacedClip, Played, Removed, RouteBus, Routed, Set};
 use bo_core::track::{Clip, Fade, Source, Track};
 
@@ -954,18 +955,43 @@ fn patch_clip_prop(
         "gain" => {
             let v = num(value, path)?.clamp(0.0, 1.0);
             player.tracks_mut()[track].clip_mut(id).expect("index resolved").gain = v;
+            land(player, Change::ClipParams(track, id), landed_last);
         }
         "fade_in" => {
             let ms = ms_value(value, path)?;
             player.tracks_mut()[track].clip_mut(id).expect("index resolved").fade.fade_in = ms;
+            land(player, Change::ClipParams(track, id), landed_last);
         }
         "fade_out" => {
             let ms = ms_value(value, path)?;
             player.tracks_mut()[track].clip_mut(id).expect("index resolved").fade.fade_out = ms;
+            land(player, Change::ClipParams(track, id), landed_last);
+        }
+        // A per-clip placement, or `null` to follow the track again.
+        "pan" => {
+            let clip = player.tracks_mut()[track].clip_mut(id).expect("index resolved");
+            clip.placement = match value {
+                Value::Null => None,
+                v => Some(Placement::Stereo {
+                    position: num(v, path)?.clamp(-1.0, 1.0),
+                }),
+            };
+            land(player, Change::ClipPan(track, id), landed_last);
+        }
+        "pan_control" => {
+            let source = value_to_source(value, path)?;
+            player.tracks_mut()[track].clip_mut(id).expect("index resolved").pan_controls =
+                source.into_iter().collect();
+            land(player, Change::ClipControls(track, id), landed_last);
+        }
+        "gain_control" => {
+            let source = value_to_source(value, path)?;
+            player.tracks_mut()[track].clip_mut(id).expect("index resolved").gain_controls =
+                source.into_iter().collect();
+            land(player, Change::ClipGainControls(track, id), landed_last);
         }
         other => return Err(Error::Value(format!("unknown clip property {other:?}"))),
     }
-    land(player, Change::ClipParams(track, id), landed_last);
     Ok(())
 }
 
@@ -1131,7 +1157,28 @@ fn patch_bus_strip(
     Ok(())
 }
 
-/// The arrangement as a JSON tree — what `Get` reads.
+/// Control sources as JSON: today each input takes at most one, so an
+/// empty list is `null`.
+fn controls_json(controls: &[ControlSource]) -> Value {
+    match controls.first() {
+        Some(source) => serde_json::from_str(&source.to_string()).unwrap_or(Value::Null),
+        None => Value::Null,
+    }
+}
+
+/// A patcher value into one control source: a JSON object, or `null` to
+/// clear the input.
+fn value_to_source(v: &Value, path: &str) -> Result<Option<ControlSource>, Error> {
+    if v.is_null() {
+        return Ok(None);
+    }
+    let text = serde_json::to_string(v).map_err(|e| Error::Value(e.to_string()))?;
+    text.parse::<ControlSource>()
+        .map(Some)
+        .map_err(|e| Error::Value(format!("{path}: {e}")))
+}
+
+/// The clip at index `c` in a track's ordered clip list, by its id./// The arrangement as a JSON tree — what `Get` reads.
 fn arrangement_tree(player: &Player<impl Backend>) -> Value {
     let ms = |d: Duration| d.as_secs() * 1000 + u64::from(d.subsec_millis());
     let tracks: Vec<Value> = player
@@ -1151,6 +1198,9 @@ fn arrangement_tree(player: &Player<impl Backend>) -> Value {
                         "gain": c.gain,
                         "fade_in": ms(c.fade.fade_in),
                         "fade_out": ms(c.fade.fade_out),
+                        "pan": c.placement.map(|p| Value::from(f64::from(p.position()))),
+                        "pan_control": controls_json(&c.pan_controls),
+                        "gain_control": controls_json(&c.gain_controls),
                     })
                 })
                 .collect();

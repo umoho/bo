@@ -659,3 +659,73 @@ fn exec_set_patches_the_state_zone() {
         other => panic!("expected NoBus, got {other:?}"),
     }
 }
+
+#[test]
+fn exec_set_patches_clip_pan_and_controls() {
+    let mut p = player();
+    exec(
+        &mut p,
+        insert(&src("a.wav"), Duration::ZERO, Duration::from_secs(10), Duration::ZERO, 0),
+    )
+    .unwrap();
+    let clip_path = |prop: &str| format!("track.0.clips.0.{prop}");
+
+    exec(
+        &mut p,
+        Command::Set {
+            path: clip_path("pan"),
+            patcher: serde_json::json!(-0.6),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        p.tracks()[0].clips()[0].placement.map(|pl| pl.position()),
+        Some(-0.6)
+    );
+
+    exec(
+        &mut p,
+        Command::Set {
+            path: clip_path("gain_control"),
+            patcher: serde_json::json!({"type": "lfo", "shape": "sine", "rate": 2.0}),
+        },
+    )
+    .unwrap();
+    assert_eq!(p.tracks()[0].clips()[0].gain_controls.len(), 1);
+
+    // null clears the input and sends the clip back to its track's pan.
+    exec(
+        &mut p,
+        Command::Set { path: clip_path("pan"), patcher: serde_json::Value::Null },
+    )
+    .unwrap();
+    assert!(p.tracks()[0].clips()[0].placement.is_none());
+    exec(
+        &mut p,
+        Command::Set { path: clip_path("gain_control"), patcher: serde_json::Value::Null },
+    )
+    .unwrap();
+    assert!(p.tracks()[0].clips()[0].gain_controls.is_empty());
+
+    // The tree echoes them.
+    let Outcome::Tree(tree) = exec(&mut p, Command::Get { path: String::new() }).unwrap() else {
+        panic!("expected a tree")
+    };
+    let clip = &tree["track"][0]["clips"][0];
+    assert!(clip["pan"].is_null());
+    assert!(clip["gain_control"].is_null());
+
+    // A malformed control source is refused.
+    match exec(
+        &mut p,
+        Command::Set {
+            path: clip_path("gain_control"),
+            patcher: serde_json::json!({"type": "wiggle"}),
+        },
+    )
+    .unwrap_err()
+    {
+        Error::Value(msg) => assert!(msg.contains("control source"), "{msg}"),
+        other => panic!("expected Value, got {other:?}"),
+    }
+}
