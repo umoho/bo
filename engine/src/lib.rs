@@ -489,6 +489,29 @@ impl<B: Backend> Player<B> {
         self.pending.clear();
     }
 
+    /// Replace this player's arrangement wholesale with `other`'s — tracks,
+    /// master, groups, playhead and pending edits — keeping this player's
+    /// backend, and stopping the transport. Host-level: a snapshot `load`
+    /// commits a staged arrangement this way.
+    pub(crate) fn adopt_from<C: Backend>(&mut self, other: Player<C>) {
+        let Player {
+            tracks,
+            bus,
+            groups,
+            next_group_id,
+            playhead,
+            pending,
+            ..
+        } = other;
+        self.stop();
+        self.tracks = tracks;
+        self.bus = bus;
+        self.groups = groups;
+        self.next_group_id = next_group_id;
+        self.playhead = playhead;
+        self.pending = pending;
+    }
+
     /// Jump the playhead. A running transport is re-planned from the new
     /// position, because most backends cannot seek mid-stream; the fresh
     /// graph takes every pending edit with it.

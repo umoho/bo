@@ -11,7 +11,7 @@
 use std::time::Duration;
 
 use bo_core::bus::Group;
-use bo_core::command::{Command, Error, Outcome};
+use bo_core::command::{Command, Error, Outcome, SNAPSHOT_VERSION, Snapshot};
 use bo_core::track::Track;
 
 use crate::rodio::Rodio;
@@ -158,12 +158,42 @@ impl Session {
         crate::exec(&mut self.player, command)
     }
 
+    /// Replace the session from a snapshot, atomically (host-level): the
+    /// history is staged on a silent session first, so a failing snapshot
+    /// leaves this session untouched; only then do the staged tracks,
+    /// groups, master and playhead come across. This session's audio
+    /// backend survives. (The daemon logs the history and intercepts
+    /// `Command::Load` here; the engine's raw `exec` refuses it.)
+    pub fn load(&mut self, snapshot: &Snapshot) -> Result<(), Error> {
+        if snapshot.version != SNAPSHOT_VERSION {
+            return Err(Error::Version(format!(
+                "snapshot version {} — this build reads {}",
+                snapshot.version, SNAPSHOT_VERSION
+            )));
+        }
+        let mut staged = crate::Player::new(crate::Silent::default());
+        for command in &snapshot.history {
+            crate::exec(&mut staged, command.clone()).map_err(|e| Error::Host(format!(
+                "load failed at {command:?}: {e}"
+            )))?;
+        }
+        self.player.adopt_from(staged);
+        self.player.set_playhead(snapshot.playhead);
+        Ok(())
+    }
+
     // ---- host lifecycle: the clock a long-lived host drives ----
 
     /// Current transport state.
     #[must_use]
     pub fn state(&self) -> State {
         self.player.state()
+    }
+
+    /// Whether the transport is running.
+    #[must_use]
+    pub fn is_playing(&self) -> bool {
+        self.player.is_playing()
     }
 
     /// The playhead timecode.
@@ -248,5 +278,45 @@ mod tests {
 
         s.exec(Command::Stop).unwrap();
         assert_eq!(s.state(), State::Stopped);
+    }
+
+    #[test]
+    fn load_replaces_the_session_from_a_snapshot() {
+        use bo_core::command::Snapshot;
+        let mut s = Session::silent();
+        s.exec(Command::Insert {
+            uri: "a.wav".to_string(),
+            from: Duration::ZERO,
+            to: Some(Duration::from_secs(10)),
+            on: OnTrack::Track {
+                index: 0,
+                at: Duration::ZERO,
+            },
+        })
+        .unwrap();
+
+        // Trash it, then load a snapshot that rebuilds it with a playhead.
+        let snapshot = Snapshot {
+            version: bo_core::command::SNAPSHOT_VERSION,
+            history: vec![Command::Insert {
+                uri: "b.wav".to_string(),
+                from: Duration::ZERO,
+                to: Some(Duration::from_secs(5)),
+                on: OnTrack::Track {
+                    index: 0,
+                    at: Duration::from_millis(2_000),
+                },
+            }],
+            playhead: Duration::from_secs(3),
+        };
+        s.exec(Command::Reset).unwrap();
+        s.load(&snapshot).unwrap();
+
+        let Outcome::Tree(tree) = s.exec(Command::Get { path: String::new() }).unwrap() else {
+            panic!("expected a tree")
+        };
+        assert_eq!(tree["track"][0]["clips"].as_array().unwrap().len(), 1);
+        assert_eq!(tree["track"][0]["clips"][0]["uri"], "b.wav");
+        assert_eq!(s.playhead(), Duration::from_secs(3), "playhead comes across");
     }
 }
