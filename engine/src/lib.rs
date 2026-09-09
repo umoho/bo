@@ -898,6 +898,45 @@ fn apply_patch(
 ) -> Result<(Value, Landed), Error> {
     let mut landed_last = None;
     let segs: Vec<&str> = path.split('.').filter(|s| !s.is_empty()).collect();
+    // Deep patch into a clip's control source: the path runs past
+    // `pan_control`/`gain_control` into the source's own JSON. The patcher
+    // merges into that value and the whole source is rewritten, typed and
+    // validated — so `gain_control.rate` works, and object merge covers
+    // whole sources (curve keyframes, whose dotted timecodes cannot be a
+    // path).
+    if segs.len() > 5
+        && segs[2] == "clips"
+        && matches!(segs[4], "pan_control" | "gain_control")
+    {
+        let t = track_index(player, segs[1])?;
+        let c = clip_index(player, t, segs[3])?;
+        let change = if segs[4] == "pan_control" {
+            Change::ClipControls(t, c)
+        } else {
+            Change::ClipGainControls(t, c)
+        };
+        let clip = player.tracks_mut()[t].clip_mut(c).expect("index resolved");
+        let controls = if segs[4] == "pan_control" {
+            &mut clip.pan_controls
+        } else {
+            &mut clip.gain_controls
+        };
+        let mut current = match controls.first() {
+            Some(source) => serde_json::from_str(&source.to_string()).unwrap_or(Value::Null),
+            None => Value::Null,
+        };
+        merge_deep(&mut current, &segs[5..], patcher)?;
+        let source = target_text_parse(&current, path)?;
+        controls.clear();
+        if let Some(source) = source {
+            controls.push(source);
+        }
+        let landed = player.changed(change);
+        let patched = get_path(&arrangement_tree(player), path)
+            .map_err(Error::Path)?
+            .clone();
+        return Ok((patched, landed));
+    }
     match segs.as_slice() {
         ["master"] => {
             let Some(volume) = patcher.get("volume") else {
@@ -1008,17 +1047,39 @@ fn patch_clip_prop(
             };
             land(player, Change::ClipPan(track, id), landed_last);
         }
-        "pan_control" => {
-            let source = value_to_source(value, path)?;
-            player.tracks_mut()[track].clip_mut(id).expect("index resolved").pan_controls =
-                source.into_iter().collect();
-            land(player, Change::ClipControls(track, id), landed_last);
-        }
-        "gain_control" => {
-            let source = value_to_source(value, path)?;
-            player.tracks_mut()[track].clip_mut(id).expect("index resolved").gain_controls =
-                source.into_iter().collect();
-            land(player, Change::ClipGainControls(track, id), landed_last);
+        "pan_control" | "gain_control" => {
+            let pan = prop == "pan_control";
+            let change = if pan {
+                Change::ClipControls(track, id)
+            } else {
+                Change::ClipGainControls(track, id)
+            };
+            let clip = player.tracks_mut()[track].clip_mut(id).expect("index resolved");
+            let controls = if pan {
+                &mut clip.pan_controls
+            } else {
+                &mut clip.gain_controls
+            };
+            // Whole-control patch merges onto the source already there —
+            // adding a curve keyframe, or changing an lfo field — and null
+            // clears the input.
+            let mut current = match controls.first() {
+                Some(source) => {
+                    serde_json::from_str(&source.to_string()).unwrap_or(Value::Null)
+                }
+                None => Value::Null,
+            };
+            if value.is_null() {
+                controls.clear();
+            } else {
+                merge_value(&mut current, value);
+                let source = target_text_parse(&current, path)?;
+                controls.clear();
+                if let Some(source) = source {
+                    controls.push(source);
+                }
+            }
+            land(player, change, landed_last);
         }
         other => return Err(Error::Value(format!("unknown clip property {other:?}"))),
     }
@@ -1187,8 +1248,6 @@ fn patch_bus_strip(
     Ok(())
 }
 
-/// Control sources as JSON: today each input takes at most one, so an
-/// empty list is `null`.
 fn controls_json(controls: &[ControlSource]) -> Value {
     match controls.first() {
         Some(source) => serde_json::from_str(&source.to_string()).unwrap_or(Value::Null),
@@ -1196,19 +1255,47 @@ fn controls_json(controls: &[ControlSource]) -> Value {
     }
 }
 
-/// A patcher value into one control source: a JSON object, or `null` to
-/// clear the input.
-fn value_to_source(v: &Value, path: &str) -> Result<Option<ControlSource>, Error> {
-    if v.is_null() {
+fn merge_deep(value: &mut Value, segs: &[&str], patch: &Value) -> Result<(), Error> {
+    if let Some((first, rest)) = segs.split_first() {
+        let node = value
+            .get_mut(*first)
+            .ok_or_else(|| Error::Path(format!("no key {first:?} in the value")))?;
+        return merge_deep(node, rest, patch);
+    }
+    merge_value(value, patch);
+    Ok(())
+}
+
+/// Object values merge (recursively), anything else replaces.
+fn merge_value(onto: &mut Value, patch: &Value) {
+    match (onto, patch) {
+        (Value::Object(current), Value::Object(patch)) => {
+            for (key, value) in patch {
+                match current.get_mut(key) {
+                    Some(node) => merge_value(node, value),
+                    None => {
+                        current.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+        }
+        (current, patch) => *current = patch.clone(),
+    }
+}
+
+/// A merged control object back into a [`ControlSource`] (or cleared by
+/// `null`), refusing anything the type grammar rejects.
+fn target_text_parse(target: &Value, path: &str) -> Result<Option<ControlSource>, Error> {
+    if target.is_null() {
         return Ok(None);
     }
-    let text = serde_json::to_string(v).map_err(|e| Error::Value(e.to_string()))?;
+    let text = serde_json::to_string(target).map_err(|e| Error::Value(e.to_string()))?;
     text.parse::<ControlSource>()
         .map(Some)
         .map_err(|e| Error::Value(format!("{path}: {e}")))
 }
 
-/// The clip at index `c` in a track's ordered clip list, by its id./// The arrangement as a JSON tree — what `Get` reads.
+/// The arrangement as a JSON tree — what `Get` reads.
 fn arrangement_tree(player: &Player<impl Backend>) -> Value {
     let ms = |d: Duration| d.as_secs() * 1000 + u64::from(d.subsec_millis());
     let tracks: Vec<Value> = player

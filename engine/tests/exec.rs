@@ -782,3 +782,83 @@ fn exec_probes_and_renders() {
         other => panic!("expected a render refusal, got {other:?}"),
     }
 }
+
+#[test]
+fn exec_set_patches_deep_into_control_sources() {
+    let mut p = player();
+    exec(
+        &mut p,
+        insert(&src("a.wav"), Duration::ZERO, Duration::from_secs(10), Duration::ZERO, 0),
+    )
+    .unwrap();
+
+    // A second clip with no control source, for the refusal at the end.
+    exec(
+        &mut p,
+        insert(&src("a.wav"), Duration::ZERO, Duration::from_secs(5), Duration::from_secs(10), 0),
+    )
+    .unwrap();
+
+    // Set a whole LFO first, then deep-patch its rate.
+    exec(
+        &mut p,
+        Command::Set {
+            path: "track.0.clips.0.gain_control".into(),
+            patcher: serde_json::json!({"type": "lfo", "shape": "sine", "rate": 1.0}),
+        },
+    )
+    .unwrap();
+    let Outcome::Set(set) = exec(
+        &mut p,
+        Command::Set {
+            path: "track.0.clips.0.gain_control.rate".into(),
+            patcher: serde_json::json!(2.0),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected Set")
+    };
+    assert_eq!(set.patched.as_f64(), Some(2.0), "{}", set.patched);
+    assert!(p.tracks()[0].clips()[0].gain_controls[0].to_string().contains("\"rate\":2"));
+
+    // Object merge into a curve adds a keyframe without touching the rest.
+    exec(
+        &mut p,
+        Command::Set {
+            path: "track.0.clips.0.pan_control".into(),
+            patcher: serde_json::json!({"type": "curve", "0": 1.0, "2": -1.0}),
+        },
+    )
+    .unwrap();
+    let Outcome::Set(set) = exec(
+        &mut p,
+        Command::Set {
+            path: "track.0.clips.0.pan_control".into(),
+            patcher: serde_json::json!({"3.5": 0.0}),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected Set")
+    };
+    assert!(
+        set.patched["00:00:03.500"].is_number(),
+        "the keyframe landed (canonical timecode): {}",
+        set.patched
+    );
+
+    // A deep patch into nothing is refused.
+    match exec(
+        &mut p,
+        Command::Set {
+            path: "track.0.clips.1.gain_control.rate".into(),
+            patcher: serde_json::json!(2.0),
+        },
+    )
+    .unwrap_err()
+    {
+        Error::Path(msg) => assert!(msg.contains("no key"), "{msg}"),
+        other => panic!("expected Path, got {other:?}"),
+    }
+}
