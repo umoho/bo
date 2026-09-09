@@ -14,6 +14,7 @@
 //! * [`time`] — the timecode text every surface speaks.
 
 pub mod bus;
+pub mod command;
 pub mod time;
 pub mod control;
 pub mod track;

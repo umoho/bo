@@ -132,7 +132,7 @@ use bo::engine::rodio::{
 };
 use bo::engine::{Applied, Backend, BackendError, Change, Landed, Player, Silent, State};
 use bo::control::ControlSource;
-use bo::client::put_on as put_on_session;
+use bo::engine::verbs::put_on as put_on_session;
 use bo::track::{Clip, Fade, FadeShape, Source, Track};
 use clap::error::ErrorKind;
 use clap::{Parser, Subcommand};

@@ -11,37 +11,19 @@ use std::time::Duration;
 
 pub mod measure;
 pub mod rodio;
+pub mod verbs;
 pub mod timeline;
 
 use bo_core::bus::{Bus, Group};
 use bo_core::track::{Clip, Track};
 
-/// Why a backend could not do what it was told.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BackendError {
-    /// Which backend said no.
-    pub backend: String,
-    /// What it said.
-    pub message: String,
-}
+/// Why a backend could not do what it was told: data, shared with the
+/// command vocabulary ([`bo_core::command`]).
+pub use bo_core::command::BackendError;
 
-impl BackendError {
-    /// A failure from a named backend.
-    pub fn new(backend: impl Into<String>, message: impl Into<String>) -> Self {
-        Self {
-            backend: backend.into(),
-            message: message.into(),
-        }
-    }
-}
-
-impl fmt::Display for BackendError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}: {}", self.backend, self.message)
-    }
-}
-
-impl std::error::Error for BackendError {}
+/// How an edit reached the sound: data, shared with the command vocabulary
+/// ([`bo_core::command`]).
+pub use bo_core::command::Landed;
 
 /// One arrangement edit, addressed the way the CLI addresses it. This is what
 /// a running graph is asked to take without being rebuilt.
@@ -70,16 +52,6 @@ pub enum Change {
     /// the group strip is baked when the graph is built — so it waits for an
     /// `apply`, which rebuilds.
     GroupGain(u64),
-}
-
-/// How an edit reached the sound.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Landed {
-    /// The running graph took it, without interrupting playback.
-    Live,
-    /// Nothing is running, or the edit needs a graph built from scratch: it
-    /// is remembered, and lands at the next `apply`, `play` or `resume`.
-    Pending,
 }
 
 /// What [`Player::apply`] did.
