@@ -23,7 +23,7 @@
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::time::{Duration, Instant};
 use std::{env, fs, thread};
@@ -100,9 +100,11 @@ fn default_socket() -> PathBuf {
 }
 
 /// Connect to the daemon, spawning it (and clearing a stale socket) when it
-/// is not there. The daemon binary is `$BO_DAEMON` when set — that is how
-/// tests and embedders point a library connection at the real `bo` binary —
-/// otherwise the current executable (the `bo` CLI itself).
+/// is not there. The daemon binary is resolved by [`daemon_binary`]:
+/// `$BO_DAEMON` wins, then the current executable when it is the `bo` CLI
+/// itself, then a `bo` on `PATH`, then one built in this checkout. The last
+/// two are what let a host that is not the bo binary — a Python interpreter
+/// running pybo, a test harness — still spawn the daemon on demand.
 fn connect_or_spawn(socket: &PathBuf) -> Result<UnixStream, String> {
     if let Ok(stream) = UnixStream::connect(socket) {
         return Ok(stream);
@@ -112,11 +114,7 @@ fn connect_or_spawn(socket: &PathBuf) -> Result<UnixStream, String> {
         fs::create_dir_all(parent)
             .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
     }
-    let exe = match env::var("BO_DAEMON") {
-        Ok(path) => PathBuf::from(path),
-        Err(_) => env::current_exe()
-            .map_err(|e| format!("cannot find own binary: {e}"))?,
-    };
+    let exe = daemon_binary()?;
     let mut child = ProcessCommand::new(&exe)
         .arg("daemon")
         .arg("--socket")
@@ -141,6 +139,75 @@ fn connect_or_spawn(socket: &PathBuf) -> Result<UnixStream, String> {
         }
         thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// Where the bo daemon binary lives, in order:
+///
+/// 1. `$BO_DAEMON`, when set — how tests and embedders point a library
+///    connection at the real `bo` binary;
+/// 2. the current executable, when it is the `bo` CLI itself (`bo`, or
+///    `bo.exe` on Windows);
+/// 3. a `bo` on `PATH`;
+/// 4. a `bo` built in this checkout — `target/{debug,release}/bo` walking
+///    up from the working directory.
+///
+/// The last two are what let a host that is *not* the bo binary — a Python
+/// interpreter running pybo, an embedding host — spawn the daemon on demand
+/// anyway, instead of failing because `current_exe` is the host, not the tool.
+fn daemon_binary() -> Result<PathBuf, String> {
+    if let Some(path) = env::var_os("BO_DAEMON")
+        && !path.is_empty()
+    {
+        return Ok(PathBuf::from(path));
+    }
+    if let Ok(exe) = env::current_exe()
+        && is_bo(&exe)
+    {
+        return Ok(exe);
+    }
+    if let Some(paths) = env::var_os("PATH") {
+        for dir in env::split_paths(&paths) {
+            let candidate = dir.join(daemon_name());
+            if is_executable(&candidate) {
+                return Ok(candidate);
+            }
+        }
+    }
+    if let Ok(cwd) = env::current_dir() {
+        for dir in cwd.ancestors() {
+            for profile in ["debug", "release"] {
+                let candidate = dir.join("target").join(profile).join(daemon_name());
+                if is_executable(&candidate) {
+                    return Ok(candidate);
+                }
+            }
+        }
+    }
+    Err("cannot find the bo daemon binary: set $BO_DAEMON to its path".to_string())
+}
+
+/// The daemon's file name on this platform.
+fn daemon_name() -> &'static str {
+    if cfg!(windows) {
+        "bo.exe"
+    } else {
+        "bo"
+    }
+}
+
+/// Whether `exe` is the bo binary itself — the CLI the daemon lives in —
+/// and not, say, a Python interpreter hosting pybo.
+fn is_bo(exe: &Path) -> bool {
+    exe.file_name().is_some_and(|name| name == daemon_name())
+}
+
+/// Whether `path` is a file that can be executed.
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    path.is_file()
+        && std::fs::metadata(path)
+            .map(|meta| meta.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -170,5 +237,24 @@ mod tests {
         let c = Connection::at("/nonexistent-bo-dir/x.sock");
         let err = c.request(&serde_json::json!({ "cmd": "put" })).unwrap_err();
         assert!(err.contains("cannot") || err.contains("spawn"), "{err}");
+    }
+
+    #[test]
+    fn a_bo_named_executable_is_the_tool_a_python_one_is_not() {
+        assert!(is_bo(std::path::Path::new("/usr/local/bin/bo")));
+        assert!(!is_bo(std::path::Path::new("/usr/local/bin/python3.14")));
+        assert!(!is_bo(std::path::Path::new("/usr/local/bin/bo-helper")));
+    }
+
+    #[test]
+    fn bo_daemon_environment_variable_wins_the_resolution() {
+        unsafe {
+            std::env::set_var("BO_DAEMON", "/srv/bo/daemon");
+        }
+        let found = daemon_binary().expect("BO_DAEMON is always enough");
+        assert_eq!(found, PathBuf::from("/srv/bo/daemon"));
+        unsafe {
+            std::env::remove_var("BO_DAEMON");
+        }
     }
 }
