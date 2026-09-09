@@ -13,6 +13,7 @@ use std::fmt;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::bus::BusRef;
 use crate::time;
@@ -142,6 +143,9 @@ pub enum Command {
     /// Read the arrangement — the whole tree (`""`), a subtree, or a leaf
     /// ([`Command`]'s state zone and structure, as JSON).
     Get { path: String },
+    /// Patch the arrangement's state zone: a leaf scalar, or a merge over a
+    /// strip ([`Set`]). Structure is edited by the other verbs only.
+    Set { path: String, patcher: Value },
     /// Start playback from the current playhead.
     Play,
     /// Hold position and silence output.
@@ -241,6 +245,17 @@ pub struct Removed {
     pub landed: Landed,
 }
 
+/// What a patch changed, echoed ([`Command::Set`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Set {
+    /// The path that was patched.
+    pub path: String,
+    /// The canonical value now at that path.
+    pub patched: Value,
+    /// How the edit reached the sound.
+    pub landed: Landed,
+}
+
 /// What a move did, echoed ([`Command::Move`]).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Moved {
@@ -265,6 +280,8 @@ pub enum Outcome {
     Moved(Moved),
     /// The arrangement read ([`Command::Get`]).
     Tree(serde_json::Value),
+    /// The arrangement was patched ([`Command::Set`]).
+    Set(Set),
     /// A track was routed ([`Command::Route`]).
     Routed(Routed),
     /// Playback started ([`Command::Play`]).
@@ -395,6 +412,8 @@ pub enum Error {
     NoClip(String),
     /// A [`Command::Get`] path led nowhere.
     Path(String),
+    /// A patch value was refused (type, range, an unknown key).
+    Value(String),
     /// A bus-name rule was refused ('master' reserved, a duplicate name).
     Bus(String),
     /// An open-ended insert whose source could not be measured.
@@ -416,6 +435,7 @@ impl fmt::Display for Error {
             Self::NoBus(id) => write!(f, "no bus {id}"),
             Self::NoClip(what) => write!(f, "no clip {what}"),
             Self::Path(path) => write!(f, "no such path {path:?}"),
+            Self::Value(msg) => f.write_str(msg),
             Self::Bus(msg) => f.write_str(msg),
             Self::Probe { uri, why } => write!(f, "cannot measure {uri}: {why}"),
             Self::Overlap(overlap) => write!(f, "{overlap}"),

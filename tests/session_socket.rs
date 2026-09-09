@@ -306,3 +306,28 @@ fn get_reads_the_arrangement_over_the_wire() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn set_patches_over_the_wire() {
+    let dir = temp_dir();
+    let socket = dir.join("d.sock");
+    let _daemon = spawn_daemon(&socket);
+
+    let mut bo = Bo::with_connection(Connection::at(&socket));
+    bo.put(
+        Clip::of("a.wav").trim(TimecodeRange::from((Duration::ZERO, Duration::from_secs(10)))),
+        TrackIndex(0).at(Duration::ZERO),
+    )
+    .unwrap();
+
+    let set = bo.set("track.0", serde_json::json!({"volume": 0.4, "muted": true})).unwrap();
+    assert_eq!(set.path, "track.0");
+    assert!((set.patched["volume"].as_f64().unwrap() - 0.4).abs() < 1e-6);
+    assert_eq!(set.patched["muted"], true);
+
+    let track = bo.get("track.0").unwrap();
+    assert_eq!(track["muted"], true);
+    assert_eq!(track["name"], serde_json::Value::Null);
+
+    std::fs::remove_dir_all(&dir).ok();
+}

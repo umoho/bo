@@ -510,3 +510,116 @@ fn exec_get_reads_the_arrangement_as_a_tree() {
         other => panic!("expected Path, got {other:?}"),
     }
 }
+
+#[test]
+fn exec_set_patches_the_state_zone() {
+    let mut p = player();
+    exec(
+        &mut p,
+        insert(&src("a.wav"), Duration::ZERO, Duration::from_secs(10), Duration::ZERO, 0),
+    )
+    .unwrap();
+    exec(
+        &mut p,
+        Command::Route { track: 0, bus: RouteBus::New { name: Some("music".into()) } },
+    )
+    .unwrap();
+
+    // Leaf patch: a scalar at a path.
+    let Outcome::Set(set) = exec(
+        &mut p,
+        Command::Set {
+            path: "track.0.volume".into(),
+            patcher: serde_json::json!(0.4),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected Set")
+    };
+    assert!((set.patched.as_f64().unwrap() - 0.4).abs() < 1e-6, "{}", set.patched);
+    assert!((p.tracks()[0].volume() - 0.4).abs() < 1e-6);
+
+    // Strip patch: an object merges, missing keys untouched.
+    let Outcome::Set(_) = exec(
+        &mut p,
+        Command::Set {
+            path: "track.0".into(),
+            patcher: serde_json::json!({"muted": true}),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected Set")
+    };
+    assert!(p.tracks()[0].muted());
+    assert!((p.tracks()[0].volume() - 0.4).abs() < 1e-6, "patch leaves volume alone");
+
+    // Master and bus strips.
+    exec(
+        &mut p,
+        Command::Set { path: "master.volume".into(), patcher: serde_json::json!(0.8) },
+    )
+    .unwrap();
+    assert!((p.volume() - 0.8).abs() < 1e-6);
+    exec(
+        &mut p,
+        Command::Set { path: "bus.0.volume".into(), patcher: serde_json::json!(0.5) },
+    )
+    .unwrap();
+    assert!((p.groups()[0].gain() - 0.5).abs() < 1e-6);
+
+    // Refusals: unknown key, structure path, bad type, missing track/bus.
+    let Outcome::Tree(tree) = exec(&mut p, Command::Get { path: String::new() }).unwrap() else {
+        panic!("expected a tree")
+    };
+    assert!((tree["track"][0]["volume"].as_f64().unwrap() - 0.4).abs() < 1e-6);
+    match exec(
+        &mut p,
+        Command::Set { path: "track.0.nope".into(), patcher: serde_json::json!(1) },
+    )
+    .unwrap_err()
+    {
+        Error::Value(msg) => assert!(msg.contains("unknown track property"), "{msg}"),
+        other => panic!("expected Value, got {other:?}"),
+    }
+    match exec(
+        &mut p,
+        Command::Set {
+            path: "track.0.clips.0.gain".into(),
+            patcher: serde_json::json!(0.5),
+        },
+    )
+    .unwrap_err()
+    {
+        Error::Path(_) => {}
+        other => panic!("expected Path, got {other:?}"),
+    }
+    match exec(
+        &mut p,
+        Command::Set { path: "track.0.muted".into(), patcher: serde_json::json!(2) },
+    )
+    .unwrap_err()
+    {
+        Error::Value(_) => {}
+        other => panic!("expected Value, got {other:?}"),
+    }
+    match exec(
+        &mut p,
+        Command::Set { path: "track.9.volume".into(), patcher: serde_json::json!(1) },
+    )
+    .unwrap_err()
+    {
+        Error::NoTrack(9) => {}
+        other => panic!("expected NoTrack, got {other:?}"),
+    }
+    match exec(
+        &mut p,
+        Command::Set { path: "bus.7.volume".into(), patcher: serde_json::json!(1) },
+    )
+    .unwrap_err()
+    {
+        Error::NoBus(7) => {}
+        other => panic!("expected NoBus, got {other:?}"),
+    }
+}

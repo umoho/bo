@@ -37,7 +37,7 @@ use crate::connection::Connection;
 
 // The command protocol, shared with the engine and the daemon.
 pub use bo_core::command::{
-    Applied, Command, Error, Inserted, Landed, Moved, Outcome, Overlap, PlacedClip, Played, Removed, Reply, Routed,
+    Applied, Command, Error, Inserted, Landed, Moved, Outcome, Overlap, PlacedClip, Played, Removed, Reply, Routed, Set,
 };
 pub use bo_core::bus::BusRef;
 use bo_core::command::{ClipHere, OnTrack, RouteBus};
@@ -478,6 +478,20 @@ impl Bo {
                 track: on.0,
                 clip: ClipHere::At(at.duration()),
             },
+        }
+    }
+
+    /// Patch the state zone: a leaf scalar (`track.0.volume`), or a merge
+    /// over a strip (`track.0` with `{"volume":…,"muted":…}`) — missing
+    /// keys untouched, unknown keys refused. Structure is edited by the
+    /// verbs, not here.
+    pub fn set(&mut self, path: &str, patcher: serde_json::Value) -> Result<Set, Error> {
+        match self.exec(Command::Set {
+            path: path.to_string(),
+            patcher,
+        })? {
+            Outcome::Set(set) => Ok(set),
+            other => Err(unexpected(&other)),
         }
     }
 

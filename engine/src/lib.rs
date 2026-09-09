@@ -22,7 +22,7 @@ pub mod session;
 pub mod timeline;
 
 use bo_core::bus::{Bus, BusRef, Group};
-use bo_core::command::{ClipHere, Command, Error, Inserted, Moved, OnTrack, Outcome, Overlap, PlacedClip, Played, Removed, RouteBus, Routed};
+use bo_core::command::{ClipHere, Command, Error, Inserted, Moved, OnTrack, Outcome, Overlap, PlacedClip, Played, Removed, RouteBus, Routed, Set};
 use bo_core::track::{Clip, Fade, Source, Track};
 
 /// Why a backend could not do what it was told: data, shared with the
@@ -819,6 +819,10 @@ pub fn exec<B: Backend>(player: &mut Player<B>, command: Command) -> Result<Outc
             };
             Ok(Outcome::Tree(node))
         }
+        Command::Set { path, patcher } => {
+            let (patched, landed) = apply_patch(player, &path, &patcher)?;
+            Ok(Outcome::Set(Set { path, patched, landed }))
+        }
         Command::Play => {
             player.play().map_err(Error::Backend)?;
             Ok(Outcome::Played(Played {
@@ -854,6 +858,203 @@ pub fn exec<B: Backend>(player: &mut Player<B>, command: Command) -> Result<Outc
         }
     }
 }
+/// Apply a state-zone patch: a leaf scalar, or a merge over a strip node.
+/// Returns the canonical value now at `path` and how the edit landed.
+fn apply_patch(
+    player: &mut Player<impl Backend>,
+    path: &str,
+    patcher: &Value,
+) -> Result<(Value, Landed), Error> {
+    let mut landed_last = None;
+    let segs: Vec<&str> = path.split('.').filter(|s| !s.is_empty()).collect();
+    match segs.as_slice() {
+        ["master"] => {
+            let Some(volume) = patcher.get("volume") else {
+                return Err(Error::Value("master takes {volume}".to_string()));
+            };
+            player.set_volume(num(volume, "master.volume")?);
+        }
+        ["master", "volume"] => player.set_volume(num(patcher, path)?),
+        ["track", index, prop] => {
+            let index = track_index(player, index)?;
+            let prop = *prop;
+            patch_track_prop(player, index, prop, patcher, path, &mut landed_last)?;
+        }
+        ["track", index] => {
+            let index = track_index(player, index)?;
+            patch_track_strip(player, index, patcher, path, &mut landed_last)?;
+        }
+        ["bus", index, prop] => {
+            let id = bus_id(player, index)?;
+            let prop = *prop;
+            patch_bus_prop(player, id, prop, patcher, path, &mut landed_last)?;
+        }
+        ["bus", index] => {
+            let id = bus_id(player, index)?;
+            patch_bus_strip(player, id, patcher, path, &mut landed_last)?;
+        }
+        _ => return Err(Error::Path(format!("{path:?} is not a writable state path"))),
+    }
+    // Echo the canonical value now at the path.
+    let patched = get_path(&arrangement_tree(player), path)
+        .map_err(Error::Path)?
+        .clone();
+    Ok((patched, landed_last.unwrap_or(Landed::Live)))
+}
+
+fn track_index(player: &Player<impl Backend>, index: &str) -> Result<usize, Error> {
+    let index: usize = index.parse().map_err(|_| Error::Path(format!("bad track {index:?}")))?;
+    if index >= player.tracks().len() {
+        return Err(Error::NoTrack(index));
+    }
+    Ok(index)
+}
+
+fn bus_id(player: &Player<impl Backend>, index: &str) -> Result<u64, Error> {
+    let id: u64 = index.parse().map_err(|_| Error::Path(format!("bad bus {index:?}")))?;
+    if player.group(id).is_none() {
+        return Err(Error::NoBus(id));
+    }
+    Ok(id)
+}
+
+/// A patcher number, or a typed refusal.
+fn num(v: &Value, path: &str) -> Result<f32, Error> {
+    v.as_f64()
+        .map(|n| n as f32)
+        .ok_or_else(|| Error::Value(format!("{path}: expected a number")))
+}
+
+fn land(player: &mut Player<impl Backend>, change: Change, landed_last: &mut Option<Landed>) {
+    *landed_last = Some(player.changed(change));
+}
+
+fn patch_track_prop(
+    player: &mut Player<impl Backend>,
+    index: usize,
+    prop: &str,
+    value: &Value,
+    path: &str,
+    landed_last: &mut Option<Landed>,
+) -> Result<(), Error> {
+    match prop {
+        "volume" => {
+            let v = num(value, path)?;
+            player.tracks_mut()[index].set_volume(v);
+            land(player, Change::TrackGain(index), landed_last);
+        }
+        "pan" => {
+            let v = num(value, path)?;
+            player.tracks_mut()[index].set_pan(v);
+            land(player, Change::TrackPan(index), landed_last);
+        }
+        "muted" => {
+            let muted = value
+                .as_bool()
+                .ok_or_else(|| Error::Value(format!("{path}: expected true or false")))?;
+            player.tracks_mut()[index].set_muted(muted);
+            land(player, Change::TrackGain(index), landed_last);
+        }
+        "name" => {
+            let name = value
+                .as_str()
+                .ok_or_else(|| Error::Value(format!("{path}: expected a name")))?;
+            player.tracks_mut()[index].set_name(name);
+        }
+        other => return Err(Error::Value(format!("unknown track property {other:?}"))),
+    }
+    Ok(())
+}
+
+fn patch_track_strip(
+    player: &mut Player<impl Backend>,
+    index: usize,
+    patcher: &Value,
+    path: &str,
+    landed_last: &mut Option<Landed>,
+) -> Result<(), Error> {
+    let obj = patcher
+        .as_object()
+        .ok_or_else(|| Error::Value(format!("{path}: expected an object of properties")))?;
+    for (key, value) in obj {
+        if key == "clips" {
+            return Err(Error::Value(format!("{path}.{key} is structure; edit clips with verbs")));
+        }
+        patch_track_prop(player, index, key, value, &format!("{path}.{key}"), landed_last)?;
+    }
+    Ok(())
+}
+
+fn patch_bus_prop(
+    player: &mut Player<impl Backend>,
+    id: u64,
+    prop: &str,
+    value: &Value,
+    path: &str,
+    landed_last: &mut Option<Landed>,
+) -> Result<(), Error> {
+    match prop {
+        "volume" => {
+            let v = num(value, path)?;
+            player
+                .group_mut(id)
+                .ok_or(Error::NoBus(id))?
+                .set_gain(v);
+            land(player, Change::GroupGain(id), landed_last);
+        }
+        "muted" => {
+            let muted = value
+                .as_bool()
+                .ok_or_else(|| Error::Value(format!("{path}: expected true or false")))?;
+            player
+                .group_mut(id)
+                .ok_or(Error::NoBus(id))?
+                .set_muted(muted);
+            land(player, Change::GroupGain(id), landed_last);
+        }
+        "name" => {
+            let name = value
+                .as_str()
+                .ok_or_else(|| Error::Value(format!("{path}: expected a name")))?;
+            if name == "master" {
+                return Err(Error::Bus("'master' is reserved for the master bus".into()));
+            }
+            if let Some(other) = player
+                .groups()
+                .iter()
+                .find(|g| g.id() != id && g.name() == Some(name))
+            {
+                return Err(Error::Bus(format!(
+                    "a bus named {name:?} already exists as #{}",
+                    other.id()
+                )));
+            }
+            player
+                .group_mut(id)
+                .ok_or(Error::NoBus(id))?
+                .set_name(name);
+        }
+        other => return Err(Error::Value(format!("unknown bus property {other:?}"))),
+    }
+    Ok(())
+}
+
+fn patch_bus_strip(
+    player: &mut Player<impl Backend>,
+    id: u64,
+    patcher: &Value,
+    path: &str,
+    landed_last: &mut Option<Landed>,
+) -> Result<(), Error> {
+    let obj = patcher
+        .as_object()
+        .ok_or_else(|| Error::Value(format!("{path}: expected an object of properties")))?;
+    for (key, value) in obj {
+        patch_bus_prop(player, id, key, value, &format!("{path}.{key}"), landed_last)?;
+    }
+    Ok(())
+}
+
 /// The arrangement as a JSON tree — what `Get` reads.
 fn arrangement_tree(player: &Player<impl Backend>) -> Value {
     let ms = |d: Duration| d.as_secs() * 1000 + u64::from(d.subsec_millis());
