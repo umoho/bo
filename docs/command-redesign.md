@@ -42,18 +42,18 @@ grammar is being replanned onto it.
 | `take …`        | `Remove { track, clip: ClipHere }` | `Removed { track, clip, landed }` | done |
 | `move …` | `Move { track, clip: ClipHere, to: OnTrack }` | `Moved { from_track, to_track, clip, landed }` | done |
 | `route …`        | `Route { track, bus: RouteBus }` (Master/Group/New) | `Routed { track, bus, landed }` | done |
-| `ls` / `at t`          | `Get { path }` | tree JSON | in progress |
-| `set <path> <value>`   | `Set { path, value }` — state zone, patch | `Set { path, value, landed }` | next |
-| `render file [range]`  | `Render { file?, range?, measure?, mono? }` | `Rendered { duration, stats? }` | next |
-| `probe uri`            | `Probe { uri }` | `Probed { length, channels }` | next |
+| `ls` / `at t`          | `Get { path }` | `Outcome::Tree(JSON)` | done |
+| `set <path> <value>`   | `Set { path, patcher }` — state zone, deep patch | `Outcome::Set(Set{ path, patched, landed })` | done |
+| `probe uri`            | `Probe { uri }` | `Probed { uri, length_ms, estimated, channels }` | done |
+| `render file [range]`  | `Render { file, from?, to? }` | `Rendered { file, duration_ms }` | done (range/measure/mono next) |
 | `check`                | revisit: `Check` over sources | — | design |
 | `save`/`load`          | snapshot: `Get` whole tree ↔ replay | — | design |
 
 ## Set / Get — the arrangement as a tree
 
 Reading is one `Get(path)` returning JSON: the whole tree (`""`), a
-subtree, or a leaf. Durations are canonical timecode text inside tree
-values; ids are stable and present on every clip.
+subtree, or a leaf. Durations are whole milliseconds; ids are stable and
+present on every clip.
 
 ```
 master        { volume }
@@ -63,18 +63,31 @@ track.N       { name, volume, pan, muted, clips: [ {id, uri, from, to,
 bus.N         { name, volume, muted }
 ```
 
-`Set` writes only the **state zone** (strips, clip params, names):
+`Set` writes only the **state zone** (strips, clip params, controls,
+names) — the tree is there precisely so the patch can go **deep**:
 
-- leaf path + scalar: validated/clamped, lands via the transport's live/pending
-  semantics;
-- interior state node + object: **patch** — missing keys untouched, unknown
-  keys refused, each key lands independently;
-- structure (`track[]`, `track.N.clips`, `bus[]` membership) has **no set
-  entry**: it is edited by verbs (`Insert`, `Remove`, `Move`, `Route`) only.
+- leaf path + scalar: validated/clamped, lands via the transport's
+  live/pending semantics;
+- interior state node + object: **merge** — missing keys untouched; each key
+  lands independently;
+- deep paths into a clip's control source (`…clips.C.gain_control.rate`)
+  merge into the current source and rewrite it typed and validated; an
+  object at the control path adds/merges into the source already there
+  (curve keyframes), `null` clears the input;
+- structure (`track[]`, `bus[]` membership) and clip membership have **no
+  set entry**: they are edited by verbs (`Insert`, `Remove`, `Move`,
+  `Route`) only, so a `clips` key in a track patch is refused.
 
-Keys/paths are a small grammar (`master`, `track.N.volume`, `clip.T.C.gain_control`,
-`bus.N.muted` …) shared by text, typed client and daemon — defined once in
-core, rendered by the text layer.
+Paths are the tree's own (`master.volume`, `track.N`, `track.N.clips.M`,
+`track.N.clips.M.gain_control.rate`, `bus.N.muted`) — shared by text, typed
+client and daemon, defined once in core. A clip is addressed by its index
+in the track's ordered list; its stable id rides inside the object. (Dotted
+paths split on `.`, so curve keyframes whose timecodes carry decimals are
+patched by object merge at the control path, never as a deeper path.)
+
+Writable today: master volume; `track.N.{name,volume,pan,muted}`;
+`bus.N.{name,volume,muted}`; `track.N.clips.M.{gain, fade_in, fade_out,
+pan, pan_control, gain_control}` (pan/controls deep as above).
 
 ## Replies
 
@@ -94,14 +107,14 @@ Python one shared read/write vocabulary.
 
 Per-command fold, each step green:
 
-1. text put/transport → `Command`; delete `put_command`/`play_command`/…
-   execution bodies; daemon serves through `Session`; replies rendered from
-   `Outcome`. Semantics already covered by engine/exec tests.
+1. text put/transport → `Command`; delete execution bodies; daemon serves
+   through `Session`; replies rendered from `Outcome`. (done)
 2. `Remove`, `Move`, `Route` commands + their text; semantics tests in
-   engine, thin grammar tests in text.
-3. tree `Get`/`Set` + state-zone rules; `ls`/`at`/`set` text become
-   rendering of the tree.
-4. `Render`, `Probe`; then revisit `check`/`save`/`load` as snapshot
+   engine. (done)
+3. tree `Get`/`Set` with deep patch; `ls`/`at`/`set` text become rendering
+   of the tree. (engine done; the text surface is still the old one)
+4. `Probe`, `Render` (file/whole range) (done); `Render` range/measure/mono
+   still to wire; then revisit `check`/`save`/`load` as snapshot
    round-trips of the tree.
 5. Close the engine: `pub use session::Session;` only; delete
    `player_mut` and the transitional exports.
