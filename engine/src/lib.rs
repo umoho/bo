@@ -893,6 +893,17 @@ fn apply_patch(
             let id = bus_id(player, index)?;
             patch_bus_strip(player, id, patcher, path, &mut landed_last)?;
         }
+        ["track", t, "clips", c, prop] => {
+            let t = track_index(player, t)?;
+            let c = clip_index(player, t, c)?;
+            let prop = *prop;
+            patch_clip_prop(player, t, c, prop, patcher, path, &mut landed_last)?;
+        }
+        ["track", t, "clips", c] => {
+            let t = track_index(player, t)?;
+            let c = clip_index(player, t, c)?;
+            patch_clip_strip(player, t, c, patcher, path, &mut landed_last)?;
+        }
         _ => return Err(Error::Path(format!("{path:?} is not a writable state path"))),
     }
     // Echo the canonical value now at the path.
@@ -916,6 +927,71 @@ fn bus_id(player: &Player<impl Backend>, index: &str) -> Result<u64, Error> {
         return Err(Error::NoBus(id));
     }
     Ok(id)
+}
+
+/// The clip at index `c` in a track's ordered clip list, by its id.
+fn clip_index(player: &Player<impl Backend>, track: usize, c: &str) -> Result<u64, Error> {
+    let c: usize = c
+        .parse()
+        .map_err(|_| Error::Path(format!("bad clip index {c:?}")))?;
+    player.tracks()[track]
+        .clips()
+        .get(c)
+        .map(|clip| clip.id)
+        .ok_or_else(|| Error::Path(format!("no clip index {c}")))
+}
+
+fn patch_clip_prop(
+    player: &mut Player<impl Backend>,
+    track: usize,
+    id: u64,
+    prop: &str,
+    value: &Value,
+    path: &str,
+    landed_last: &mut Option<Landed>,
+) -> Result<(), Error> {
+    match prop {
+        "gain" => {
+            let v = num(value, path)?.clamp(0.0, 1.0);
+            player.tracks_mut()[track].clip_mut(id).expect("index resolved").gain = v;
+        }
+        "fade_in" => {
+            let ms = ms_value(value, path)?;
+            player.tracks_mut()[track].clip_mut(id).expect("index resolved").fade.fade_in = ms;
+        }
+        "fade_out" => {
+            let ms = ms_value(value, path)?;
+            player.tracks_mut()[track].clip_mut(id).expect("index resolved").fade.fade_out = ms;
+        }
+        other => return Err(Error::Value(format!("unknown clip property {other:?}"))),
+    }
+    land(player, Change::ClipParams(track, id), landed_last);
+    Ok(())
+}
+
+fn patch_clip_strip(
+    player: &mut Player<impl Backend>,
+    track: usize,
+    id: u64,
+    patcher: &Value,
+    path: &str,
+    landed_last: &mut Option<Landed>,
+) -> Result<(), Error> {
+    let obj = patcher
+        .as_object()
+        .ok_or_else(|| Error::Value(format!("{path}: expected an object of properties")))?;
+    for (key, value) in obj {
+        patch_clip_prop(player, track, id, key, value, &format!("{path}.{key}"), landed_last)?;
+    }
+    Ok(())
+}
+
+/// A patcher number interpreted as whole milliseconds.
+fn ms_value(v: &Value, path: &str) -> Result<Duration, Error> {
+    let ms = v
+        .as_u64()
+        .ok_or_else(|| Error::Value(format!("{path}: expected whole milliseconds")))?;
+    Ok(Duration::from_millis(ms))
 }
 
 /// A patcher number, or a typed refusal.
@@ -1073,6 +1149,8 @@ fn arrangement_tree(player: &Player<impl Backend>) -> Value {
                         "to": ms(c.to),
                         "at": ms(c.at),
                         "gain": c.gain,
+                        "fade_in": ms(c.fade.fade_in),
+                        "fade_out": ms(c.fade.fade_out),
                     })
                 })
                 .collect();

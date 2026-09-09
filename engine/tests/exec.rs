@@ -583,16 +583,52 @@ fn exec_set_patches_the_state_zone() {
         Error::Value(msg) => assert!(msg.contains("unknown track property"), "{msg}"),
         other => panic!("expected Value, got {other:?}"),
     }
-    match exec(
+    // Clip params are writable too — gain and fades, by the clip's array
+    // index in the tree.
+    let Outcome::Set(set) = exec(
         &mut p,
         Command::Set {
             path: "track.0.clips.0.gain".into(),
             patcher: serde_json::json!(0.5),
         },
     )
+    .unwrap()
+    else {
+        panic!("expected Set")
+    };
+    assert!((set.patched.as_f64().unwrap() - 0.5).abs() < 1e-6);
+    exec(
+        &mut p,
+        Command::Set {
+            path: "track.0.clips.0".into(),
+            patcher: serde_json::json!({"fade_in": 500, "fade_out": 250}),
+        },
+    )
+    .unwrap();
+    assert_eq!(p.tracks()[0].clips()[0].fade.fade_in, Duration::from_millis(500));
+    assert_eq!(p.tracks()[0].clips()[0].fade.fade_out, Duration::from_millis(250));
+    match exec(
+        &mut p,
+        Command::Set {
+            path: "track.0.clips.0.chorus".into(),
+            patcher: serde_json::json!(1),
+        },
+    )
     .unwrap_err()
     {
-        Error::Path(_) => {}
+        Error::Value(msg) => assert!(msg.contains("unknown clip property"), "{msg}"),
+        other => panic!("expected Value, got {other:?}"),
+    }
+    match exec(
+        &mut p,
+        Command::Set {
+            path: "track.0.clips.5.gain".into(),
+            patcher: serde_json::json!(0.5),
+        },
+    )
+    .unwrap_err()
+    {
+        Error::Path(msg) => assert!(msg.contains("no clip index"), "{msg}"),
         other => panic!("expected Path, got {other:?}"),
     }
     match exec(
