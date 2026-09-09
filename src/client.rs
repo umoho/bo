@@ -23,7 +23,7 @@
 //! use std::time::Duration;
 //!
 //! let mut bo = Bo::new();   // the default connection: the shared daemon
-//! let clip = Clip::of("bed.wav").trim(Duration::from_secs(60), Duration::from_secs(120));
+//! let clip = Clip::of("bed.wav").trim("1:00-2:00".parse()?);
 //! let put = bo.put(clip, TrackRef(0).at(Duration::from_secs(30)))?;
 //! assert_eq!(put.track, 0);
 //! # Ok::<(), bo::client::Error>(())
@@ -38,6 +38,104 @@ use crate::connection::Connection;
 pub use bo_core::command::{
     Applied, Command, Error, Inserted, Landed, Outcome, Overlap, PlacedClip, Played, Reply,
 };
+
+/// A timecode: a point in time, parsed from the lenient forms the whole
+/// tool speaks — `SS`, `MM:SS` or `HH:MM:SS` with an optional `.fff`
+/// fraction (`"3.2"`, `"1:00"`, `"00:01:30.500"`). DAW text for a moment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct Timecode(pub Duration);
+
+impl Timecode {
+    /// The moment, as a duration.
+    #[must_use]
+    pub const fn duration(self) -> Duration {
+        self.0
+    }
+}
+
+impl fmt::Display for Timecode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&bo_core::time::format(self.0))
+    }
+}
+
+impl std::str::FromStr for Timecode {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        bo_core::time::parse(s).map(Timecode).map_err(Error::Parse)
+    }
+}
+
+impl From<Duration> for Timecode {
+    fn from(d: Duration) -> Self {
+        Self(d)
+    }
+}
+
+impl From<Timecode> for Duration {
+    fn from(t: Timecode) -> Self {
+        t.0
+    }
+}
+
+/// A span of a source's time, parsed as `from-to` (the CLI's slice text):
+/// `"1:00-2:00"` for a closed span, `"1:00-"` to the source's end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TimecodeRange {
+    /// Where the span starts, measured into the source.
+    pub from: Timecode,
+    /// Where it ends; `None` = the source's end.
+    pub to: Option<Timecode>,
+}
+
+impl TimecodeRange {
+    /// A closed span.
+    #[must_use]
+    pub const fn closed(from: Timecode, to: Timecode) -> Self {
+        Self { from, to: Some(to) }
+    }
+
+    /// From `from` to the source's end.
+    #[must_use]
+    pub const fn open(from: Timecode) -> Self {
+        Self { from, to: None }
+    }
+}
+
+impl fmt::Display for TimecodeRange {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}-{}", self.from, match self.to {
+            Some(to) => to.to_string(),
+            None => String::new(),
+        })
+    }
+}
+
+impl std::str::FromStr for TimecodeRange {
+    type Err = Error;
+
+    /// Parse `from-to`, or `from-` for the source's end.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let s = s.trim();
+        let (from, to) = s.split_once('-').ok_or_else(|| {
+            Error::Parse(format!("bad timecode range {s:?}: expected from-to"))
+        })?;
+        let from: Timecode = from.trim().parse()?;
+        let to = if to.trim().is_empty() {
+            None
+        } else {
+            Some(to.trim().parse()?)
+        };
+        Ok(Self { from, to })
+    }
+}
+
+impl From<(Duration, Duration)> for TimecodeRange {
+    fn from((from, to): (Duration, Duration)) -> Self {
+        Self::closed(from.into(), to.into())
+    }
+}
 
 /// Material to place: a source and the `from..to` window of it to play.
 /// `to: None` means the source's end — resolved by probing when the clip is
@@ -68,27 +166,28 @@ impl Clip {
         }
     }
 
-    /// Trim the material to the `from .. to` span of its source.
+    /// Trim the material to a span of its source: `"1:00-2:00"`, or
+    /// `"1:00-"` for the tail.
     #[must_use]
-    pub const fn trim(mut self, from: Duration, to: Duration) -> Self {
-        self.from = from;
-        self.to = Some(to);
+    pub fn trim(mut self, range: TimecodeRange) -> Self {
+        self.from = range.from.duration();
+        self.to = range.to.map(Timecode::duration);
         self
     }
 
     /// Trim the material to start at `from`, running to the source's end.
     #[must_use]
-    pub const fn trim_to_end(mut self, from: Duration) -> Self {
-        self.from = from;
+    pub fn trim_to_end(mut self, from: Timecode) -> Self {
+        self.from = from.duration();
         self.to = None;
         self
     }
 
     /// Trim the material to the source's first `to`.
     #[must_use]
-    pub const fn trim_from_begin(mut self, to: Duration) -> Self {
+    pub fn trim_from_begin(mut self, to: Timecode) -> Self {
         self.from = Duration::ZERO;
-        self.to = Some(to);
+        self.to = Some(to.duration());
         self
     }
 }
@@ -268,9 +367,25 @@ fn unexpected(outcome: &Outcome) -> Error {
 mod tests {
     use super::*;
 
+
+    #[test]
+    fn timecode_text_parses_and_formats() {
+        let t: Timecode = "1:00".parse().unwrap();
+        assert_eq!(t.duration(), Duration::from_secs(60));
+        assert_eq!(t.to_string(), "00:01:00.000");
+        let r: TimecodeRange = "1:00-2:00".parse().unwrap();
+        assert_eq!(r.from.duration(), Duration::from_secs(60));
+        assert_eq!(r.to.map(Timecode::duration), Some(Duration::from_secs(120)));
+        assert_eq!("1:00-".parse::<TimecodeRange>().unwrap().to, None);
+        assert!("1:00".parse::<TimecodeRange>().is_err(), "needs a -");
+        let c = Clip::of("a.wav").trim(r);
+        assert_eq!(c.from, Duration::from_secs(60));
+        assert_eq!(c.to, Some(Duration::from_secs(120)));
+    }
+
     #[test]
     fn material_and_placement_expand_into_a_flat_command() {
-        let clip = Clip::of("a.wav").trim(Duration::ZERO, Duration::from_secs(5));
+        let clip = Clip::of("a.wav").trim(TimecodeRange::from((Duration::ZERO, Duration::from_secs(5))));
         let to = TrackPosition::from((3, Duration::from_secs(9)));
         let cmd = Command::Insert {
             uri: clip.uri,

@@ -7,7 +7,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use bo::client::{Bo, Clip, Error, TrackRef};
+use bo::client::{Bo, Clip, Error, TimecodeRange, TrackRef};
 use bo::connection::Connection;
 
 fn temp_dir() -> PathBuf {
@@ -92,7 +92,7 @@ fn bo_put_reaches_the_daemon_and_shares_its_arrangement_with_the_cli() {
     // A closed window needs no file: nothing is probed.
     let put = bo
         .put(
-            Clip::of("bed.wav").trim(Duration::from_secs(10), Duration::from_secs(20)),
+            Clip::of("bed.wav").trim(TimecodeRange::from((Duration::from_secs(10), Duration::from_secs(20)))),
             TrackRef(0).at(Duration::from_secs(5)),
         )
         .expect("the daemon accepts the put");
@@ -109,7 +109,7 @@ fn bo_put_reaches_the_daemon_and_shares_its_arrangement_with_the_cli() {
     let mut other = Bo::with_connection(Connection::at(&socket));
     let put = other
         .put(
-            Clip::of("voice.wav").trim(Duration::ZERO, Duration::from_secs(5)),
+            Clip::of("voice.wav").trim(TimecodeRange::from((Duration::ZERO, Duration::from_secs(5)))),
             TrackRef(1).at(Duration::ZERO),
         )
         .expect("voice joins on a fresh track");
@@ -129,13 +129,13 @@ fn a_refused_put_comes_back_as_a_typed_overlap() {
 
     let mut bo = Bo::with_connection(Connection::at(&socket));
     bo.put(
-        Clip::of("a.wav").trim(Duration::ZERO, Duration::from_secs(10)),
+        Clip::of("a.wav").trim(TimecodeRange::from((Duration::ZERO, Duration::from_secs(10)))),
         TrackRef(0).at(Duration::ZERO),
     )
     .unwrap();
     let err = bo
         .put(
-            Clip::of("b.wav").trim(Duration::ZERO, Duration::from_secs(10)),
+            Clip::of("b.wav").trim(TimecodeRange::from((Duration::ZERO, Duration::from_secs(10)))),
             TrackRef(0).at(Duration::ZERO),
         )
         .unwrap_err();
@@ -162,7 +162,7 @@ fn session_default_spawns_the_daemon_on_demand() {
     unsafe { std::env::set_var("BO_DAEMON", env!("CARGO_BIN_EXE_bo")) };
     let put = bo
         .put(
-            Clip::of("a.wav").trim(Duration::ZERO, Duration::from_secs(1)),
+            Clip::of("a.wav").trim(TimecodeRange::from((Duration::ZERO, Duration::from_secs(1)))),
             TrackRef(0).at(Duration::ZERO),
         )
         .expect("the first request spawns the daemon");
@@ -194,7 +194,7 @@ fn transport_verbs_round_trip_through_the_daemon() {
 
     let mut bo = Bo::with_connection(Connection::at(&socket));
     bo.put(
-        Clip::of("a.wav").trim(Duration::ZERO, Duration::from_secs(10)),
+        Clip::of("a.wav").trim(TimecodeRange::from((Duration::ZERO, Duration::from_secs(10)))),
         TrackRef(0).at(Duration::ZERO),
     )
     .unwrap();
