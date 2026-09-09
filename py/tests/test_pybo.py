@@ -74,14 +74,14 @@ def test_trim_builds_a_source_window():
     assert (closed.from_ms, closed.to_ms) == (30_000, 60_000)
     tail = pybo.trim("voice.wav", "0:30-")
     assert (tail.from_ms, tail.to_ms) == (30_000, None)
-    kw = pybo.trim("voice.wav", start="0:30", to=90)
+    kw = pybo.trim("voice.wav", start="0:30", end=90)
     assert (kw.from_ms, kw.to_ms) == (30_000, 90_000)
     with pytest.raises(ValueError):
         pybo.trim("voice.wav", "0:30-1:00", start="0:00")  # range or kw, not both
     with pytest.raises(ValueError):
         pybo.trim("voice.wav", "1:00-0:30")  # to before from
     with pytest.raises(ValueError):
-        pybo.trim("voice.wav", start="1:00", to="0:30")
+        pybo.trim("voice.wav", start="1:00", end="0:30")
 
 
 def test_track_placements_read_back():

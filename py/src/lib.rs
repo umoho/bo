@@ -154,57 +154,57 @@ impl Material {
 }
 
 /// Slice `uri` to a window of its own time: the whole source, a
-/// `from-to` span, an open `from-` tail, or `start`/`to` moments.
+/// `from-to` span, an open `from-` tail, or `start`/`end` moments.
 ///
 /// ```python
 /// clip = pybo.trim("voice.wav")              # the whole source
 /// clip = pybo.trim("voice.wav", "0:30-1:00") # a closed span
 /// clip = pybo.trim("voice.wav", "0:30-")     # to the source's end
-/// clip = pybo.trim("voice.wav", start="0:30", to="1:00")
+/// clip = pybo.trim("voice.wav", start="0:30", end="1:00")
 /// ```
 #[pyfunction]
-#[pyo3(signature = (uri, range=None, *, start=None, to=None))]
+#[pyo3(signature = (uri, range=None, *, start=None, end=None))]
 fn trim(
     uri: String,
     range: Option<&Bound<'_, PyAny>>,
     start: Option<&Bound<'_, PyAny>>,
-    to: Option<&Bound<'_, PyAny>>,
+    end: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<Material> {
-    let (from, end) = match (range, start, to) {
+    let (from, to_ms) = match (range, start, end) {
         (Some(text), None, None) => {
             let from_to = parse_range_text(&text.extract::<String>()?)?;
             (ms_of(from_to.0), from_to.1.map(ms_of))
         }
-        (None, start, to) => {
+        (None, start, end) => {
             let from = match start {
                 Some(s) => coerce_ms(s)?,
                 None => 0,
             };
-            let to = match to {
+            let to_ms = match end {
                 Some(t) => Some(coerce_ms(t)?),
                 None => None,
             };
-            if let Some(to) = to
+            if let Some(to) = to_ms
                 && to < from
             {
                 return Err(PyValueError::new_err(format!(
-                    "trim to {} before from {}",
+                    "trim end {} before start {}",
                     tc_text(to),
                     tc_text(from)
                 )));
             }
-            (from, to)
+            (from, to_ms)
         }
         _ => {
             return Err(PyValueError::new_err(
-                "trim takes a range text or start/to, not both",
+                "trim takes a range text or start/end, not both",
             ))
         }
     };
     Ok(Material {
         uri,
         from_ms: from,
-        to_ms: end,
+        to_ms,
     })
 }
 

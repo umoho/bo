@@ -147,7 +147,7 @@ and tree it is whole milliseconds.
 
 Every verb that takes a moment also accepts seconds floats and lenient
 text directly:
-  Track(0).at("0:30")  bo.seek("0:05")  trim(..., start=0.5, to="1:00")
+  Track(0).at("0:30")  bo.seek("0:05")  trim(..., start=0.5, end="1:00")
 
 Notes
   - text forms: SS, MM:SS, HH:MM:SS, optional .fff fraction; a bare field
@@ -164,13 +164,13 @@ Notes
         body: r#"topic: trim
 
 trim(uri, ...) builds the material a put places: a from..to window of the
-source. The whole source is the default; a range text or start/to moments
+source. The whole source is the default; a range text or start/end moments
 select a window.
 
   pybo.trim("voice.wav")                # whole source (open end -> probed)
   pybo.trim("voice.wav", "0:30-1:00")   # closed span
   pybo.trim("voice.wav", "0:30-")       # to the source's end
-  pybo.trim("voice.wav", start="0:30", to=90)
+  pybo.trim("voice.wav", start="0:30", end=90)
 
 Semantics
   - a closed span touches no disk until the clip plays or renders; an
@@ -180,9 +180,9 @@ Semantics
   - the returned value reads uri/from_ms/to_ms; pass it straight to put.
 
 Mistakes
-  - trim(uri, range, start=...) — a range and start/to are mutually
+  - trim(uri, range, start=...) — a range and start/end are mutually
     exclusive (ValueError).
-  - a 'to' before 'from' is refused (ValueError).
+  - an 'end' before 'start' is refused (ValueError).
 "#,
     },
     Topic {
@@ -550,7 +550,7 @@ Format ms as time text:
               clip and the next free start; a whole-source put that cannot
               be measured says so). Covers transport trouble too.
   ValueError  an argument was wrong: a bad timecode, a range with 'to'
-              before 'from', trim with both a range and start/to.
+              before 'start', trim with both a range and start/end.
   TypeError   a value had the wrong kind: put(x, 0), route(on, 3.5).
 
 Semantics
