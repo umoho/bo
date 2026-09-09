@@ -1722,11 +1722,13 @@ fn mix(
 /// An offline [`Backend`]: `play` renders the arrangement to a wav file.
 /// Transport controls are no-ops — the mix is computed eagerly, not
 /// streamed, so there is nothing to pause or resume.
+#[cfg(test)]
 pub struct Renderer {
     path: std::path::PathBuf,
     master: f32,
 }
 
+#[cfg(test)]
 impl Renderer {
     /// Render to `path` (overwritten if it exists), at full master gain.
     pub fn new(path: impl Into<std::path::PathBuf>) -> Self {
@@ -1737,6 +1739,7 @@ impl Renderer {
     }
 }
 
+#[cfg(test)]
 impl Backend for Renderer {
     fn play(
         &mut self,
@@ -1869,23 +1872,6 @@ fn decode_to_end<D: Source>(mut source: D) -> Duration {
 /// form put and planning need.
 pub fn probe(uri: &str) -> Result<Duration, String> {
     measure(uri).map(|p| p.length.duration())
-}
-
-/// Measure every distinct source in the arrangement: the uri plus what was
-/// learned, or why it could not be measured. Duplicate uris are probed once.
-pub fn probe_sources(tracks: &[Track]) -> Vec<(String, Result<Probing, String>)> {
-    let mut seen = std::collections::HashSet::new();
-    let mut results = Vec::new();
-    for track in tracks {
-        for clip in track.clips() {
-            let uri = clip.source.uri.as_str();
-            if !seen.insert(uri) {
-                continue;
-            }
-            results.push((uri.to_string(), measure(uri)));
-        }
-    }
-    results
 }
 
 #[cfg(test)]

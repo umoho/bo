@@ -27,10 +27,11 @@ this file is the contract the crates converge on.
 
 ```
 core::command   Command / Outcome / Reply / data   (model units, serde, ms)
-engine::Session exec + lifecycle (backend choice, clock)     — the only executor
-bo lib          client::Bo: typed sugar -> Command over a Connection (daemon wire)
+engine          Session: exec + lifecycle (backend choice, clock) — the ONLY
+                public item; lib.rs re-exports it, nothing else is exported
 daemon (bin)    Session host: JSON lines in -> exec -> JSON lines out; host-level
                 snapshot ops (history lives here)
+bo lib          client::Bo: typed sugar -> Command over a Connection (daemon wire)
 pybo            pyo3 binding of the bo-lib Bo surface, for Python (uv/maturin)
 mini CLI (bin)  play pause resume seek stop load — thin translator over the
                 same wire, for audition and restore from a shell

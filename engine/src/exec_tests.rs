@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use bo_core::bus::BusRef;
 use bo_core::command::{Applied, ClipHere, Command, Error, Inserted, Landed, OnTrack, Outcome, RouteBus};
-use bo_engine::{exec, Player, Silent};
+use crate::{exec, Player, Silent};
 
 fn write_test_wav(path: &Path, seconds: f32) {
     let rate = 44_100u32;
@@ -237,7 +237,7 @@ fn exec_drives_the_transport() {
     );
 
     // A structural edit while playing waits; apply rebuilds for it.
-    assert_eq!(p.changed(bo_engine::Change::Structure), Landed::Pending);
+    assert_eq!(p.changed(crate::Change::Structure), Landed::Pending);
     let Outcome::Applied(Applied::Rebuilt { live, at }) = exec(&mut p, Command::Apply).unwrap()
     else {
         panic!("expected a rebuild");
@@ -256,7 +256,7 @@ fn exec_drives_the_transport() {
     let Outcome::Stopped = exec(&mut p, Command::Stop).unwrap() else {
         panic!("expected Stopped");
     };
-    assert_eq!(p.state(), bo_engine::State::Stopped);
+    assert_eq!(p.state(), crate::State::Stopped);
 }
 
 #[test]
@@ -884,7 +884,7 @@ fn exec_reset_returns_to_a_fresh_session() {
     let Outcome::Reset = exec(&mut p, Command::Reset).unwrap() else {
         panic!("expected Reset")
     };
-    assert_eq!(p.state(), bo_engine::State::Stopped);
+    assert_eq!(p.state(), crate::State::Stopped);
     assert!(p.tracks().is_empty(), "tracks dropped");
     assert!(p.groups().is_empty(), "group buses dropped");
     assert!(p.pending().is_empty());

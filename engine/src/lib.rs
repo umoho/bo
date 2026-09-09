@@ -16,33 +16,30 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-pub mod measure;
-pub mod rodio;
-pub mod session;
-pub mod timeline;
+mod measure;
+mod rodio;
+mod session;
+mod timeline;
 
-/// The engine's host handle: one executor plus lifecycle over a chosen
+/// The engine's public face: one host handle — a session over a chosen
 /// backend. Everything a session can do goes through [`Session::exec`]; the
-/// daemon hosts one of these.
+/// daemon hosts one of these. Nothing else in the engine is exported: the
+/// player, the executor and the modules behind them are implementation.
 pub use session::Session;
+
+// The semantics spec, run inside the crate where the executor is private.
+#[cfg(test)]
+mod exec_tests;
 
 use bo_core::bus::{Bus, BusRef, Group, Placement};
 use bo_core::control::ControlSource;
-use bo_core::command::{ClipHere, Command, Error, Inserted, Moved, OnTrack, Outcome, Overlap, PlacedClip, Played, Removed, Rendered, RouteBus, Routed, Set, Stats};
+use bo_core::command::{Applied, BackendError, ClipHere, Command, Error, Inserted, Landed, Moved, OnTrack, Outcome, Overlap, PlacedClip, Played, Removed, Rendered, RouteBus, Routed, Set, Stats};
 use bo_core::track::{Clip, Fade, Source, Track};
-
-/// Why a backend could not do what it was told: data, shared with the
-/// command vocabulary ([`bo_core::command`]).
-pub use bo_core::command::BackendError;
-
-/// How an edit reached the sound: data, shared with the command vocabulary
-/// ([`bo_core::command`]).
-pub use bo_core::command::Landed;
 
 /// One arrangement edit, addressed the way the CLI addresses it. This is what
 /// a running graph is asked to take without being rebuilt.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Change {
+pub(crate) enum Change {
     /// A track's gain changed: its volume, or its mute.
     TrackGain(usize),
     /// A track's placement (pan) changed.
@@ -68,16 +65,12 @@ pub enum Change {
     GroupGain(u64),
 }
 
-/// What [`Player::apply`] did: data, shared with the command protocol
-/// ([`bo_core::command::Applied`]).
-pub use bo_core::command::Applied;
-
 /// The thing that makes sound.
 ///
 /// `Player` never decodes anything itself; it decides *what* should be audible
 /// and hands that over. Implementations: [`Silent`] here (headless, used by
 /// tests and CI), and whatever real audio backend the daemon picks at startup.
-pub trait Backend {
+pub(crate) trait Backend {
     /// Start (or restart) playback of `tracks` from playhead `at`.
     ///
     /// `at` is a track timecode; an implementation reads each clip from
@@ -124,7 +117,7 @@ pub trait Backend {
 
 /// A backend that hears nothing: for tests, CI, and `--backend silent`.
 #[derive(Debug, Default, Clone)]
-pub struct Silent {
+pub(crate) struct Silent {
     /// Last `play` request, as `(track count, start timecode)`.
     pub last_play: Option<(usize, Duration)>,
     /// Group count in the last `play` request; lets a test assert the bus
@@ -139,7 +132,7 @@ pub struct Silent {
 
 /// One thing a [`Silent`] backend was asked to do.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum BackendEvent {
+pub(crate) enum BackendEvent {
     Play,
     Pause,
     Resume,
@@ -189,7 +182,8 @@ impl Backend for Silent {
 }
 
 impl Silent {
-    /// Volume last requested, for assertions.
+    /// Volume last requested, for assertions (tests).
+    #[cfg(test)]
     #[must_use]
     pub fn volume(&self) -> f32 {
         self.volume
@@ -198,7 +192,7 @@ impl Silent {
 
 /// Transport state.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum State {
+pub(crate) enum State {
     /// Nothing loaded into the backend; playhead is at zero.
     #[default]
     Stopped,
@@ -219,7 +213,7 @@ impl fmt::Display for State {
 /// A playhead over a set of simultaneously mixed tracks, and the buses their
 /// outputs feed — the master and any group buses.
 #[derive(Debug)]
-pub struct Player<B: Backend = Silent> {
+pub(crate) struct Player<B: Backend = Silent> {
     tracks: Vec<Track>,
     playhead: Duration,
     state: State,
@@ -277,6 +271,7 @@ impl<B: Backend> Player<B> {
     }
 
     /// Remove a track by index.
+    #[cfg(test)]
     pub fn remove_track(&mut self, index: usize) -> Option<Track> {
         (index < self.tracks.len()).then(|| self.tracks.remove(index))
     }
@@ -288,6 +283,7 @@ impl<B: Backend> Player<B> {
     }
 
     /// Whether the transport is running.
+    #[cfg(test)]
     #[must_use]
     pub fn is_playing(&self) -> bool {
         self.state == State::Playing
@@ -303,12 +299,6 @@ impl<B: Backend> Player<B> {
             return real;
         }
         self.playhead
-    }
-
-    /// The master bus: where every track's output lands.
-    #[must_use]
-    pub fn bus(&self) -> &Bus {
-        &self.bus
     }
 
     /// Master gain, clamped to `0.0 ..= 1.0`.
@@ -334,6 +324,7 @@ impl<B: Backend> Player<B> {
 
     /// Every clip audible at track time `t`, one per track at most. This *is*
     /// the mix; nothing about it is cached.
+    #[cfg(test)]
     pub fn active_clips(&self, t: Duration) -> impl Iterator<Item = (usize, &Clip)> {
         self.tracks
             .iter()
@@ -348,12 +339,14 @@ impl<B: Backend> Player<B> {
     }
 
     /// Mutable access to the backend.
+    #[cfg(test)]
     pub fn backend_mut(&mut self) -> &mut B {
         &mut self.backend
     }
 
     /// Replace the backend, e.g. swap in a real audio implementation. Leaves
     /// transport stopped.
+    #[cfg(test)]
     pub fn with_backend<C: Backend>(self, backend: C) -> Player<C> {
         let Player {
             tracks,
@@ -378,6 +371,7 @@ impl<B: Backend> Player<B> {
 
     /// The edits waiting for a graph that can take them.
     #[must_use]
+    #[cfg(test)]
     pub fn pending(&self) -> &[Change] {
         &self.pending
     }
@@ -415,14 +409,6 @@ impl<B: Backend> Player<B> {
         id
     }
 
-    /// Replace the whole group table, e.g. committing a loaded arrangement.
-    /// The id counter is advanced past the tallest id, so a later
-    /// [`Player::add_group`] can never collide with a loaded group.
-    pub fn set_groups(&mut self, groups: Vec<Group>) {
-        let next = groups.iter().map(Group::id).max().map_or(0, |id| id + 1);
-        self.next_group_id = self.next_group_id.max(next);
-        self.groups = groups;
-    }
 }
 
 impl<B: Backend> Player<B> {
@@ -630,7 +616,7 @@ impl<B: Backend> Player<B> {
 /// after decoding them off its wire, a process session directly. A refused
 /// command (an unmeasurable source, a collision) is an [`Error`] and leaves
 /// the arrangement exactly as it was.
-pub fn exec<B: Backend>(player: &mut Player<B>, command: Command) -> Result<Outcome, Error> {
+pub(crate) fn exec<B: Backend>(player: &mut Player<B>, command: Command) -> Result<Outcome, Error> {
     match command {
         Command::Insert { uri, from, to, on } => {
             // An open end plays to the source's end; resolve that end now,

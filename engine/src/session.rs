@@ -21,7 +21,7 @@ use crate::{Backend, BackendError, Change, Player, Silent, State};
 /// otherwise. Forced silent by `BO_BACKEND=silent`, or when no device
 /// exists (the `String` is why).
 #[derive(Debug)]
-pub enum Runtime {
+pub(crate) enum Runtime {
     /// Headless.
     Silent(Silent, Option<String>),
     /// Real audio.
@@ -147,7 +147,7 @@ impl Session {
 
     /// A session on a specific runtime.
     #[must_use]
-    pub fn with_runtime(runtime: Runtime) -> Self {
+    pub(crate) fn with_runtime(runtime: Runtime) -> Self {
         Self {
             player: Player::new(runtime),
         }
@@ -186,14 +186,14 @@ impl Session {
 
     /// Current transport state.
     #[must_use]
-    pub fn state(&self) -> State {
+    pub(crate) fn state(&self) -> State {
         self.player.state()
     }
 
     /// Whether the transport is running.
     #[must_use]
     pub fn is_playing(&self) -> bool {
-        self.player.is_playing()
+        self.state() == State::Playing
     }
 
     /// The playhead timecode.
@@ -229,13 +229,6 @@ impl Session {
     #[must_use]
     pub fn backend_note(&self) -> Option<&str> {
         self.player.backend().note()
-    }
-
-    /// The player, for the surfaces that still edit the arrangement
-    /// directly. Transitional: as commands cover the surface this goes
-    /// away.
-    pub fn player_mut(&mut self) -> &mut Player<Runtime> {
-        &mut self.player
     }
 }
 
