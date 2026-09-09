@@ -40,7 +40,7 @@ pub use bo_core::command::{
     Applied, Command, Error, Inserted, Landed, Outcome, Overlap, PlacedClip, Played, Reply, Routed,
 };
 pub use bo_core::bus::BusRef;
-use bo_core::command::RouteBus;
+use bo_core::command::{OnTrack, RouteBus};
 
 /// A timecode: a point in time, parsed from the lenient forms the whole
 /// tool speaks — `SS`, `MM:SS` or `HH:MM:SS` with an optional `.fff`
@@ -244,6 +244,39 @@ impl From<(usize, Duration)> for TrackPosition {
     }
 }
 
+/// Where a clip lands: on an existing track at a timecode, or on a fresh
+/// one (at the playhead) — the CLI's bare `put`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PutOn {
+    /// An existing track at a timecode.
+    Track(TrackPosition),
+    /// A fresh track, appended; the clip lands at the playhead.
+    NewTrack,
+}
+
+impl From<TrackPosition> for PutOn {
+    fn from(position: TrackPosition) -> Self {
+        Self::Track(position)
+    }
+}
+
+impl From<NewTrack> for PutOn {
+    fn from(_: NewTrack) -> Self {
+        Self::NewTrack
+    }
+}
+
+/// A fresh track for a clip ([`PutOn::NewTrack`]) — the marker type so
+/// `put(clip, NewTrack::default())` reads like the CLI's bare `put`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NewTrack;
+
+impl Default for NewTrack {
+    fn default() -> Self {
+        Self
+    }
+}
+
 /// A bus to route into: the master, an existing group bus, or a fresh one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BusIndex {
@@ -342,14 +375,18 @@ impl Bo {
     /// clip placed past the end of a running track's queue joins that queue
     /// as it is placed; anything else waits for an `apply` — see
     /// [`Inserted::landed`].
-    pub fn put(&mut self, clip: Clip, to: TrackPosition) -> Result<Inserted, Error> {
+    pub fn put(&mut self, clip: Clip, to: impl Into<PutOn>) -> Result<Inserted, Error> {
         let Clip { uri, from, to: to_in } = clip;
+        let (at, on) = match to.into() {
+            PutOn::Track(position) => (position.at, OnTrack::Track(position.track)),
+            PutOn::NewTrack => (Duration::ZERO, OnTrack::New),
+        };
         match self.exec(Command::Insert {
             uri,
             from,
             to: to_in,
-            at: to.at,
-            track: to.track,
+            at,
+            on,
         })? {
             Outcome::Inserted(inserted) => Ok(inserted),
             other => Err(unexpected(&other)),
@@ -475,14 +512,14 @@ mod tests {
             from: clip.from,
             to: clip.to,
             at: to.at,
-            track: to.track,
+            on: OnTrack::Track(to.track),
         };
         assert_eq!(cmd, Command::Insert {
             uri: "a.wav".to_string(),
             from: Duration::ZERO,
             to: Some(Duration::from_secs(5)),
             at: Duration::from_secs(9),
-            track: 3,
+            on: OnTrack::Track(3),
         });
     }
 }

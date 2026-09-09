@@ -212,7 +212,7 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bo_core::command::Outcome;
+    use bo_core::command::{OnTrack, Outcome};
 
     #[test]
     fn a_silent_session_runs_commands() {
@@ -226,7 +226,7 @@ mod tests {
                 from: Duration::ZERO,
                 to: Some(Duration::from_secs(10)),
                 at: Duration::ZERO,
-                track: 0,
+                on: OnTrack::Track(0),
             })
             .unwrap()
         else {

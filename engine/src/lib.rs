@@ -20,7 +20,7 @@ pub mod session;
 pub mod timeline;
 
 use bo_core::bus::{Bus, BusRef, Group};
-use bo_core::command::{Command, Error, Inserted, Outcome, Overlap, PlacedClip, Played, RouteBus, Routed};
+use bo_core::command::{Command, Error, Inserted, OnTrack, Outcome, Overlap, PlacedClip, Played, RouteBus, Routed};
 use bo_core::track::{Clip, Fade, Source, Track};
 
 /// Why a backend could not do what it was told: data, shared with the
@@ -606,7 +606,7 @@ pub fn exec<B: Backend>(player: &mut Player<B>, command: Command) -> Result<Outc
             from,
             to,
             at,
-            track,
+            on,
         } => {
             // An open end plays to the source's end; resolve that end now,
             // so every clip has a known finite length and none can silently
@@ -618,11 +618,20 @@ pub fn exec<B: Backend>(player: &mut Player<B>, command: Command) -> Result<Outc
                     why,
                 })?,
             };
-            // The track is addressed by index, created on demand like the
-            // CLI's.
-            while player.tracks().len() <= track {
-                player.add_track(Track::new());
-            }
+            // Resolve the track: by index (created on demand like the
+            // CLI's), or a fresh one — whose clip lands at the playhead.
+            let (track, at) = match on {
+                OnTrack::Track(i) => {
+                    while player.tracks().len() <= i {
+                        player.add_track(Track::new());
+                    }
+                    (i, at)
+                }
+                OnTrack::New => {
+                    let i = player.add_track(Track::new());
+                    (i, player.playhead())
+                }
+            };
             let clip = Clip::sliced(Arc::new(Source::new(&uri)), from, to)
                 .at(at)
                 .gain(1.0)

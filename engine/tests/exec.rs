@@ -3,7 +3,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use bo_core::command::{Applied, Command, Error, Inserted, Landed, Outcome, RouteBus};
+use bo_core::command::{Applied, Command, Error, Inserted, Landed, OnTrack, Outcome, RouteBus};
 use bo_engine::{exec, Player, Silent};
 
 fn write_test_wav(path: &Path, seconds: f32) {
@@ -49,7 +49,7 @@ fn insert(uri: &str, from: Duration, to: Duration, at: Duration, track: usize) -
         from,
         to: Some(to),
         at,
-        track,
+        on: OnTrack::Track(track),
     }
 }
 
@@ -60,7 +60,7 @@ fn insert_open(uri: &str, track: usize) -> Command {
         from: Duration::ZERO,
         to: None,
         at: Duration::ZERO,
-        track,
+        on: OnTrack::Track(track),
     }
 }
 
@@ -166,6 +166,43 @@ fn exec_insert_grows_tracks_to_fit() {
     let put = inserted_outcome(outcome);
     assert_eq!(put.track, 4);
     assert_eq!(p.tracks().len(), 5, "missing tracks are created");
+}
+
+#[test]
+fn exec_insert_on_a_fresh_track_uses_the_playhead() {
+    let mut p = player();
+    p.seek(Duration::from_secs(3)).unwrap();
+    let uri = src("a.wav");
+    let outcome = exec(
+        &mut p,
+        Command::Insert {
+            uri: uri.clone(),
+            from: Duration::ZERO,
+            to: Some(Duration::from_secs(2)),
+            at: Duration::ZERO, // ignored for a fresh track
+            on: OnTrack::New,
+        },
+    )
+    .unwrap();
+    let put = inserted_outcome(outcome);
+    assert_eq!(put.track, 0, "the fresh track is appended at the end");
+    assert_eq!(put.clip.at, Duration::from_secs(3), "landed at the playhead");
+    assert_eq!(p.tracks()[0].clips()[0].at, Duration::from_secs(3));
+
+    // A second fresh put appends another track, also at the playhead.
+    let outcome = exec(
+        &mut p,
+        Command::Insert {
+            uri,
+            from: Duration::ZERO,
+            to: Some(Duration::from_secs(2)),
+            at: Duration::ZERO,
+            on: OnTrack::New,
+        },
+    )
+    .unwrap();
+    let put = inserted_outcome(outcome);
+    assert_eq!(put.track, 1);
 }
 
 #[test]

@@ -99,9 +99,9 @@ pub enum Landed {
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Command {
     /// Insert a clip into a track, like the model's `Track::insert`: the
-    /// `from .. to` span of source `uri` is placed at track-time `at` on
-    /// `track` (grown to fit). `to: None` means the source's end, resolved
-    /// by probing when the command runs.
+    /// `from .. to` span of source `uri` is placed on `on` at track-time
+    /// `at` (`at` is the playhead for [`OnTrack::New`]). `to: None` means
+    /// the source's end, resolved by probing when the command runs.
     Insert {
         uri: String,
         #[serde(with = "ms")]
@@ -110,7 +110,7 @@ pub enum Command {
         to: Option<Duration>,
         #[serde(with = "ms")]
         at: Duration,
-        track: usize,
+        on: OnTrack,
     },
     /// Route a track's output into a bus — a group bus, or back to the
     /// master; a [`RouteBus::New`] creates the group on its first mention
@@ -132,6 +132,15 @@ pub enum Command {
     Stop,
     /// Make every pending edit audible.
     Apply,
+}
+
+/// Which track a clip lands on: an existing one, or a fresh one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OnTrack {
+    /// The track with this index, grown to fit if it does not exist.
+    Track(usize),
+    /// A fresh track, appended — the clip lands at the playhead.
+    New,
 }
 
 /// What playback is about to play ([`Command::Play`]).
@@ -379,7 +388,7 @@ mod tests {
             from: Duration::from_secs(60),
             to: Some(Duration::from_secs(120)),
             at: Duration::from_millis(30_000),
-            track: 2,
+            on: OnTrack::Track(2),
         };
         let text = serde_json::to_string(&cmd).unwrap();
         assert_eq!(
