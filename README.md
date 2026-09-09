@@ -1,150 +1,142 @@
 # bo
 
-> An audio editor, mixer, and player for agents. One command at a time — build tracks, place clips, tune the mix, then play it live or render it to a file. Not a DAW yet, but this is the shape one would grow from.
+> An audio editor, mixer, and player for agents. Build tracks, place clips,
+> tune the mix, then play it live or render it to a file — from a Python
+> script, a Rust program, or the shell. Not a DAW yet, but this is the shape
+> one would grow from.
 
 [English](README.md) | [中文](README.zh-CN.md)
 
-**bo** is a command-driven audio editor, mixer, and player. You describe a session — clips placed on stacked tracks, each clip a slice of an audio source — with `put` commands, tune it with `set`, and hear the result with `play` (through your sound device) or `render` (offline, to a wav file). There is no project file: your arrangement stays in the running session — later commands keep working on the same one — and can be written out as a script (`save`) and rebuilt from it (`load`).
+**bo** is a command-driven audio engine. You describe a session — clips
+placed on stacked tracks, each clip a slice of an audio source — tune it,
+and hear the result through `play` (your sound device) or `render`
+(offline, to a wav file). There is no project file: the arrangement lives
+in a daemon session and is written out as a **snapshot** (`save`) and
+rebuilt from it (`load`).
 
-Each `bo ...` invocation is one action: place a clip, remove one, move the playhead, tune a track's gain, start or stop playback. The daemon is spawned on demand and cleans up after itself, so a session is a conversation, not a project.
+## Two faces, one session
 
-## What bo is — and isn't
+The engine and the data model are the spine; everything above them speaks
+a typed command wire to the same daemon, so every face shares one
+arrangement per socket.
 
-**bo** is an editing, mixing, and playback tool for agents: slicing sources, placing clips on a timeline, stacking tracks, adjusting gain, fades and mute — auditioning a section while you work, playing a finished arrangement out in full, or rendering it to a file.
+* **Code is the editor.** Arrangement verbs — placing, taking, moving,
+  routing, patching, rendering — live in typed clients:
+  * **Python**: [`pybo`](py/) (a pyo3 extension, managed with uv). See the
+    [quick start](#quick-start-python) below.
+  * **Rust**: `bo::client::Bo` in this crate.
+* **The shell is the transport.** The mini CLI keeps what a terminal is
+  for — audition and restore:
+  ```console
+  $ bo play | pause | resume | seek <t> | stop | load <snapshot.bo>
+  ```
 
-What it is **not** — yet — is a DAW: no effects, no LFOs or sidechains, and no project files. Clips carry gain, linear fade in/out and — the first automation — a hand-drawn *curve*, a periodic *LFO*, or a *sidechain* that ducks a clip's gain under another bus's level as it plays (`set clip.N.N.pan_control`, `set clip.N.N.gain_control`); tracks carry gain, mute and a placement on the stereo bus (`set track.N.pan`). A placement is a *balance* for a stereo source — the far side is attenuated, keeping its width — and a constant-power *pan* for a mono one: the two sides share its energy, so a voice moved between them never gets louder or quieter (and no longer plays 3 dB hot against the file at center). Wider sources are downmixed to the front pair, so a voice on the center channel of a 5.1 source survives. Several tracks can also be routed into one **group bus** (`bo route N name`) — a summing point with a strip of its own over their sum before the master hears it, the radio music bus or voice bus that ducks a whole side of the show with one knob. The data model underneath — `Source` → `Clip` → `Track`, a timeline, a transport, the buses outputs feed — is exactly the spine a CLI DAW is built on. The roadmap is to grow DAW operations onto that spine, not to replace it.
+The daemon is spawned on demand by whichever client first touches a
+socket (`$TMPDIR/bo/daemon.sock` by default; `--socket` or `socket=...`
+for another), and cleans up after itself when playback finishes, on
+`stop`, or after `BO_IDLE_TIMEOUT` seconds of silence (default 600; `0`
+disables). It exits and removes its socket when done.
 
-## Features
+## Quick start (Python)
 
-- **Arrangement as data** — tracks and clips live in the session, not in files. `save`/`load` serialize them as the very commands that built them.
-- **Built for agents** — one command per invocation, machine-readable replies, stable exit codes: 2 for misuse, 1 for a refused operation.
-- **Play it live, or render it offline** — audition from the playhead mid-edit, play a finished arrangement out end to end (rodio), or mix the whole arrangement — or just a range — to a wav file.
-- **Edit while it plays** — a gain, a fade, a pan or a mute lands on the running mix as it is set, and a clip placed past the end of a track's queue joins that queue, so a show can be remixed and extended on air. `apply` is left for what a running mix cannot take itself — a clip taken or moved — and rebuilds it from where the audio really is, not from a wall clock.
-- **Group buses** — `route` several tracks into one bus and a single strip (volume, mute) controls the whole group, a radio music bus or voice bus; `ls` shows the buses and which track feeds which. Routing and a bus-strip change are structure: they land on the next `apply`, like a clip move.
-- **A source is a gesture** — `set clip.N.N.pan_control '{"type":"curve","0":1,"3.2":-1}'` plugs a curve into a clip's pan, `set clip.N.N.gain_control '{"type":"lfo","shape":"sine","rate":2,"depth":0.3}'` an LFO into its gain, and `set clip.N.N.gain_control '{"type":"sidechain","bus":"group.0","amount":-1.5}'` a duck under a bus: the parameter rides the static base plus the source as the clip plays, identically live and rendered (both build the same chain), and an edit lands on the running mix like a fade. No script polling the playhead. Three *control sources* today — curve, LFO, sidechain — ride the pan and the gain of a clip.
-- **Silent fallback** — with no audio device the daemon still runs; set `BO_BACKEND=silent` for deterministic, headless tests and CI.
-- **Self-cleaning** — the daemon exits and removes its socket when playback finishes, on `stop`, or after `BO_IDLE_TIMEOUT` seconds of silence (default 600, `0` disables).
-- **Slicing, not files** — `uri,from-to` places any slice of a source anywhere on the timeline; in-points are sample-accurate in live play and offline render alike; no trimming, no copies.
+```python
+import pybo
 
-## Install
-
-Requires **Rust 1.88 or newer** (edition 2024).
-
-```console
-$ cargo build --release
-$ target/release/bo --help
+bo = pybo.Bo()                                  # the shared daemon
+bo.put(pybo.trim("voice.wav", "0:30-1:00"),     # a slice of a source
+       pybo.Track(0).at("0:00"))                # on track 0 at the start
+bo.put("bed.wav", pybo.Track(1).at("0:00"))     # a whole source (probed)
+bo.route(on=1, bus="music")                     # several tracks under one bus
+bo.route(on=0, bus="music")
+bo.set("bus.0.volume", 0.35)                    # one knob ducks the whole bus
+bo.set("track.0.volume", 0.4)
+bo.get("track.1")                               # read the tree back
+bo.render("mix.wav")
+bo.save("show.bo")                              # a snapshot for later
 ```
 
-or install from this checkout:
+Times are one dialect everywhere: `Timecode(1.23)` and `Timecode("1.23")`
+are 1.23 seconds, `Timecode("1:02.5")` is a minute and change, and
+`str(t)` is `HH:MM:SS.fff`. Durations in replies and the tree are whole
+milliseconds. A `put` of a whole source is probed (its end resolved)
+where the arrangement lives; a closed `trim(...)` span touches no disk
+until it plays or renders. Errors are typed (`pybo.BoError`).
+
+Restore and audition from the shell:
 
 ```console
-$ cargo install --path .
-```
-
-The name `bo` is already taken on crates.io, so `cargo install bo` installs an unrelated crate. Build from source, or use a release binary instead.
-
-## Quick start
-
-A two-track session — a voice over a bed of music:
-
-```console
-$ bo put bed.wav,00:00:00-00:00:30          # 30 s of a bed, on a fresh track
-ok: 1 clip on track 0
-  clip #0 'bed.wav' 00:00:00.000-00:00:30.000 @ 00:00:00.000
-$ bo put voice.wav,00:00:00-00:00:30 1@00:00:00      # voice on track 1
-ok: 1 clip on track 1
-  clip #0 'voice.wav' 00:00:00.000-00:00:30.000 @ 00:00:00.000
+$ bo load show.bo
+ok: loaded 'show.bo'
 $ bo play
-ok: 2 tracks, 2 clips, ends 00:00:30.000, playing from 00:00:00.000
-$ bo set track.0.volume 0.4   # duck the bed under the voice, as it plays
-ok: `track.0.volume` set to `0.40`
-$ bo set track.1.pan -0.6      # place the voice left of center, as it plays
-ok: `track.1.pan` set to `-0.60`
-$ bo put outro.wav,00:00:00-00:00:10 0@00:00:30   # queue on, mid-playback
-ok: 1 clip on track 0
-  clip #1 'outro.wav' 00:00:00.000-00:00:10.000 @ 00:00:30.000
-$ bo apply                    # nothing was left waiting
-ok: nothing pending
-$ bo stop                     # end the session; the daemon cleans up
+ok: 2 tracks, 2 clips, ends 00:01:00.000, playing from 00:00:00.000
+$ bo stop
 ok: stopped
 ```
 
-`bo set` with no arguments prints the whole mix surface as a status line
-followed by one `var value` row per current value — the same registry `set`
-applies through — so an agent can read (or snapshot) the session in one
-command.
+Exit codes: `0` ok, `1` refused, `2` usage. The arrangement verbs that
+were once text commands — `put`, `ls`, `set`, `render`, `save`, … — are
+now client calls; `bo help` documents the shell surface.
 
-Edits take effect as they are made: a gain or a fade goes into the chain that
-is playing it, and a clip placed past the end of a track's queue joins the
-running queue. `apply` is for the edits a running mix cannot take itself — a
-clip taken or moved — and rebuilds the mix from where the audio really is;
-one that has to wait says so on a `note:` line, and `ls` counts what is
-waiting as `pending=N`.
+## The model
 
-### Grouping tracks
+* **Source → Clip → Track**: a clip is a `from..to` slice of a source
+  parked at a track timecode (`at`); tracks never overlap their own clips
+  and stack across the mix. Ids are stable per track and never reused.
+* **A source is a gesture** — a curve, an LFO or a sidechain plugs into a
+  clip's pan or gain input (`track.N.clips.M.pan_control` /
+  `gain_control`):
+  `{"type":"curve","0":1,"3.2":-1}`, `{"type":"lfo","shape":"sine",
+  "rate":1,"depth":0.5}`, `{"type":"sidechain","bus":"group.0"}` — the
+  parameter rides the static base plus the source, identically live and
+  rendered.
+* **Group buses**: `route` several tracks into one bus; one strip
+  (volume, mute) controls the group before the master hears them — a
+  radio music bus or voice bus.
+* **Read/write as a tree**: `get("")` returns the whole arrangement
+  (tracks, clips, buses, transport) as JSON; `set("track.0", …)` deep
+  patches the state zone. Structure is edited by the verbs only.
 
-A set of tracks can share one strip — a radio music bus or voice bus — before the
-master hears them:
+## Editing while it plays
 
-```console
-$ bo route 0 music                 # track 0's output joins bus 'music' — created
-ok: track 0 routed to bus #0 'music' (1 track)   # by its first mention, named by it
-$ bo route 1 music
-ok: track 1 routed to bus #0 'music' (2 tracks)
-$ bo set bus.0.volume 0.35         # one knob ducks the whole bus
-ok: `bus.0.volume` set to `0.35`
-$ bo ls
-ok: 2 tracks, 2 clips
-… 'silent' backend, … master=1.00, …
-bus #0 'music' vol=0.35 tracks=2
-  track 0 'bed' vol=1.00 pan=0.00 end=… bus=#0 'music'
-  track 1 'voice' … bus=#0 'music'
+A gain, a fade, a pan or a mute lands on the running mix as it is set; a
+clip placed past a track's queue joins it. What a running graph cannot
+take — a clip taken or moved, a re-route — waits (`landed: pending`) for
+an `apply`, which rebuilds from where the audio really is.
+
+## Snapshots
+
+A snapshot (`save`) is the session's own command history plus its
+playhead: a versioned, replayable script. `load` stages it atomically — a
+failing snapshot leaves the session untouched — and `check` validates a
+snapshot file without touching the session.
+
+## Layout
+
+```
+core/      model units: Command/Outcome, the tree, timecode text
+engine/    the only executor: Session::exec over a transport/backend
+bo lib     client::Bo over a Connection (daemon wire); frozen for 0.2
+src/cli.rs the mini CLI (transport + load)
+src/daemon.rs  the daemon: JSON wire in, JSON wire out, host-level snapshots
+py/        pybo: pyo3 binding of the Bo surface (uv + maturin)
 ```
 
-A bus strip is baked when a mix is built, so a change to it — and a re-route —
-lands on the next `apply`, the same way a clip taken or moved does. `route
-<track> master` sends a track back out; bus names are unique and are what
-`route` addresses (`master` is reserved); `set bus.N.muted true` mutes the whole
-group. Buses, strips and routing survive `save`/`load`; an empty bus — one no
-track feeds — is not saved (empty tracks are not saved either).
+## Install
 
-### A source instead of a script
-
-The demo gesture once needed a background script that polled the playhead and
-re-panned every few tens of milliseconds. As a source it is one line, live
-and rendered alike:
+Requires **Rust 1.88+** for the engine, CLI and daemon; **uv** for the
+Python binding.
 
 ```console
-$ bo put slide.wav,00:00:00-00:00:03.200
-ok: 1 clip on track 0
-$ bo set clip.0.0.pan_control '{"type":"curve","0":1,"3.2":-1}'  # pan +1 → -1
-ok: `clip.0.0.pan_control` set to `{"type":"curve","00:00:00.000":1,"00:00:03.200":-1}`
-$ bo render mix.wav                        # the file sweeps the same way it plays
+$ cargo build --release          # the bo CLI/daemon
+$ cd py && uv sync               # pybo into .venv
+$ uv run pytest                  # pybo's test suite
 ```
 
-A source is one cable plugged into a clip's pan (`set clip.N.N.pan_control`)
-or its gain (`set clip.N.N.gain_control`) input. Three kinds today, each a
-single-line JSON object whose `"type"` says which:
+The Python host finds the daemon binary by itself (this checkout's
+`target/…/bo`, then `PATH`), so a script needs no setup beyond an import.
 
-- a *curve* — a map of timecode-to-offset points, linear between them and
-  held flat at the edges: `{"type":"curve","0":1,"3.2":-1}`;
-- an *LFO* — a periodic wiggle with optional fields `shape`, `rate`,
-  `depth`, `phase` (defaults `sine`, `1`, `0.5`, `0`):
-  `{"type":"lfo","shape":"sine","rate":1,"depth":0.5}` swings once a second
-  at half depth;
-- a *sidechain* — listens to a bus (the master, or a group you routed) and
-  follows its level: `{"type":"sidechain","bus":"group.0","amount":-1.5}` —
-  amount is the offset per unit level (negative ducks, positive swells;
-  default -0.5), attack/release timecodes (defaults 5 ms / 150 ms). The
-  radio gesture is one line: route the voice into a group and put
-  `{"type":"sidechain","bus":"group.0"}` on the music's gain — the music
-  rides down under the voice and swells back when it ends.
-
-A timecode may be typed in the CLI's lenient forms — `3.2` and `0.005` mean
-seconds — and echoes back as `HH:MM:SS.fff`.
-
-`none` unplugs. A parameter is the static base plus the sum of its sources;
-each input takes one source today.
+Set `BO_BACKEND=silent` for deterministic headless sessions and CI;
+without an audio device the daemon falls back to silence with a note.
 
 ## License
 
