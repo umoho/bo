@@ -185,7 +185,7 @@ fn trim(
             if let Some(to) = to
                 && to < from
             {
-                return Err(BoError::new_err(format!(
+                return Err(PyValueError::new_err(format!(
                     "trim to {} before from {}",
                     tc_text(to),
                     tc_text(from)
@@ -257,6 +257,12 @@ impl Track {
     #[getter]
     fn index(&self) -> Option<usize> {
         self.index
+    }
+
+    /// The moment on the track, whole milliseconds; `None` = the playhead.
+    #[getter]
+    fn at_ms(&self) -> Option<u64> {
+        self.at_ms
     }
 
     fn __repr__(&self) -> String {
