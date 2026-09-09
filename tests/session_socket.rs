@@ -250,3 +250,35 @@ fn buses_and_routing_round_trip_through_the_daemon() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn take_round_trips_through_the_daemon() {
+    use bo::client::ClipOnTrack;
+    let dir = temp_dir();
+    let socket = dir.join("d.sock");
+    let _daemon = spawn_daemon(&socket);
+
+    let mut bo = Bo::with_connection(Connection::at(&socket));
+    bo.put(
+        Clip::of("a.wav").trim(TimecodeRange::from((Duration::ZERO, Duration::from_secs(10)))),
+        TrackIndex(0).at(Duration::ZERO),
+    )
+    .unwrap();
+    bo.put(
+        Clip::of("b.wav").trim(TimecodeRange::from((Duration::ZERO, Duration::from_secs(5)))),
+        TrackIndex(0).at(Duration::from_secs(10)),
+    )
+    .unwrap();
+
+    // Address the clip covering 12 s (b, id 1) by time, then a by id.
+    let removed = bo.take(ClipOnTrack::at(Duration::from_secs(12)), TrackIndex(0)).unwrap();
+    assert_eq!(removed.clip.id, 1);
+    assert!(removed.clip.uri.ends_with("b.wav"), "{}", removed.clip.uri);
+    let removed = bo.take(ClipOnTrack::id(0), TrackIndex(0)).unwrap();
+    assert!(removed.clip.uri.ends_with("a.wav"), "{}", removed.clip.uri);
+
+    let out = bo_cli(&socket, &["ls"]);
+    assert!(!out.contains("clip #"), "both clips are gone: {out}");
+
+    std::fs::remove_dir_all(&dir).ok();
+}

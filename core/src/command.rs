@@ -92,6 +92,17 @@ pub enum Landed {
     Pending,
 }
 
+/// Address a clip on a track: by its stable id, or by the track time it
+/// covers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClipHere {
+    /// The clip with this (per-track) stable id.
+    Id(u64),
+    /// The clip covering this track time.
+    #[serde(with = "ms")]
+    At(Duration),
+}
+
 /// One command: what to do. The engine executes it
 /// ([`exec`](bo_engine::exec)); commands travel as JSON over the wire.
 /// Fields speak the model's units; the engine needs nothing translated.
@@ -114,6 +125,12 @@ pub enum Command {
     /// (the CLI's `route <track> <name>`). Structure: it lands at the next
     /// `apply`.
     Route { track: usize, bus: RouteBus },
+    /// Take a clip off a track ([`ClipHere`]). Structure: it lands at the
+    /// next `apply`.
+    Remove {
+        track: usize,
+        clip: ClipHere,
+    },
     /// Start playback from the current playhead.
     Play,
     /// Hold position and silence output.
@@ -202,11 +219,24 @@ pub struct Routed {
     pub landed: Landed,
 }
 
+/// What a take removed, echoed ([`Command::Remove`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Removed {
+    /// The track the clip was on.
+    pub track: usize,
+    /// The removed clip, as it was.
+    pub clip: PlacedClip,
+    /// Structure lands at the next `apply` ([`Landed::Pending`]).
+    pub landed: Landed,
+}
+
 /// The result of a [`Command`], as data.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Outcome {
     /// A clip was inserted ([`Command::Insert`]).
     Inserted(Inserted),
+    /// A clip was taken ([`Command::Remove`]).
+    Removed(Removed),
     /// A track was routed ([`Command::Route`]).
     Routed(Routed),
     /// Playback started ([`Command::Play`]).
@@ -333,6 +363,8 @@ pub enum Error {
     NoTrack(usize),
     /// A command addressed a group bus that does not exist.
     NoBus(u64),
+    /// A take or move could not find the clip it addressed.
+    NoClip(String),
     /// A bus-name rule was refused ('master' reserved, a duplicate name).
     Bus(String),
     /// An open-ended insert whose source could not be measured.
@@ -352,6 +384,7 @@ impl fmt::Display for Error {
             Self::Parse(msg) => f.write_str(msg),
             Self::NoTrack(track) => write!(f, "no track {track}"),
             Self::NoBus(id) => write!(f, "no bus {id}"),
+            Self::NoClip(what) => write!(f, "no clip {what}"),
             Self::Bus(msg) => f.write_str(msg),
             Self::Probe { uri, why } => write!(f, "cannot measure {uri}: {why}"),
             Self::Overlap(overlap) => write!(f, "{overlap}"),

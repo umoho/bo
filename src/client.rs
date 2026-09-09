@@ -37,10 +37,10 @@ use crate::connection::Connection;
 
 // The command protocol, shared with the engine and the daemon.
 pub use bo_core::command::{
-    Applied, Command, Error, Inserted, Landed, Outcome, Overlap, PlacedClip, Played, Reply, Routed,
+    Applied, Command, Error, Inserted, Landed, Outcome, Overlap, PlacedClip, Played, Removed, Reply, Routed,
 };
 pub use bo_core::bus::BusRef;
-use bo_core::command::{OnTrack, RouteBus};
+use bo_core::command::{ClipHere, OnTrack, RouteBus};
 
 /// A timecode: a point in time, parsed from the lenient forms the whole
 /// tool speaks — `SS`, `MM:SS` or `HH:MM:SS` with an optional `.fff`
@@ -192,6 +192,29 @@ impl Clip {
         self.from = Duration::ZERO;
         self.to = Some(to.duration());
         self
+    }
+}
+
+/// A clip as it sits on a track: what a take or move addresses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClipOnTrack {
+    /// By its stable (per-track) id — the one an insert returned.
+    Id(u64),
+    /// By the track time it covers.
+    At(Timecode),
+}
+
+impl ClipOnTrack {
+    /// The clip with this stable id.
+    #[must_use]
+    pub const fn id(id: u64) -> Self {
+        Self::Id(id)
+    }
+
+    /// The clip covering this track time.
+    #[must_use]
+    pub fn at(at: impl Into<Timecode>) -> Self {
+        Self::At(at.into())
     }
 }
 
@@ -402,6 +425,22 @@ impl Bo {
         };
         match self.exec(Command::Insert { uri, from, to: to_in, on })? {
             Outcome::Inserted(inserted) => Ok(inserted),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// Take a clip off a track ([`ClipOnTrack::id`] or
+    /// [`ClipOnTrack::at`]). Structure: it lands at the next `apply`.
+    pub fn take(&mut self, clip: ClipOnTrack, on: TrackIndex) -> Result<Removed, Error> {
+        let clip = match clip {
+            ClipOnTrack::Id(id) => ClipHere::Id(id),
+            ClipOnTrack::At(at) => ClipHere::At(at.duration()),
+        };
+        match self.exec(Command::Remove {
+            track: on.0,
+            clip,
+        })? {
+            Outcome::Removed(removed) => Ok(removed),
             other => Err(unexpected(&other)),
         }
     }

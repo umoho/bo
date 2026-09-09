@@ -20,7 +20,7 @@ pub mod session;
 pub mod timeline;
 
 use bo_core::bus::{Bus, BusRef, Group};
-use bo_core::command::{Command, Error, Inserted, OnTrack, Outcome, Overlap, PlacedClip, Played, RouteBus, Routed};
+use bo_core::command::{ClipHere, Command, Error, Inserted, OnTrack, Outcome, Overlap, PlacedClip, Played, Removed, RouteBus, Routed};
 use bo_core::track::{Clip, Fade, Source, Track};
 
 /// Why a backend could not do what it was told: data, shared with the
@@ -698,6 +698,41 @@ pub fn exec<B: Backend>(player: &mut Player<B>, command: Command) -> Result<Outc
             // lands at the next apply's rebuild.
             let landed = player.changed(Change::Structure);
             Ok(Outcome::Routed(Routed { track, bus: target, landed }))
+        }
+        Command::Remove { track, clip } => {
+            if track >= player.tracks().len() {
+                return Err(Error::NoTrack(track));
+            }
+            let removed = match clip {
+                ClipHere::Id(id) => player.tracks_mut()[track].remove(id),
+                ClipHere::At(at) => {
+                    let id = player.tracks()[track].clip_at(at).map(|c| c.id);
+                    match id {
+                        Some(id) => player.tracks_mut()[track].remove(id),
+                        None => None,
+                    }
+                }
+            };
+            let Some(removed) = removed else {
+                let what = match clip {
+                    ClipHere::Id(id) => format!("{track}#{id}"),
+                    ClipHere::At(at) => format!("{track}@{}", bo_core::time::format(at)),
+                };
+                return Err(Error::NoClip(what));
+            };
+            // Taking a clip out of a queue that is sounding cannot be done
+            // live: it lands at the next apply's rebuild.
+            let landed = player.changed(Change::Structure);
+            let clip_echo = PlacedClip {
+                id: removed.id,
+                uri: removed.source.uri.clone(),
+                at: removed.at,
+                from: removed.from,
+                to: removed.to,
+                gain: removed.gain,
+                fade: removed.fade,
+            };
+            Ok(Outcome::Removed(Removed { track, clip: clip_echo, landed }))
         }
         Command::Play => {
             player.play().map_err(Error::Backend)?;

@@ -3,7 +3,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use bo_core::command::{Applied, Command, Error, Inserted, Landed, OnTrack, Outcome, RouteBus};
+use bo_core::command::{Applied, ClipHere, Command, Error, Inserted, Landed, OnTrack, Outcome, RouteBus};
 use bo_engine::{exec, Player, Silent};
 
 fn write_test_wav(path: &Path, seconds: f32) {
@@ -340,4 +340,62 @@ fn exec_routes_tracks_into_buses() {
     };
     assert_eq!(routed.bus, BusRef::Master);
     assert_eq!(p.tracks()[0].bus(), BusRef::Master);
+}
+
+#[test]
+fn exec_take_removes_by_id_or_time() {
+    let mut p = player();
+    let uri = src("a.wav");
+    exec(
+        &mut p,
+        insert(&uri, Duration::ZERO, Duration::from_secs(10), Duration::ZERO, 0),
+    )
+    .unwrap();
+    exec(
+        &mut p,
+        insert(&uri, Duration::ZERO, Duration::from_secs(5), Duration::from_secs(10), 0),
+    )
+    .unwrap();
+
+    // By track time: the clip covering 12 s is the second one (#1).
+    let Outcome::Removed(removed) = exec(
+        &mut p,
+        Command::Remove {
+            track: 0,
+            clip: ClipHere::At(Duration::from_secs(12)),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected Removed");
+    };
+    assert_eq!(removed.clip.id, 1);
+    assert_eq!(p.tracks()[0].clips().len(), 1);
+
+    // By id: #0 still there.
+    let Outcome::Removed(removed) = exec(
+        &mut p,
+        Command::Remove { track: 0, clip: ClipHere::Id(0) },
+    )
+    .unwrap()
+    else {
+        panic!("expected Removed");
+    };
+    assert_eq!(removed.clip.id, 0);
+    assert!(p.tracks()[0].clips().is_empty());
+
+    // Ids are never reused: asking for the gone #1 is refused.
+    match exec(&mut p, Command::Remove { track: 0, clip: ClipHere::Id(1) }).unwrap_err() {
+        Error::NoClip(what) => assert_eq!(what, "0#1"),
+        other => panic!("expected NoClip, got {other:?}"),
+    }
+    match exec(
+        &mut p,
+        Command::Remove { track: 0, clip: ClipHere::At(Duration::ZERO) },
+    )
+    .unwrap_err()
+    {
+        Error::NoClip(what) => assert!(what.starts_with("0@"), "{what}"),
+        other => panic!("expected NoClip, got {other:?}"),
+    }
 }
