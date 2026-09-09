@@ -1,7 +1,8 @@
-//! `bo` command-line front-end: one command per invocation, meant to be driven
-//! by an agent editing and mixing audio. See [`cli`] for the command surface.
+//! `bo` command-line front-end: the mini CLI. See [`cli`] for the surface;
+//! the daemon it spawns lives in [`daemon`].
 
 mod cli;
+mod daemon;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();

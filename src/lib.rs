@@ -4,16 +4,15 @@
 //! both re-exported here so `bo::track`, `bo::engine`, … still read as
 //! before. This crate adds the client surfaces on top:
 //!
-//! * [`connection`] — a connection: how a client reaches a session — today the
-//!   daemon on its Unix socket, spawned on demand, speaking a typed JSON wire
-//!   ([`connection::Connection`]).
+//! * [`connection`] — a connection: how a client reaches a session — today
+//!   the daemon on its Unix socket, spawned on demand, speaking a typed JSON
+//!   wire ([`connection::Connection`]).
 //! * [`client`] — the typed client on a session: [`client::Bo`] puts clips
 //!   and tunes a session like the CLI does, minus the reply grammar.
 //!
 //! Operations are forwarded to an executor: the daemon over its socket
-//! ([`Connection`](connection::Connection)), or — for a process session —
-//! the engine directly. The binary crate in this package (`bo` on the command line) is
-//! the text front-end and, for now, the daemon's home.
+//! ([`Connection`](connection::Connection)). The binary crate in this
+//! package is the mini CLI (transport + load) and the daemon's home.
 
 pub use bo_core::{bus, control, time, track};
 pub use bo_engine as engine;

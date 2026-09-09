@@ -66,24 +66,8 @@ impl Drop for DaemonGuard {
     }
 }
 
-fn bo_cli(socket: &Path, args: &[&str]) -> String {
-    let out = Command::new(env!("CARGO_BIN_EXE_bo"))
-        .env("BO_BACKEND", "silent")
-        .arg("--socket")
-        .arg(socket)
-        .args(args)
-        .output()
-        .expect("bo runs");
-    assert!(
-        out.status.success(),
-        "bo {args:?} failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout).into_owned()
-}
-
 #[test]
-fn bo_put_reaches_the_daemon_and_shares_its_arrangement_with_the_cli() {
+fn bo_put_reaches_the_daemon_and_clients_share_the_session() {
     let dir = temp_dir();
     let socket = dir.join("d.sock");
     let _daemon = spawn_daemon(&socket);
@@ -100,12 +84,7 @@ fn bo_put_reaches_the_daemon_and_shares_its_arrangement_with_the_cli() {
     assert_eq!(put.clip.id, 0);
     assert_eq!(put.clip.at, Duration::from_secs(5));
 
-    // The CLI sees the very same arrangement over its own socket.
-    let out = bo_cli(&socket, &["ls"]);
-    assert!(out.contains("clip #0") && out.contains("bed.wav"), "{out}");
-    assert!(out.contains("00:00:10.000-00:00:20.000"), "{out}");
-
-    // A second Bo shares the session too: ids stay stable and grow.
+    // A second Bo shares the session: ids stay stable and grow.
     let mut other = Bo::with_connection(Connection::at(&socket));
     let put = other
         .put(
@@ -115,8 +94,15 @@ fn bo_put_reaches_the_daemon_and_shares_its_arrangement_with_the_cli() {
         .expect("voice joins on a fresh track");
     assert_eq!(put.track, 1);
     assert_eq!(put.clip.id, 0, "ids are per-track");
-    let out = bo_cli(&socket, &["ls"]);
-    assert!(out.contains("2 tracks") && out.contains("clip #"), "{out}");
+    let tree = bo.get("").unwrap();
+    assert_eq!(tree["track"].as_array().unwrap().len(), 2, "both clients see both tracks");
+    assert!(
+        tree["track"][0]["clips"][0]["uri"]
+            .as_str()
+            .unwrap()
+            .ends_with("bed.wav"),
+        "the uri is absolutized against the caller's cwd"
+    );
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -169,9 +155,10 @@ fn session_default_spawns_the_daemon_on_demand() {
     assert_eq!(put.clip.id, 0);
     unsafe { std::env::remove_var("BO_DAEMON") };
 
-    // The spawned daemon is the real one: the CLI can reach it.
-    let out = bo_cli(&socket, &["ls"]);
-    assert!(out.contains("clip #0"), "{out}");
+    // The spawned daemon is the real one: another client reaches it.
+    let mut other = Bo::with_connection(Connection::at(&socket));
+    let tree = other.get("").unwrap();
+    assert_eq!(tree["track"][0]["clips"].as_array().unwrap().len(), 1);
     let _ = Command::new(env!("CARGO_BIN_EXE_bo"))
         .env("BO_BACKEND", "silent")
         .arg("--socket")
@@ -209,12 +196,18 @@ fn transport_verbs_round_trip_through_the_daemon() {
     bo.resume().unwrap();
 
     // The daemon's own transport agrees.
-    let out = bo_cli(&socket, &["ls"]);
-    assert!(out.contains("playing") || out.contains("stopped"), "{out}");
+    let state = bo.get("transport.state").unwrap();
+    assert_eq!(state, serde_json::json!("playing"));
+    let playhead = bo.get("transport.playhead").unwrap();
+    assert_eq!(playhead, serde_json::json!(4_000u64));
 
+    // stop ends the session: the daemon cleans its socket up.
     bo.stop().unwrap();
-    let out = bo_cli(&socket, &["ls"]);
-    assert!(out.contains("stopped, playhead at 00:00:00.000"), "{out}");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while socket.exists() {
+        assert!(Instant::now() < deadline, "daemon did not clean up after stop");
+        std::thread::sleep(Duration::from_millis(20));
+    }
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -240,13 +233,14 @@ fn buses_and_routing_round_trip_through_the_daemon() {
     assert_eq!(routed.bus, BusRef::Group(0));
     assert_eq!(routed.landed, Landed::Pending, "structure waits for apply");
 
-    // The CLI sees the routing.
-    let out = bo_cli(&socket, &["ls"]);
-    assert!(out.contains("'music'") && out.contains("bus=#0"), "{out}");
+    // The tree agrees: a bus named music with the track routed into it.
+    let buses = bo.get("bus").unwrap();
+    assert_eq!(buses[0]["name"], serde_json::json!("music"));
+    assert_eq!(buses[0]["members"], serde_json::json!(1));
 
     bo.route(TrackIndex(0), BusIndex::master()).unwrap();
-    let out = bo_cli(&socket, &["ls"]);
-    assert!(out.contains("master"), "{out}");
+    let buses = bo.get("bus").unwrap();
+    assert_eq!(buses[0]["members"], serde_json::json!(0), "routed back out");
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -309,8 +303,14 @@ fn take_round_trips_through_the_daemon() {
     let removed = bo.take(ClipOnTrack::id(TrackIndex(0), 0)).unwrap();
     assert!(removed.clip.uri.ends_with("a.wav"), "{}", removed.clip.uri);
 
-    let out = bo_cli(&socket, &["ls"]);
-    assert!(!out.contains("clip #"), "both clips are gone: {out}");
+    let tree = bo.get("").unwrap();
+    let clips: usize = tree["track"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|track| track["clips"].as_array().unwrap().len())
+        .sum();
+    assert_eq!(clips, 0, "both clips are gone");
 
     std::fs::remove_dir_all(&dir).ok();
 }
