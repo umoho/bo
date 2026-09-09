@@ -740,14 +740,6 @@ fn exec_probes_and_renders() {
     )
     .unwrap();
 
-    let Outcome::Probed(probed) = exec(&mut p, Command::Probe { uri: uri.clone() }).unwrap()
-    else {
-        panic!("expected Probed")
-    };
-    assert_eq!(probed.length_ms, 500);
-    assert_eq!(probed.channels, 1);
-    assert!(!probed.estimated, "a wav header states its length");
-
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("out.wav");
     let file = out.to_string_lossy().into_owned();

@@ -23,7 +23,7 @@ pub mod timeline;
 
 use bo_core::bus::{Bus, BusRef, Group, Placement};
 use bo_core::control::ControlSource;
-use bo_core::command::{ClipHere, Command, Error, Inserted, Moved, OnTrack, Outcome, Overlap, PlacedClip, Played, Probed, Removed, Rendered, RouteBus, Routed, Set, Stats};
+use bo_core::command::{ClipHere, Command, Error, Inserted, Moved, OnTrack, Outcome, Overlap, PlacedClip, Played, Removed, Rendered, RouteBus, Routed, Set, Stats};
 use bo_core::track::{Clip, Fade, Source, Track};
 
 /// Why a backend could not do what it was told: data, shared with the
@@ -823,19 +823,6 @@ pub fn exec<B: Backend>(player: &mut Player<B>, command: Command) -> Result<Outc
         Command::Set { path, patcher } => {
             let (patched, landed) = apply_patch(player, &path, &patcher)?;
             Ok(Outcome::Set(Set { path, patched, landed }))
-        }
-        Command::Probe { uri } => {
-            let probing = crate::rodio::measure(&uri)
-                .map_err(|why| Error::Probe { uri: uri.clone(), why })?;
-            Ok(Outcome::Probed(Probed {
-                uri,
-                length_ms: ms_of(probing.length.duration()),
-                estimated: matches!(
-                    probing.length,
-                    crate::rodio::SourceLength::Estimated(_)
-                ),
-                channels: probing.channels,
-            }))
         }
         Command::Render { file, from, to, measure, mono } => {
             let path = std::path::PathBuf::from(&file);

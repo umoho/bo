@@ -37,7 +37,7 @@ use crate::connection::Connection;
 
 // The command protocol, shared with the engine and the daemon.
 pub use bo_core::command::{
-    Applied, Command, Error, Inserted, Landed, Moved, Outcome, Overlap, PlacedClip, Played, Probed, Removed, Rendered, Reply, Routed, Set, Stats,
+    Applied, Command, Error, Inserted, Landed, Moved, Outcome, Overlap, PlacedClip, Played, Removed, Rendered, Reply, Routed, Set, Stats,
 };
 pub use bo_core::bus::BusRef;
 use bo_core::command::{ClipHere, OnTrack, RouteBus};
@@ -504,14 +504,6 @@ impl Bo {
             patcher,
         })? {
             Outcome::Set(set) => Ok(set),
-            other => Err(unexpected(&other)),
-        }
-    }
-
-    /// Measure a source: its length and channel count.
-    pub fn probe(&mut self, uri: &str) -> Result<Probed, Error> {
-        match self.exec(Command::Probe { uri: uri.to_string() })? {
-            Outcome::Probed(probed) => Ok(probed),
             other => Err(unexpected(&other)),
         }
     }

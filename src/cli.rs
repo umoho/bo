@@ -2611,8 +2611,7 @@ fn handle_json(state: &Mutex<Arrangement>, line: &str, cwd: &str) -> (i32, Strin
         }
     };
     match &mut command {
-        bo_core::command::Command::Insert { uri, .. }
-        | bo_core::command::Command::Probe { uri, .. } => *uri = absolutize(uri, cwd),
+        bo_core::command::Command::Insert { uri, .. } => *uri = absolutize(uri, cwd),
         bo_core::command::Command::Render { file, .. } => *file = absolutize(file, cwd),
         _ => {}
     }

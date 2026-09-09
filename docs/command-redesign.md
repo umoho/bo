@@ -44,9 +44,9 @@ grammar is being replanned onto it.
 | `route …`        | `Route { track, bus: RouteBus }` (Master/Group/New) | `Routed { track, bus, landed }` | done |
 | `ls` / `at t`          | `Get { path }` | `Outcome::Tree(JSON)` | done |
 | `set <path> <value>`   | `Set { path, patcher }` — state zone, deep patch | `Outcome::Set(Set{ path, patched, landed })` | done |
-| `probe uri`            | `Probe { uri }` | `Probed { uri, length_ms, estimated, channels }` | done |
+| ~~`probe uri`~~ | removed — measurement is upstream tooling (Python / ffmpeg); engine still measures internally for open-end inserts | |
 | `render file [range]`  | `Render { file, from?, to? }` | `Rendered { file, duration_ms }` | done (range/measure/mono next) |
-| `check`                | revisit: `Check` over sources | — | design |
+| ~~`check`~~ | removed — source verification is upstream tooling too | |
 | `save`/`load`          | snapshot: `Get` whole tree ↔ replay | — | design |
 
 ## Set / Get — the arrangement as a tree

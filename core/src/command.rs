@@ -146,8 +146,6 @@ pub enum Command {
     /// Patch the arrangement's state zone: a leaf scalar, or a merge over a
     /// strip ([`Set`]). Structure is edited by the other verbs only.
     Set { path: String, patcher: Value },
-    /// Measure a source: its length and channel count.
-    Probe { uri: String },
     /// Mix the arrangement — or a range of it — to a wav file, optionally
     /// measuring the mix or folding it to mono.
     Render {
@@ -282,20 +280,6 @@ pub struct Moved {
     pub landed: Landed,
 }
 
-/// What probing learned, echoed ([`Command::Probe`]).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Probed {
-    /// The measured source.
-    pub uri: String,
-    /// Its length, whole milliseconds.
-    pub length_ms: u64,
-    /// Whether the length was estimated by decoding rather than stated by
-    /// the container.
-    pub estimated: bool,
-    /// Interleaved channels per frame.
-    pub channels: u16,
-}
-
 /// Levels of a rendered span, when measured ([`Command::Render`]).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Stats {
@@ -341,8 +325,6 @@ pub enum Outcome {
     Tree(serde_json::Value),
     /// The arrangement was patched ([`Command::Set`]).
     Set(Set),
-    /// A source was measured ([`Command::Probe`]).
-    Probed(Probed),
     /// A range was rendered ([`Command::Render`]).
     Rendered(Rendered),
     /// A track was routed ([`Command::Route`]).
