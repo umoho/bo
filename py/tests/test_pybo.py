@@ -225,3 +225,24 @@ def test_render_writes_a_wav(bo, tmp_path):
     rendered = bo.render(out)
     assert rendered["duration_ms"] == 1000
     assert os.path.isfile(out) and os.path.getsize(out) > 100
+
+
+def test_help_pages_cover_the_surface():
+    # Discovery is pybo.help() itself — no topics() helper.
+    assert not hasattr(pybo, "topics")
+    assert pybo.help().startswith("topic: overview")
+    for key in [
+        "put", "take", "move", "route", "set", "get", "apply", "render",
+        "transport", "snapshot", "reset", "cli", "timecode", "errors",
+    ]:
+        assert pybo.help(key).startswith(f"topic: {key}"), key
+
+
+def test_help_matches_fuzzy_ambiguous_and_unknown_queries():
+    assert pybo.help("place a clip").startswith("topic: put")
+    assert pybo.help("how do i save?").startswith("topic: snapshot")
+    assert pybo.help("放素材").startswith("topic: put")
+    assert pybo.help("tree").startswith("topic: get")
+    assert pybo.help("zzz-nonsense").startswith("no help topic")
+    ambiguous = pybo.help("set track volume")
+    assert "matches several" in ambiguous and "track" in ambiguous and "set" in ambiguous

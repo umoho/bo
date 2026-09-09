@@ -35,6 +35,8 @@ use pyo3::types::{
 use pyo3::IntoPyObjectExt;
 use serde_json::{json, Value};
 
+mod help;
+
 create_exception!(pybo, BoError, pyo3::exceptions::PyException);
 
 /// The package version.
@@ -834,6 +836,7 @@ fn json_to_py<'py>(py: Python<'py>, value: &Value) -> PyResult<Py<PyAny>> {
 fn pybo(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(version, m)?)?;
     m.add_function(wrap_pyfunction!(trim, m)?)?;
+    m.add_function(wrap_pyfunction!(help::help, m)?)?;
     m.add_class::<Timecode>()?;
     m.add_class::<Material>()?;
     m.add_class::<Track>()?;
