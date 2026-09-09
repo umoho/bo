@@ -24,7 +24,7 @@
 //!
 //! let mut bo = Bo::new();   // the default connection: the shared daemon
 //! let clip = Clip::of("bed.wav").trim("1:00-2:00".parse()?);
-//! let put = bo.put(clip, TrackIndex(0).at(Duration::from_secs(30)))?;
+//! let put = bo.put(clip, TrackIndex(0).at("0:30".parse()?))?;
 //! assert_eq!(put.track, 0);
 //! # Ok::<(), bo::client::Error>(())
 //! ```
@@ -198,11 +198,12 @@ pub struct TrackIndex(pub usize);
 
 impl TrackIndex {
     /// A position on this track: `TrackIndex(0).at(t)` — the CLI's `0@t`.
+    /// Takes a parsed [`Timecode`] (`"0:30".parse()?`) or any [`Duration`].
     #[must_use]
-    pub const fn at(self, at: Duration) -> TrackPosition {
+    pub fn at(self, at: impl Into<Timecode>) -> TrackPosition {
         TrackPosition {
             track: self.0,
-            at,
+            at: at.into().duration(),
         }
     }
 }
