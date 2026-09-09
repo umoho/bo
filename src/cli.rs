@@ -2657,6 +2657,14 @@ fn handle_json(state: &Mutex<Arrangement>, line: &str, cwd: &str) -> (i32, Strin
             };
             return (0, json_reply(&reply), false);
         }
+        // A fresh session forgets its history too.
+        Cmd::Reset => match bo::engine::exec(&mut a.player, command) {
+            Ok(outcome) => {
+                a.history.clear();
+                bo_core::command::Reply::Ok(outcome)
+            }
+            Err(e) => bo_core::command::Reply::Err(e),
+        },
         _ => {
             match &mut command {
                 Cmd::Insert { uri, .. } => *uri = absolutize(uri, cwd),

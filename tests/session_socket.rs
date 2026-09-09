@@ -415,3 +415,25 @@ fn check_validates_a_snapshot_file() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn reset_clears_the_session_over_the_wire() {
+    let dir = temp_dir();
+    let socket = dir.join("d.sock");
+    let _daemon = spawn_daemon(&socket);
+
+    let mut bo = Bo::with_connection(Connection::at(&socket));
+    bo.put(
+        Clip::of("a.wav").trim(TimecodeRange::from((Duration::ZERO, Duration::from_secs(10)))),
+        TrackIndex(0).at(Duration::ZERO),
+    )
+    .unwrap();
+    bo.set("track.0.volume", serde_json::json!(0.4)).unwrap();
+    bo.reset().unwrap();
+
+    let tree = bo.get("").unwrap();
+    assert!(tree["track"].as_array().unwrap().is_empty(), "{tree}");
+    let snap = bo.save(dir.join("after.json")).unwrap();
+    assert!(snap.history.is_empty(), "a fresh session has no history");
+    std::fs::remove_dir_all(&dir).ok();
+}

@@ -620,6 +620,14 @@ impl Bo {
         }
     }
 
+    /// Drop every track and group bus: back to a fresh session.
+    pub fn reset(&mut self) -> Result<(), Error> {
+        match self.exec(Command::Reset)? {
+            Outcome::Reset => Ok(()),
+            other => Err(unexpected(&other)),
+        }
+    }
+
     /// Stop and rewind to zero.
     pub fn stop(&mut self) -> Result<(), Error> {
         match self.exec(Command::Stop)? {

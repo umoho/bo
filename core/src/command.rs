@@ -183,6 +183,8 @@ pub enum Command {
     },
     /// Stop and rewind to zero.
     Stop,
+    /// Drop every track and group bus: back to a fresh session.
+    Reset,
     /// Make every pending edit audible.
     Apply,
 }
@@ -375,6 +377,8 @@ pub enum Outcome {
     },
     /// The transport stopped and rewound ([`Command::Stop`]).
     Stopped,
+    /// The session was cleared ([`Command::Reset`]).
+    Reset,
     /// The playhead moved ([`Command::Seek`]).
     Seeked {
         #[serde(with = "ms")]

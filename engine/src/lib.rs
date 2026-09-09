@@ -891,6 +891,10 @@ pub fn exec<B: Backend>(player: &mut Player<B>, command: Command) -> Result<Outc
             player.stop();
             Ok(Outcome::Stopped)
         }
+        Command::Reset => {
+            player.reset();
+            Ok(Outcome::Reset)
+        }
         Command::Apply => {
             let applied = player.apply().map_err(Error::Backend)?;
             Ok(Outcome::Applied(applied))

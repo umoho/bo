@@ -856,3 +856,27 @@ fn exec_set_patches_deep_into_control_sources() {
         other => panic!("expected Path, got {other:?}"),
     }
 }
+
+#[test]
+fn exec_reset_returns_to_a_fresh_session() {
+    let mut p = player();
+    exec(
+        &mut p,
+        insert(&src("a.wav"), Duration::ZERO, Duration::from_secs(10), Duration::ZERO, 0),
+    )
+    .unwrap();
+    exec(
+        &mut p,
+        Command::Route { track: 0, bus: RouteBus::New { name: Some("music".into()) } },
+    )
+    .unwrap();
+    exec(&mut p, Command::Play).unwrap();
+
+    let Outcome::Reset = exec(&mut p, Command::Reset).unwrap() else {
+        panic!("expected Reset")
+    };
+    assert_eq!(p.state(), bo_engine::State::Stopped);
+    assert!(p.tracks().is_empty(), "tracks dropped");
+    assert!(p.groups().is_empty(), "group buses dropped");
+    assert!(p.pending().is_empty());
+}
