@@ -20,7 +20,7 @@ pub mod session;
 pub mod timeline;
 
 use bo_core::bus::{Bus, BusRef, Group};
-use bo_core::command::{ClipHere, Command, Error, Inserted, OnTrack, Outcome, Overlap, PlacedClip, Played, Removed, RouteBus, Routed};
+use bo_core::command::{ClipHere, Command, Error, Inserted, Moved, OnTrack, Outcome, Overlap, PlacedClip, Played, Removed, RouteBus, Routed};
 use bo_core::track::{Clip, Fade, Source, Track};
 
 /// Why a backend could not do what it was told: data, shared with the
@@ -733,6 +733,81 @@ pub fn exec<B: Backend>(player: &mut Player<B>, command: Command) -> Result<Outc
                 fade: removed.fade,
             };
             Ok(Outcome::Removed(Removed { track, clip: clip_echo, landed }))
+        }
+        Command::Move { track, clip, to } => {
+            // Find the clip to move, as it sits on the source track now.
+            if track >= player.tracks().len() {
+                return Err(Error::NoTrack(track));
+            }
+            let clip_now = match clip {
+                ClipHere::Id(id) => player.tracks()[track].clips().iter().find(|c| c.id == id).cloned(),
+                ClipHere::At(at) => player.tracks()[track].clip_at(at).cloned(),
+            };
+            let Some(mut moved) = clip_now else {
+                let what = match clip {
+                    ClipHere::Id(id) => format!("{track}#{id}"),
+                    ClipHere::At(at) => format!("{track}@{}", bo_core::time::format(at)),
+                };
+                return Err(Error::NoClip(what));
+            };
+            // Resolve the destination exactly like an insert does.
+            let (dest_index, at) = match to {
+                OnTrack::Track { index, at } => {
+                    while player.tracks().len() <= index {
+                        player.add_track(Track::new());
+                    }
+                    (index, at)
+                }
+                OnTrack::New { at } => {
+                    let index = player.add_track(Track::new());
+                    (index, at.unwrap_or_else(|| player.playhead()))
+                }
+            };
+            moved.at = at;
+            // Refuse whole if the destination is occupied. A same-track move
+            // vacates its own span, so the moving clip itself is excluded.
+            if let Some(conflict) = player.tracks()[dest_index].clips().iter().find(|c| {
+                c.overlaps(&moved) && !(dest_index == track && c.id == moved.id)
+            }) {
+                return Err(Error::Overlap(Overlap {
+                    track: dest_index,
+                    at: moved.at,
+                    conflict: conflict.id,
+                    conflict_at: conflict.at,
+                    conflict_end: conflict.end(),
+                    next_free: player.tracks()[dest_index].next_free_start(moved.at, moved.duration()),
+                }));
+            }
+            // Ids are per-track counters: the clip keeps its id unless the
+            // destination already carries it.
+            let keep_id = dest_index == track
+                || !player.tracks()[dest_index].clips().iter().any(|c| c.id == moved.id);
+            player.tracks_mut()[track].remove(moved.id).expect("found above");
+            let id = if keep_id {
+                player.tracks_mut()[dest_index].insert_keeping_id(moved.clone());
+                moved.id
+            } else {
+                player.tracks_mut()[dest_index]
+                    .insert(moved.clone())
+                    .expect("pre-checked: the destination is free")
+            };
+            moved.id = id;
+            let landed = player.changed(Change::Structure);
+            let clip_echo = PlacedClip {
+                id: moved.id,
+                uri: moved.source.uri.clone(),
+                at: moved.at,
+                from: moved.from,
+                to: moved.to,
+                gain: moved.gain,
+                fade: moved.fade,
+            };
+            Ok(Outcome::Moved(Moved {
+                from_track: track,
+                to_track: dest_index,
+                clip: clip_echo,
+                landed,
+            }))
         }
         Command::Play => {
             player.play().map_err(Error::Backend)?;

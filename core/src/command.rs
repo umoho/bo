@@ -131,6 +131,14 @@ pub enum Command {
         track: usize,
         clip: ClipHere,
     },
+    /// Move a clip to another track, or a new position on its own,
+    /// keeping its content (gain, fades) and its id when the destination
+    /// allows. Atomic: refused whole if the destination is occupied.
+    Move {
+        track: usize,
+        clip: ClipHere,
+        to: OnTrack,
+    },
     /// Start playback from the current playhead.
     Play,
     /// Hold position and silence output.
@@ -230,6 +238,19 @@ pub struct Removed {
     pub landed: Landed,
 }
 
+/// What a move did, echoed ([`Command::Move`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Moved {
+    /// The track the clip left.
+    pub from_track: usize,
+    /// The track it landed on.
+    pub to_track: usize,
+    /// The moved clip, as moved (its actual id).
+    pub clip: PlacedClip,
+    /// Structure lands at the next `apply` ([`Landed::Pending`]).
+    pub landed: Landed,
+}
+
 /// The result of a [`Command`], as data.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Outcome {
@@ -237,6 +258,8 @@ pub enum Outcome {
     Inserted(Inserted),
     /// A clip was taken ([`Command::Remove`]).
     Removed(Removed),
+    /// A clip was moved ([`Command::Move`]).
+    Moved(Moved),
     /// A track was routed ([`Command::Route`]).
     Routed(Routed),
     /// Playback started ([`Command::Play`]).
@@ -340,7 +363,7 @@ impl fmt::Display for Overlap {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "insert refused: track {} @ {} overlaps\nreason: clip #{} occupies [{:.3},{:.3}); \
+            "placement refused: track {} @ {} overlaps\nreason: clip #{} occupies [{:.3},{:.3}); \
              next free start is {:.3}s",
             self.track,
             time::format(self.at),

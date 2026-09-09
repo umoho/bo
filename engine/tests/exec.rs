@@ -399,3 +399,80 @@ fn exec_take_removes_by_id_or_time() {
         other => panic!("expected NoClip, got {other:?}"),
     }
 }
+
+#[test]
+fn exec_move_rearranges_clips_atomically() {
+    let mut p = player();
+    let uri = src("a.wav");
+    exec(
+        &mut p,
+        insert(&uri, Duration::ZERO, Duration::from_secs(10), Duration::ZERO, 0),
+    )
+    .unwrap(); // track 0 #0: 0..10
+    exec(
+        &mut p,
+        insert(&uri, Duration::ZERO, Duration::from_secs(5), Duration::from_secs(10), 0),
+    )
+    .unwrap(); // track 0 #1: 10..15
+    exec(
+        &mut p,
+        insert(&uri, Duration::ZERO, Duration::from_secs(5), Duration::from_secs(20), 1),
+    )
+    .unwrap(); // track 1 #0: 20..25 — the id 0 is taken there, but far away
+
+    // #0 from track 0 → track 1 @ 3 s (3..13, clear of 20..25). Track 1
+    // already carries id 0, so the moved clip takes track 1's next id.
+    let Outcome::Moved(moved) = exec(
+        &mut p,
+        Command::Move {
+            track: 0,
+            clip: ClipHere::Id(0),
+            to: OnTrack::Track { index: 1, at: Duration::from_secs(3) },
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected Moved")
+    };
+    assert_eq!(moved.from_track, 0);
+    assert_eq!(moved.to_track, 1);
+    assert_eq!(moved.clip.id, 1, "id 0 was taken on the destination");
+    assert_eq!(moved.clip.at, Duration::from_secs(3));
+    assert_eq!(p.tracks()[0].clips().len(), 1, "track 0 lost #0");
+    assert_eq!(p.tracks()[1].clips().len(), 2);
+
+    // A refused move leaves both tracks untouched: track 0's #1 (10..15)
+    // onto track 1 @ 11 collides with the clip just moved there (3..13).
+    match exec(
+        &mut p,
+        Command::Move {
+            track: 0,
+            clip: ClipHere::Id(1),
+            to: OnTrack::Track { index: 1, at: Duration::from_secs(11) },
+        },
+    )
+    .unwrap_err()
+    {
+        Error::Overlap(overlap) => assert_eq!(overlap.conflict, 1),
+        other => panic!("expected Overlap, got {other:?}"),
+    }
+    assert_eq!(p.tracks()[0].clips().len(), 1, "refused move leaves no trace");
+    assert_eq!(p.tracks()[1].clips().len(), 2);
+
+    // A same-track move vacates its own span: #1 at 3..13 → 6 (6..16,
+    // clear of #0's 20..25) and keeps its id.
+    let Outcome::Moved(moved) = exec(
+        &mut p,
+        Command::Move {
+            track: 1,
+            clip: ClipHere::Id(1),
+            to: OnTrack::Track { index: 1, at: Duration::from_secs(6) },
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected Moved")
+    };
+    assert_eq!(moved.clip.id, 1, "same-track moves keep the id");
+    assert_eq!(moved.clip.at, Duration::from_secs(6));
+}

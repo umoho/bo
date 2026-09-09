@@ -37,7 +37,7 @@ use crate::connection::Connection;
 
 // The command protocol, shared with the engine and the daemon.
 pub use bo_core::command::{
-    Applied, Command, Error, Inserted, Landed, Outcome, Overlap, PlacedClip, Played, Removed, Reply, Routed,
+    Applied, Command, Error, Inserted, Landed, Moved, Outcome, Overlap, PlacedClip, Played, Removed, Reply, Routed,
 };
 pub use bo_core::bus::BusRef;
 use bo_core::command::{ClipHere, OnTrack, RouteBus};
@@ -195,26 +195,28 @@ impl Clip {
     }
 }
 
-/// A clip as it sits on a track: what a take or move addresses.
+/// A clip as it sits on a track — what a take or move addresses. It knows
+/// its track: [`ClipOnTrack::id`] addresses by the stable (per-track) id an
+/// insert returned, [`ClipOnTrack::at`] by the track time it covers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClipOnTrack {
-    /// By its stable (per-track) id — the one an insert returned.
-    Id(u64),
-    /// By the track time it covers.
-    At(Timecode),
+    /// The clip with this stable id on `on`.
+    Id { on: TrackIndex, id: u64 },
+    /// The clip covering this time on `on`.
+    At { on: TrackIndex, at: Timecode },
 }
 
 impl ClipOnTrack {
-    /// The clip with this stable id.
+    /// The clip with this stable id on `on`.
     #[must_use]
-    pub const fn id(id: u64) -> Self {
-        Self::Id(id)
+    pub const fn id(on: TrackIndex, id: u64) -> Self {
+        Self::Id { on, id }
     }
 
-    /// The clip covering this track time.
+    /// The clip covering this time on `on`.
     #[must_use]
-    pub fn at(at: impl Into<Timecode>) -> Self {
-        Self::At(at.into())
+    pub fn at(on: TrackIndex, at: impl Into<Timecode>) -> Self {
+        Self::At { on, at: at.into() }
     }
 }
 
@@ -270,26 +272,26 @@ impl From<(usize, Duration)> for TrackPosition {
 /// Where a clip lands: on an existing track at a timecode, or on a fresh
 /// one — the CLI's bare `put` (or `put uri @pos`).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PutOn {
+pub enum Destination {
     /// An existing track at a timecode.
     Track(TrackPosition),
     /// A fresh track, appended ([`NewTrack`]).
     NewTrack(NewTrack),
 }
 
-impl From<TrackPosition> for PutOn {
+impl From<TrackPosition> for Destination {
     fn from(position: TrackPosition) -> Self {
         Self::Track(position)
     }
 }
 
-impl From<NewTrack> for PutOn {
+impl From<NewTrack> for Destination {
     fn from(track: NewTrack) -> Self {
         Self::NewTrack(track)
     }
 }
 
-/// A fresh track for a clip ([`PutOn::NewTrack`]). `default()` lands at the
+/// A fresh track for a clip ([`Destination::NewTrack`]). `default()` lands at the
 /// playhead (the CLI's bare `put`); [`NewTrack::at`] places it at a time —
 /// the CLI's `put uri @pos`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -412,14 +414,14 @@ impl Bo {
     /// clip placed past the end of a running track's queue joins that queue
     /// as it is placed; anything else waits for an `apply` — see
     /// [`Inserted::landed`].
-    pub fn put(&mut self, clip: Clip, to: impl Into<PutOn>) -> Result<Inserted, Error> {
+    pub fn put(&mut self, clip: Clip, to: impl Into<Destination>) -> Result<Inserted, Error> {
         let Clip { uri, from, to: to_in } = clip;
         let on = match to.into() {
-            PutOn::Track(position) => OnTrack::Track {
+            Destination::Track(position) => OnTrack::Track {
                 index: position.track,
                 at: position.at,
             },
-            PutOn::NewTrack(track) => OnTrack::New {
+            Destination::NewTrack(track) => OnTrack::New {
                 at: track.at.map(Timecode::duration),
             },
         };
@@ -431,17 +433,51 @@ impl Bo {
 
     /// Take a clip off a track ([`ClipOnTrack::id`] or
     /// [`ClipOnTrack::at`]). Structure: it lands at the next `apply`.
-    pub fn take(&mut self, clip: ClipOnTrack, on: TrackIndex) -> Result<Removed, Error> {
-        let clip = match clip {
-            ClipOnTrack::Id(id) => ClipHere::Id(id),
-            ClipOnTrack::At(at) => ClipHere::At(at.duration()),
-        };
-        match self.exec(Command::Remove {
-            track: on.0,
-            clip,
-        })? {
+    pub fn take(&mut self, clip: ClipOnTrack) -> Result<Removed, Error> {
+        match self.exec(self.remove_command(clip))? {
             Outcome::Removed(removed) => Ok(removed),
             other => Err(unexpected(&other)),
+        }
+    }
+
+    /// Move a clip to another track, or a new position on its own, keeping
+    /// its content and (when the destination allows) its id. Atomic:
+    /// refused whole if the destination is occupied. Structure: it lands at
+    /// the next `apply`.
+    pub fn r#move(
+        &mut self,
+        clip: ClipOnTrack,
+        to: impl Into<Destination>,
+    ) -> Result<Moved, Error> {
+        let Command::Remove { track, clip } = self.remove_command(clip) else {
+            unreachable!("remove_command always builds Remove")
+        };
+        let to = match to.into() {
+            Destination::Track(position) => OnTrack::Track {
+                index: position.track,
+                at: position.at,
+            },
+            Destination::NewTrack(track) => OnTrack::New {
+                at: track.at.map(Timecode::duration),
+            },
+        };
+        match self.exec(Command::Move { track, clip, to })? {
+            Outcome::Moved(moved) => Ok(moved),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// The [`Command::Remove`] a [`ClipOnTrack`] addresses.
+    fn remove_command(&self, clip: ClipOnTrack) -> Command {
+        match clip {
+            ClipOnTrack::Id { on, id } => Command::Remove {
+                track: on.0,
+                clip: ClipHere::Id(id),
+            },
+            ClipOnTrack::At { on, at } => Command::Remove {
+                track: on.0,
+                clip: ClipHere::At(at.duration()),
+            },
         }
     }
 

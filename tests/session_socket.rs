@@ -271,10 +271,10 @@ fn take_round_trips_through_the_daemon() {
     .unwrap();
 
     // Address the clip covering 12 s (b, id 1) by time, then a by id.
-    let removed = bo.take(ClipOnTrack::at(Duration::from_secs(12)), TrackIndex(0)).unwrap();
+    let removed = bo.take(ClipOnTrack::at(TrackIndex(0), Duration::from_secs(12))).unwrap();
     assert_eq!(removed.clip.id, 1);
     assert!(removed.clip.uri.ends_with("b.wav"), "{}", removed.clip.uri);
-    let removed = bo.take(ClipOnTrack::id(0), TrackIndex(0)).unwrap();
+    let removed = bo.take(ClipOnTrack::id(TrackIndex(0), 0)).unwrap();
     assert!(removed.clip.uri.ends_with("a.wav"), "{}", removed.clip.uri);
 
     let out = bo_cli(&socket, &["ls"]);
