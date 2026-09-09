@@ -325,7 +325,6 @@ pub struct Rendered {
     /// How long the rendered range is.
     pub duration_ms: u64,
     /// Levels, when the render measured them.
-    #[serde(skip)]
     pub stats: Option<Stats>,
 }
 
