@@ -1,12 +1,13 @@
 //! The session command protocol — data shared by the executors
 //! ([`bo_engine`]) and the client ([`bo`]).
 //!
-//! Pure data, no execution. A [`Command`] says what to do (place a clip…);
-//! the engine runs it ([`exec`](bo_engine::exec)); an [`Outcome`] or an
-//! [`Error`] says what happened; a [`Reply`] carries either over the wire.
-//! The vocabulary here is what travels — serialized as JSON between the
-//! client and the daemon, with durations as whole milliseconds — and what
-//! both sides decode back into typed values.
+//! Pure data, no execution. A [`Command`] says what to do; the engine runs
+//! it ([`exec`](bo_engine::exec)); an [`Outcome`] or an [`Error`] says what
+//! happened; a [`Reply`] carries either over the wire. Commands speak the
+//! model's own units — uris, durations, track indices — never client-side
+//! conveniences. The vocabulary here is what travels — serialized as JSON
+//! between the client and the daemon, with durations as whole milliseconds —
+//! and what both sides decode back into typed values.
 
 use std::fmt;
 use std::time::Duration;
@@ -90,131 +91,25 @@ pub enum Landed {
     Pending,
 }
 
-/// A track, addressed by its index. A `put` grows the session to fit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct TrackRef(pub usize);
-
-impl TrackRef {
-    /// A position on this track: `TrackRef(0).at(t)` — the CLI's `0@t`.
-    #[must_use]
-    pub const fn at(self, at: Duration) -> TrackPos {
-        TrackPos {
-            track: self.0,
-            at,
-        }
-    }
-}
-
-impl From<usize> for TrackRef {
-    fn from(track: usize) -> Self {
-        Self(track)
-    }
-}
-
-impl From<TrackRef> for usize {
-    fn from(track: TrackRef) -> Self {
-        track.0
-    }
-}
-
-impl fmt::Display for TrackRef {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-/// A track and a timecode: where a clip lands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TrackPos {
-    /// Track index, created on demand by a put.
-    pub track: usize,
-    /// Position on that track.
-    #[serde(with = "ms")]
-    pub at: Duration,
-}
-
-impl From<(usize, Duration)> for TrackPos {
-    fn from((track, at): (usize, Duration)) -> Self {
-        Self { track, at }
-    }
-}
-
-/// A `from..to` window into a source: where the clip starts reading and
-/// where it stops. `to: None` means the source's end — resolved by probing
-/// when the clip is put (the CLI's `uri,from-`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct Slice {
-    /// In-point, measured into the source.
-    #[serde(with = "ms")]
-    pub from: Duration,
-    /// Out-point, measured into the source; `None` = the source's end.
-    #[serde(with = "ms_opt")]
-    pub to: Option<Duration>,
-}
-
-impl Slice {
-    /// The whole source.
-    #[must_use]
-    pub fn whole() -> Self {
-        Self {
-            from: Duration::ZERO,
-            to: None,
-        }
-    }
-
-    /// A closed `from .. to` window.
-    #[must_use]
-    pub const fn window(from: Duration, to: Duration) -> Self {
-        Self { from, to: Some(to) }
-    }
-}
-
-impl fmt::Display for Slice {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}-{}", time::format(self.from), match self.to {
-            Some(to) => time::format(to),
-            None => String::new(),
-        })
-    }
-}
-
-impl std::str::FromStr for Slice {
-    type Err = Error;
-
-    /// Parse `from-to`, or `from-` for the source's end. Timecodes are
-    /// `SS`, `MM:SS` or `HH:MM:SS` with an optional `.fff` fraction.
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let s = s.trim();
-        let (from, to) = s.split_once('-').ok_or_else(|| {
-            Error::Parse(format!("bad slice {s:?}: expected from-to"))
-        })?;
-        let from = time::parse(from).map_err(Error::Parse)?;
-        let to = if to.trim().is_empty() {
-            None
-        } else {
-            Some(time::parse(to).map_err(Error::Parse)?)
-        };
-        Ok(Self { from, to })
-    }
-}
-
-impl From<(Duration, Duration)> for Slice {
-    fn from((from, to): (Duration, Duration)) -> Self {
-        Self::window(from, to)
-    }
-}
-
 /// One command: what to do. The engine executes it
 /// ([`exec`](bo_engine::exec)); commands travel as JSON over the wire.
+/// Fields speak the model's units; the engine needs nothing translated.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Command {
-    /// Place a clip: the `from..to` window `slice` of source `uri`, on
-    /// `on.track` at track-time `on.at`. The track is grown to fit.
-    Put {
+    /// Insert a clip into a track, like the model's `Track::insert`: the
+    /// `from .. to` span of source `uri` is placed at track-time `at` on
+    /// `track` (grown to fit). `to: None` means the source's end, resolved
+    /// by probing when the command runs.
+    Insert {
         uri: String,
-        slice: Slice,
-        on: TrackPos,
+        #[serde(with = "ms")]
+        from: Duration,
+        #[serde(with = "ms_opt")]
+        to: Option<Duration>,
+        #[serde(with = "ms")]
+        at: Duration,
+        track: usize,
     },
     /// Start playback from the current playhead.
     Play,
@@ -266,8 +161,8 @@ pub enum Applied {
 /// The result of a [`Command`], as data.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Outcome {
-    /// A clip was placed ([`Command::Put`]).
-    Put(Put),
+    /// A clip was inserted ([`Command::Insert`]).
+    Inserted(Inserted),
     /// Playback started ([`Command::Play`]).
     Played(Played),
     /// The transport paused ([`Command::Pause`]).
@@ -301,9 +196,9 @@ pub enum Reply {
     Err(Error),
 }
 
-/// What a put placed, echoed like the CLI's reply.
+/// What an insert placed, echoed like the CLI's reply.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Put {
+pub struct Inserted {
     /// The track the clip landed on.
     pub track: usize,
     /// The placed clip, as placed.
@@ -314,8 +209,8 @@ pub struct Put {
 }
 
 /// One placed clip, echoed. Gain and fades always carry their defaults on
-/// the wire today (a plain put places full-gain, straight-faded); they are
-/// echoed the moment a command can place anything else.
+/// the wire today (a plain insert places full-gain, straight-faded); they
+/// are echoed the moment a command can place anything else.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PlacedClip {
     /// Stable id, never reused while the clip lives.
@@ -344,7 +239,7 @@ fn full_gain() -> f32 {
     1.0
 }
 
-/// Why a put was refused.
+/// Why an insert was refused.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Overlap {
     /// The track the clip wanted.
@@ -369,7 +264,7 @@ impl fmt::Display for Overlap {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "put refused: track {} @ {} overlaps\nreason: clip #{} occupies [{:.3},{:.3}); \
+            "insert refused: track {} @ {} overlaps\nreason: clip #{} occupies [{:.3},{:.3}); \
              next free start is {:.3}s",
             self.track,
             time::format(self.at),
@@ -386,9 +281,9 @@ impl std::error::Error for Overlap {}
 /// Everything a session command can refuse, without panicking.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Error {
-    /// Text that failed to parse (a slice, later a key or control source).
+    /// Text that failed to parse (a key, a control source).
     Parse(String),
-    /// An open-ended slice whose source could not be measured.
+    /// An open-ended insert whose source could not be measured.
     Probe { uri: String, why: String },
     /// The placement collided with a resident clip.
     Overlap(Overlap),
@@ -431,38 +326,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn slice_text_parses_closed_open_and_bad() {
-        assert_eq!(
-            "1:00-2:00".parse::<Slice>().unwrap(),
-            Slice::window(Duration::from_secs(60), Duration::from_secs(120))
-        );
-        assert_eq!(
-            "1:00-".parse::<Slice>().unwrap(),
-            Slice {
-                from: Duration::from_secs(60),
-                to: None,
-            }
-        );
-        assert!("1:00".parse::<Slice>().is_err(), "needs a -");
-        assert!("x-y".parse::<Slice>().is_err(), "bad timecode");
-    }
-
-    #[test]
-    fn tracks_and_slices_convert() {
-        let t: TrackRef = 3.into();
-        assert_eq!(t.at(Duration::from_secs(9)), TrackPos {
-            track: 3,
-            at: Duration::from_secs(9),
-        });
-        assert_eq!(usize::from(t), 3);
-        assert_eq!(TrackPos::from((1, Duration::ZERO)).track, 1);
-        assert_eq!(
-            Slice::from((Duration::ZERO, Duration::from_secs(5))).to,
-            Some(Duration::from_secs(5))
-        );
-    }
-
-    #[test]
     fn landed_is_copy_data() {
         let a = Landed::Live;
         let b = a; // Copy
@@ -471,13 +334,12 @@ mod tests {
 
     #[test]
     fn commands_and_replies_round_trip_as_json() {
-        let cmd = Command::Put {
+        let cmd = Command::Insert {
             uri: "bed.wav".to_string(),
-            slice: Slice::window(Duration::from_secs(60), Duration::from_secs(120)),
-            on: TrackPos {
-                track: 2,
-                at: Duration::from_millis(30_000),
-            },
+            from: Duration::from_secs(60),
+            to: Some(Duration::from_secs(120)),
+            at: Duration::from_millis(30_000),
+            track: 2,
         };
         let text = serde_json::to_string(&cmd).unwrap();
         assert_eq!(

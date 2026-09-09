@@ -3,7 +3,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use bo_core::command::{Applied, Command, Error, Landed, Outcome, Slice, TrackPos};
+use bo_core::command::{Applied, Command, Error, Inserted, Landed, Outcome};
 use bo_engine::{exec, Player, Silent};
 
 fn write_test_wav(path: &Path, seconds: f32) {
@@ -42,19 +42,34 @@ fn src(uri: &str) -> String {
     path.to_string_lossy().into_owned()
 }
 
-fn put(uri: &str, slice: Slice, on: TrackPos) -> Command {
-    Command::Put {
+/// An insert command with a closed window.
+fn insert(uri: &str, from: Duration, to: Duration, at: Duration, track: usize) -> Command {
+    Command::Insert {
         uri: uri.to_string(),
-        slice,
-        on,
+        from,
+        to: Some(to),
+        at,
+        track,
     }
 }
 
-/// The Put payload of an outcome, or a panic — tests only ask for puts.
-fn put_outcome(outcome: Outcome) -> bo_core::command::Put {
+/// An insert command with an open end (probing resolves it).
+fn insert_open(uri: &str, track: usize) -> Command {
+    Command::Insert {
+        uri: uri.to_string(),
+        from: Duration::ZERO,
+        to: None,
+        at: Duration::ZERO,
+        track,
+    }
+}
+
+/// The Inserted payload of an outcome, or a panic — tests only ask for
+/// inserts.
+fn inserted_outcome(outcome: Outcome) -> Inserted {
     match outcome {
-        Outcome::Put(put) => put,
-        other => panic!("expected a Put outcome, got {other:?}"),
+        Outcome::Inserted(inserted) => inserted,
+        other => panic!("expected an Inserted outcome, got {other:?}"),
     }
 }
 
@@ -63,19 +78,21 @@ fn player() -> Player<Silent> {
 }
 
 #[test]
-fn exec_put_places_a_windowed_clip_on_a_track() {
+fn exec_insert_places_a_windowed_clip_on_a_track() {
     let mut p = player();
     let uri = src("a.wav");
     let outcome = exec(
         &mut p,
-        put(
+        insert(
             &uri,
-            Slice::window(Duration::ZERO, Duration::from_secs_f64(0.2)),
-            TrackPos::from((0, Duration::ZERO)),
+            Duration::ZERO,
+            Duration::from_secs_f64(0.2),
+            Duration::ZERO,
+            0,
         ),
     )
     .unwrap();
-    let put = put_outcome(outcome);
+    let put = inserted_outcome(outcome);
     assert_eq!(put.track, 0);
     assert_eq!(put.clip.id, 0);
     assert_eq!(p.tracks().len(), 1);
@@ -89,46 +106,27 @@ fn exec_put_places_a_windowed_clip_on_a_track() {
 }
 
 #[test]
-fn exec_put_probes_an_open_slice_to_the_sources_end() {
+fn exec_insert_probes_an_open_end_to_the_sources_end() {
     let mut p = player();
     let uri = src("a.wav");
-    let outcome = exec(
-        &mut p,
-        put(&uri, Slice::whole(), TrackPos::from((0, Duration::ZERO))),
-    )
-    .unwrap();
-    let put = put_outcome(outcome);
+    let outcome = exec(&mut p, insert_open(&uri, 0)).unwrap();
+    let put = inserted_outcome(outcome);
     assert_eq!(put.clip.from, Duration::ZERO);
     assert!(
         !put.clip.to.is_zero(),
-        "an open slice resolves to a finite end"
+        "an open end resolves to a finite end"
     );
     assert_eq!(put.clip.to, Duration::from_secs_f64(0.5));
 }
 
 #[test]
-fn exec_put_refuses_a_collision_and_leaves_no_trace() {
+fn exec_insert_refuses_a_collision_and_leaves_no_trace() {
     let mut p = player();
     let uri = src("a.wav");
     let zero = Duration::ZERO;
-    exec(
-        &mut p,
-        put(
-            &uri,
-            Slice::window(Duration::ZERO, Duration::from_secs_f64(0.2)),
-            TrackPos::from((0, zero)),
-        ),
-    )
-    .unwrap();
-    let err = exec(
-        &mut p,
-        put(
-            &uri,
-            Slice::window(Duration::ZERO, Duration::from_secs_f64(0.2)),
-            TrackPos::from((0, zero)),
-        ),
-    )
-    .unwrap_err();
+    let d = Duration::from_secs_f64(0.2);
+    exec(&mut p, insert(&uri, zero, d, zero, 0)).unwrap();
+    let err = exec(&mut p, insert(&uri, zero, d, zero, 0)).unwrap_err();
     match err {
         Error::Overlap(overlap) => {
             assert_eq!(overlap.track, 0);
@@ -140,35 +138,19 @@ fn exec_put_refuses_a_collision_and_leaves_no_trace() {
     assert_eq!(
         p.tracks()[0].clips().len(),
         1,
-        "a refused put leaves no trace"
+        "a refused insert leaves no trace"
     );
     assert_eq!(p.duration(), Duration::from_secs_f64(0.2));
 }
 
 #[test]
-fn exec_put_butt_joins_clips_in_order() {
+fn exec_insert_butt_joins_clips_in_order() {
     let mut p = player();
     let uri = src("a.wav");
     let d = Duration::from_secs_f64(0.2);
-    exec(
-        &mut p,
-        put(
-            &uri,
-            Slice::window(Duration::ZERO, d),
-            TrackPos::from((0, Duration::ZERO)),
-        ),
-    )
-    .unwrap();
-    let outcome = exec(
-        &mut p,
-        put(
-            &uri,
-            Slice::window(Duration::ZERO, d),
-            TrackPos::from((0, d)),
-        ),
-    )
-    .unwrap();
-    let put = put_outcome(outcome);
+    exec(&mut p, insert(&uri, Duration::ZERO, d, Duration::ZERO, 0)).unwrap();
+    let outcome = exec(&mut p, insert(&uri, Duration::ZERO, d, d, 0)).unwrap();
+    let put = inserted_outcome(outcome);
     assert_eq!(put.clip.id, 1);
     assert_eq!(p.tracks()[0].clips().len(), 2);
     assert_eq!(p.tracks()[0].clips()[1].at, d);
@@ -176,20 +158,12 @@ fn exec_put_butt_joins_clips_in_order() {
 }
 
 #[test]
-fn exec_put_grows_tracks_to_fit() {
+fn exec_insert_grows_tracks_to_fit() {
     let mut p = player();
     let uri = src("a.wav");
     let d = Duration::from_secs_f64(0.2);
-    let outcome = exec(
-        &mut p,
-        put(
-            &uri,
-            Slice::window(Duration::ZERO, d),
-            TrackPos::from((4, Duration::ZERO)),
-        ),
-    )
-    .unwrap();
-    let put = put_outcome(outcome);
+    let outcome = exec(&mut p, insert(&uri, Duration::ZERO, d, Duration::ZERO, 4)).unwrap();
+    let put = inserted_outcome(outcome);
     assert_eq!(put.track, 4);
     assert_eq!(p.tracks().len(), 5, "missing tracks are created");
 }
@@ -200,11 +174,7 @@ fn exec_drives_the_transport() {
     let uri = src("a.wav");
     exec(
         &mut p,
-        put(
-            &uri,
-            Slice::window(Duration::ZERO, Duration::from_secs(10)),
-            TrackPos::from((0, Duration::ZERO)),
-        ),
+        insert(&uri, Duration::ZERO, Duration::from_secs(10), Duration::ZERO, 0),
     )
     .unwrap();
 
@@ -216,17 +186,21 @@ fn exec_drives_the_transport() {
     assert_eq!(played.end, Duration::from_secs(10));
     assert!(p.is_playing());
 
-    let Outcome::Seeked { at } = exec(&mut p, Command::Seek { at: Duration::from_secs(4) }).unwrap()
+    let Outcome::Seeked { at } =
+        exec(&mut p, Command::Seek { at: Duration::from_secs(4) }).unwrap()
     else {
         panic!("expected Seeked");
     };
     assert_eq!(at, Duration::from_secs(4));
-    assert_eq!(p.playhead(), Duration::from_secs(4), "a running transport is re-planned");
+    assert_eq!(
+        p.playhead(),
+        Duration::from_secs(4),
+        "a running transport is re-planned"
+    );
 
     // A structural edit while playing waits; apply rebuilds for it.
     assert_eq!(p.changed(bo_engine::Change::Structure), Landed::Pending);
-    let Outcome::Applied(Applied::Rebuilt { live, at }) =
-        exec(&mut p, Command::Apply).unwrap()
+    let Outcome::Applied(Applied::Rebuilt { live, at }) = exec(&mut p, Command::Apply).unwrap()
     else {
         panic!("expected a rebuild");
     };

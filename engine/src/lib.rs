@@ -19,7 +19,7 @@ pub mod rodio;
 pub mod timeline;
 
 use bo_core::bus::{Bus, Group};
-use bo_core::command::{Command, Error, Outcome, Overlap, PlacedClip, Played, Put};
+use bo_core::command::{Command, Error, Inserted, Outcome, Overlap, PlacedClip, Played};
 use bo_core::track::{Clip, Fade, Source, Track};
 
 /// Why a backend could not do what it was told: data, shared with the
@@ -600,11 +600,17 @@ impl<B: Backend> Player<B> {
 /// the arrangement exactly as it was.
 pub fn exec<B: Backend>(player: &mut Player<B>, command: Command) -> Result<Outcome, Error> {
     match command {
-        Command::Put { uri, slice, on } => {
-            // An open slice plays to the source's end; resolve that end now,
+        Command::Insert {
+            uri,
+            from,
+            to,
+            at,
+            track,
+        } => {
+            // An open end plays to the source's end; resolve that end now,
             // so every clip has a known finite length and none can silently
             // block its track. Same refusal the CLI makes.
-            let to = match slice.to {
+            let to = match to {
                 Some(to) => to,
                 None => rodio::probe(&uri).map_err(|why| Error::Probe {
                     uri: uri.clone(),
@@ -613,19 +619,20 @@ pub fn exec<B: Backend>(player: &mut Player<B>, command: Command) -> Result<Outc
             };
             // The track is addressed by index, created on demand like the
             // CLI's.
-            while player.tracks().len() <= on.track {
+            while player.tracks().len() <= track {
                 player.add_track(Track::new());
             }
-            let clip = Clip::sliced(Arc::new(Source::new(&uri)), slice.from, to)
-                .at(on.at)
+            let clip = Clip::sliced(Arc::new(Source::new(&uri)), from, to)
+                .at(at)
                 .gain(1.0)
                 .fade(Fade::default());
-            // Refuse a collision before inserting anything: a rejected put
-            // leaves no trace, and says where the clip could go instead.
-            let view = &player.tracks()[on.track];
+            // Refuse a collision before inserting anything: a rejected
+            // insert leaves no trace, and says where the clip could go
+            // instead.
+            let view = &player.tracks()[track];
             if let Some(conflict) = view.clips().iter().find(|c| c.overlaps(&clip)) {
                 return Err(Error::Overlap(Overlap {
-                    track: on.track,
+                    track,
                     at: clip.at,
                     conflict: conflict.id,
                     conflict_at: conflict.at,
@@ -633,19 +640,19 @@ pub fn exec<B: Backend>(player: &mut Player<B>, command: Command) -> Result<Outc
                     next_free: view.next_free_start(clip.at, clip.duration()),
                 }));
             }
-            let id = player.tracks_mut()[on.track]
+            let id = player.tracks_mut()[track]
                 .insert(clip)
                 .expect("pre-checked: the insert cannot collide");
             // Placement past the queued tail joins the running graph; the
             // rest waits for an apply — exactly what the daemon does.
-            let landed = player.changed(Change::Appended(on.track));
-            Ok(Outcome::Put(Put {
-                track: on.track,
+            let landed = player.changed(Change::Appended(track));
+            Ok(Outcome::Inserted(Inserted {
+                track,
                 clip: PlacedClip {
                     id,
                     uri: uri.clone(),
-                    at: on.at,
-                    from: slice.from,
+                    at,
+                    from,
                     to,
                     gain: 1.0,
                     fade: Fade::default(),

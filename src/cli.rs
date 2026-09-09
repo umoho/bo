@@ -2704,7 +2704,7 @@ fn handle_json(state: &Mutex<Arrangement>, line: &str, cwd: &str) -> (i32, Strin
             )
         }
     };
-    if let bo_core::command::Command::Put { uri, .. } = &mut command {
+    if let bo_core::command::Command::Insert { uri, .. } = &mut command {
         *uri = absolutize(uri, cwd);
     }
     let mut a = state.lock().unwrap();
