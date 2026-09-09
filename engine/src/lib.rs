@@ -21,6 +21,11 @@ pub mod rodio;
 pub mod session;
 pub mod timeline;
 
+/// The engine's host handle: one executor plus lifecycle over a chosen
+/// backend. Everything a session can do goes through [`Session::exec`]; the
+/// daemon hosts one of these.
+pub use session::Session;
+
 use bo_core::bus::{Bus, BusRef, Group, Placement};
 use bo_core::control::ControlSource;
 use bo_core::command::{ClipHere, Command, Error, Inserted, Moved, OnTrack, Outcome, Overlap, PlacedClip, Played, Removed, Rendered, RouteBus, Routed, Set, Stats};

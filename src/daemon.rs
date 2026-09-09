@@ -2,11 +2,11 @@
 //! JSON wire — one [`Command`] per request (after a line naming the caller's
 //! working directory), one JSON [`Reply`] back.
 //!
-//! The daemon owns the arrangement (an [`Arrangement`]: an engine player
-//! over the chosen runtime, plus the command history snapshots are made
-//! from), the transport clock, and the host-level snapshot verbs —
-//! `Snapshot`/`Load`/`Check` are intercepted here, never sent to the engine
-//! (which refuses them with `Error::Host`).
+//! The daemon hosts an engine [`Session`] (the only engine item it touches),
+//! plus the command history snapshots are made from, and the transport
+//! clock. The host-level snapshot verbs — `Snapshot`/`Load`/`Check` — are
+//! intercepted here (or answered by `Session::load`), never sent to the
+//! engine's raw `exec`, which refuses them with `Error::Host`.
 //!
 //! It is spawned on demand by the clients and the mini CLI, exits when
 //! playback finishes, on a `stop`, or after `BO_IDLE_TIMEOUT` seconds of
@@ -21,14 +21,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use bo::client::{Command, Error, Reply, SNAPSHOT_VERSION, Snapshot};
-use bo::engine::session::Runtime;
-use bo::engine::{Change, Player, State};
+use bo::engine::Session;
 
-/// The arrangement a daemon hosts: a transport over the audio backend, the
-/// idle timeout it was started with, and the arrangement commands that built
-/// it — the snapshot history.
+/// What a daemon hosts: an engine session, the idle timeout it was started
+/// with, and the arrangement commands that built it — the snapshot history.
 struct Arrangement {
-    player: Player<Runtime>,
+    session: Session,
     /// `BO_IDLE_TIMEOUT` seconds (default 600, `0` disables): a quiet,
     /// non-playing daemon exits after this long without a command.
     idle_timeout: u64,
@@ -37,24 +35,24 @@ struct Arrangement {
 
 impl Default for Arrangement {
     fn default() -> Self {
-        Self::with_backend(Runtime::silent())
+        Self::with_session(Session::silent())
     }
 }
 
 impl Arrangement {
-    fn with_backend(backend: Runtime) -> Self {
+    fn with_session(session: Session) -> Self {
         Self {
-            player: Player::new(backend),
+            session,
             idle_timeout: 600,
             history: Vec::new(),
         }
     }
 }
 
-/// Run the daemon on the runtime the environment asks for: rodio unless
+/// Run the daemon on the session the environment asks for: rodio unless
 /// `BO_BACKEND=silent`, falling back to silence without an audio device.
 pub fn main(socket: &Path) -> i32 {
-    daemon_main_with(socket, Runtime::open())
+    daemon_main_with(socket, Session::open())
 }
 
 /// The idle timeout from `BO_IDLE_TIMEOUT` seconds (default 600; 0 disables).
@@ -66,8 +64,8 @@ fn idle_timeout() -> Duration {
     }
 }
 
-/// The daemon over a specific backend.
-fn daemon_main_with(socket: &Path, backend: Runtime) -> i32 {
+/// The daemon over a specific session.
+fn daemon_main_with(socket: &Path, session: Session) -> i32 {
     if let Some(parent) = socket.parent()
         && let Err(e) = std::fs::create_dir_all(parent)
     {
@@ -82,7 +80,7 @@ fn daemon_main_with(socket: &Path, backend: Runtime) -> i32 {
             return 1;
         }
     };
-    let state = Arc::new(Mutex::new(Arrangement::with_backend(backend)));
+    let state = Arc::new(Mutex::new(Arrangement::with_session(session)));
     let exit = Arc::new(AtomicBool::new(false));
     // Every served command resets this clock; a non-playing daemon that stays
     // quiet for `BO_IDLE_TIMEOUT` seconds cleans itself up.
@@ -108,9 +106,9 @@ fn daemon_main_with(socket: &Path, backend: Runtime) -> i32 {
         last = now;
         let quit = {
             let mut a = state.lock().unwrap();
-            a.player.advance(dt);
-            if a.player.state() == State::Playing {
-                a.player.is_finished()
+            a.session.advance(dt);
+            if a.session.is_playing() {
+                a.session.is_finished()
             } else if timeout > Duration::ZERO
                 && now.duration_since(*idle.lock().unwrap()) > timeout
             {
@@ -181,17 +179,21 @@ fn handle_command(state: &Mutex<Arrangement>, line: &str, cwd: &str) -> (i32, St
     use Command as Cmd;
     let ends_session = matches!(command, Cmd::Stop);
     let reply = match &command {
-        // Host-level: the daemon holds the history and the transport.
+        // Host-level: the daemon holds the history; the session holds the
+        // transport.
         Cmd::Snapshot => {
             let snapshot = Snapshot {
                 version: SNAPSHOT_VERSION,
                 history: a.history.clone(),
-                playhead: a.player.playhead(),
+                playhead: a.session.playhead(),
             };
             Reply::Ok(bo::client::Outcome::Snapshot(snapshot))
         }
-        Cmd::Load { snapshot } => match load_snapshot(&mut a, snapshot) {
-            Ok(()) => Reply::Ok(bo::client::Outcome::Loaded),
+        Cmd::Load { snapshot } => match a.session.load(snapshot) {
+            Ok(()) => {
+                a.history = snapshot.history.clone();
+                Reply::Ok(bo::client::Outcome::Loaded)
+            }
             Err(e) => Reply::Err(e),
         },
         Cmd::Check { snapshot } => {
@@ -205,10 +207,10 @@ fn handle_command(state: &Mutex<Arrangement>, line: &str, cwd: &str) -> (i32, St
                     false,
                 );
             }
-            let mut staged = Arrangement::default();
+            let mut staged = Session::silent();
             let mut problems = Vec::new();
             for (i, command) in snapshot.history.iter().enumerate() {
-                if let Err(e) = bo::engine::exec(&mut staged.player, command.clone()) {
+                if let Err(e) = staged.exec(command.clone()) {
                     problems.push(format!("#{} {}", i + 1, e));
                 }
             }
@@ -220,7 +222,7 @@ fn handle_command(state: &Mutex<Arrangement>, line: &str, cwd: &str) -> (i32, St
             return (0, json_reply(&reply), false);
         }
         // A fresh session forgets its history too.
-        Cmd::Reset => match bo::engine::exec(&mut a.player, command) {
+        Cmd::Reset => match a.session.exec(command) {
             Ok(outcome) => {
                 a.history.clear();
                 Reply::Ok(outcome)
@@ -234,7 +236,7 @@ fn handle_command(state: &Mutex<Arrangement>, line: &str, cwd: &str) -> (i32, St
                 _ => {}
             }
             let executed = command.clone();
-            match bo::engine::exec(&mut a.player, command) {
+            match a.session.exec(command) {
                 Ok(outcome) => {
                     if is_mutator(&executed) {
                         a.history.push(executed);
@@ -272,40 +274,6 @@ fn absolutize(path: &str, cwd: &str) -> String {
         return path.to_string();
     }
     Path::new(cwd).join(p).to_string_lossy().into_owned()
-}
-
-/// Replace the arrangement from a snapshot, atomically: the history runs on
-/// a silent staging session first, so a failing script leaves the live
-/// session untouched; only then do the staged tracks, groups, volume and
-/// playhead come across. The audio backend survives (only the arrangement is
-/// swapped).
-fn load_snapshot(
-    a: &mut Arrangement,
-    snapshot: &Snapshot,
-) -> Result<(), bo::client::Error> {
-    use bo::client::Error;
-    if snapshot.version != SNAPSHOT_VERSION {
-        return Err(Error::Version(format!(
-            "snapshot version {} — this build reads {}",
-            snapshot.version, SNAPSHOT_VERSION
-        )));
-    }
-    let mut staged = Arrangement::default();
-    for command in &snapshot.history {
-        bo::engine::exec(&mut staged.player, command.clone()).map_err(|e| Error::Host(format!(
-            "load failed at {command:?}: {e}"
-        )))?;
-    }
-    a.player.reset();
-    a.player.set_volume(staged.player.volume());
-    let tracks: Vec<_> = staged.player.tracks().to_vec();
-    let groups: Vec<_> = staged.player.groups().to_vec();
-    a.player.tracks_mut().extend(tracks);
-    a.player.set_groups(groups);
-    a.player.set_playhead(snapshot.playhead);
-    a.player.changed(Change::Structure);
-    a.history = snapshot.history.clone();
-    Ok(())
 }
 
 /// Serialize a typed reply for the wire.
