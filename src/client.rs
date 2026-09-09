@@ -5,27 +5,27 @@
 //! arrangement every `bo` invocation shares. Each method is one
 //! [`Command`](bo_core::command::Command), sent as typed JSON and decoded
 //! back from the typed [`Reply`](bo_core::command::Reply). The command
-//! protocol speaks the model's own units; this module adds the ergonomics a
-//! human or script types — [`Slice`], [`TrackRef`]`(i).at(t)` — that expand
-//! into those units.
+//! protocol speaks the model's own units; this module adds the client's own
+//! vocabulary on top — a [`Clip`] (what to play, as material) and a
+//! [`TrackPosition`] (where on the timeline) — that expand into those units.
 //!
 //! # Placing a clip
 //!
-//! [`Bo::put`] takes three plain things: a source address (a file the caller
-//! manages — bo does not open or probe it unless it must), a [`Slice`] (the
-//! `from..to` window into that source, or the whole source), and a
-//! [`TrackPos`] (a track and a timecode). A clip with an open end (a slice
-//! whose `to` is `None`) is measured where the arrangement lives, because
-//! only decoding the source can say where it ends; a closed slice touches no
-//! disk at all until play or render.
+//! [`Bo::put`] takes the material ([`Clip`]: a source and a `from..to`
+//! window, or the whole source) and the placement ([`TrackPosition`]: a
+//! track and a timecode). A clip with an open end (`to: None`) is measured
+//! where the arrangement lives, because only decoding the source can say
+//! where it ends; a closed window touches no disk at all until play or
+//! render.
 //!
 //! ```no_run
-//! use bo::client::{Bo, Slice, TrackRef};
+//! use bo::client::{Bo, Clip, Slice, TrackRef};
 //! use std::time::Duration;
 //!
 //! let mut bo = Bo::new();   // the default connection: the shared daemon
-//! // The 1:00–2:00 window of the file, on track 0 at 30 s in:
-//! let put = bo.put("bed.wav", "1:00-2:00".parse()?, TrackRef(0).at(Duration::from_secs(30)))?;
+//! let window: Slice = "1:00-2:00".parse()?;
+//! let clip = Clip::whole("bed.wav").windowed(window);
+//! let put = bo.put(clip, TrackRef(0).at(Duration::from_secs(30)))?;
 //! assert_eq!(put.track, 0);
 //! # Ok::<(), bo::client::Error>(())
 //! ```
@@ -40,10 +40,56 @@ pub use bo_core::command::{
     Applied, Command, Error, Inserted, Landed, Outcome, Overlap, PlacedClip, Played, Reply,
 };
 
-/// A `from..to` window into a source: where a clip starts reading and where
-/// it stops. `to: None` means the source's end — resolved by probing when
-/// the clip is placed (the CLI's `uri,from-`). Client ergonomics: commands
-/// carry the window as plain `from`/`to` fields.
+/// Material to place: a source and the `from..to` window of it to play.
+/// `to: None` means the source's end — resolved by probing when the clip is
+/// placed (the CLI's `uri,from-`).
+///
+/// The client's own clip, deliberately not the model's [`Clip`] — no id, no
+/// shared [`Source`](bo_core::track::Source) arc, no controls yet: this is
+/// *what you want to place*, expressed plainly, and it becomes a model clip
+/// where it is placed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Clip {
+    /// The source address.
+    pub uri: String,
+    /// In-point, measured into the source.
+    pub from: Duration,
+    /// Out-point, measured into the source; `None` = the source's end.
+    pub to: Option<Duration>,
+}
+
+impl Clip {
+    /// The whole of `uri` (its end resolved by probing at placement).
+    #[must_use]
+    pub fn whole(uri: impl Into<String>) -> Self {
+        Self {
+            uri: uri.into(),
+            from: Duration::ZERO,
+            to: None,
+        }
+    }
+
+    /// A `from .. to` window of `uri`.
+    #[must_use]
+    pub fn window(uri: impl Into<String>, from: Duration, to: Duration) -> Self {
+        Self {
+            uri: uri.into(),
+            from,
+            to: Some(to),
+        }
+    }
+
+    /// Narrow the material to a window (builder form).
+    #[must_use]
+    pub fn windowed(mut self, window: impl Into<Slice>) -> Self {
+        let window = window.into();
+        self.from = window.from;
+        self.to = window.to;
+        self
+    }
+}
+
+/// A `from..to` window, parsed from text. Client vocabulary for [`Clip`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Slice {
     /// In-point, measured into the source.
@@ -104,15 +150,15 @@ impl From<(Duration, Duration)> for Slice {
     }
 }
 
-/// A track, addressed by its index. An insert grows the session to fit.
+/// A track, addressed by its index. A `put` grows the session to fit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TrackRef(pub usize);
 
 impl TrackRef {
     /// A position on this track: `TrackRef(0).at(t)` — the CLI's `0@t`.
     #[must_use]
-    pub const fn at(self, at: Duration) -> TrackPos {
-        TrackPos {
+    pub const fn at(self, at: Duration) -> TrackPosition {
+        TrackPosition {
             track: self.0,
             at,
         }
@@ -137,16 +183,16 @@ impl fmt::Display for TrackRef {
     }
 }
 
-/// A track and a timecode: where a clip lands.
+/// Where on the timeline a clip lands: a track and a timecode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TrackPos {
+pub struct TrackPosition {
     /// Track index, created on demand by an insert.
     pub track: usize,
     /// Position on that track.
     pub at: Duration,
 }
 
-impl From<(usize, Duration)> for TrackPos {
+impl From<(usize, Duration)> for TrackPosition {
     fn from((track, at): (usize, Duration)) -> Self {
         Self { track, at }
     }
@@ -185,22 +231,22 @@ impl Bo {
         Self { connection }
     }
 
-    /// Insert a clip: the `from..to` window `slice` of source `uri`, on
-    /// `on.track` at track-time `on.at`.
+    /// Place a clip: the material `clip` lands at `to`.
     ///
-    /// A refused insert — a slice with no end whose source cannot be
-    /// measured, or a placement that collides with a resident clip — is an
-    /// `Err` and leaves the session exactly as it was. The track is grown to
-    /// fit. A clip placed past the end of a running track's queue joins that
-    /// queue as it is placed; anything else waits for an `apply` — see
+    /// A refused put — a clip with no end whose source cannot be measured,
+    /// or a placement that collides with a resident clip — is an `Err` and
+    /// leaves the session exactly as it was. The track is grown to fit. A
+    /// clip placed past the end of a running track's queue joins that queue
+    /// as it is placed; anything else waits for an `apply` — see
     /// [`Inserted::landed`].
-    pub fn put(&mut self, uri: &str, slice: Slice, on: TrackPos) -> Result<Inserted, Error> {
+    pub fn put(&mut self, clip: Clip, to: TrackPosition) -> Result<Inserted, Error> {
+        let Clip { uri, from, to: to_in } = clip;
         match self.exec(Command::Insert {
-            uri: uri.to_string(),
-            from: slice.from,
-            to: slice.to,
-            at: on.at,
-            track: on.track,
+            uri,
+            from,
+            to: to_in,
+            at: to.at,
+            track: to.track,
         })? {
             Outcome::Inserted(inserted) => Ok(inserted),
             other => Err(unexpected(&other)),
@@ -297,24 +343,20 @@ mod tests {
     }
 
     #[test]
-    fn sugar_expands_into_a_flat_command() {
-        let on = TrackRef(3).at(Duration::from_secs(9));
-        assert_eq!(
-            TrackPos::from((3, Duration::from_secs(9))),
-            on
-        );
-        let s = Slice::whole();
+    fn material_and_placement_expand_into_a_flat_command() {
+        let clip = Clip::whole("a.wav").windowed((Duration::ZERO, Duration::from_secs(5)));
+        let to = TrackPosition::from((3, Duration::from_secs(9)));
         let cmd = Command::Insert {
-            uri: "a.wav".to_string(),
-            from: s.from,
-            to: s.to,
-            at: on.at,
-            track: on.track,
+            uri: clip.uri,
+            from: clip.from,
+            to: clip.to,
+            at: to.at,
+            track: to.track,
         };
         assert_eq!(cmd, Command::Insert {
             uri: "a.wav".to_string(),
             from: Duration::ZERO,
-            to: None,
+            to: Some(Duration::from_secs(5)),
             at: Duration::from_secs(9),
             track: 3,
         });
