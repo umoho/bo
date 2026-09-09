@@ -17,7 +17,7 @@
 ///
 /// Every output points at one of two things: the master, or a group bus
 /// addressed by its stable id (see [`Group`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum BusRef {
     /// The terminal bus: receives everything, and its output leaves the mix.
     #[default]

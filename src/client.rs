@@ -19,12 +19,13 @@
 //! render.
 //!
 //! ```no_run
-//! use bo::client::{Bo, Clip, TrackIndex};
+//! use bo::client::{Bo, Clip, Timecode, TrackIndex};
 //! use std::time::Duration;
 //!
 //! let mut bo = Bo::new();   // the default connection: the shared daemon
 //! let clip = Clip::of("bed.wav").trim("1:00-2:00".parse()?);
-//! let put = bo.put(clip, TrackIndex(0).at("0:30".parse()?))?;
+//! let when: Timecode = "0:30".parse()?;
+//! let put = bo.put(clip, TrackIndex(0).at(when))?;
 //! assert_eq!(put.track, 0);
 //! # Ok::<(), bo::client::Error>(())
 //! ```
@@ -37,7 +38,9 @@ use crate::connection::Connection;
 // The command protocol, shared with the engine and the daemon.
 pub use bo_core::command::{
     Applied, Command, Error, Inserted, Landed, Outcome, Overlap, PlacedClip, Played, Reply,
+    Routed,
 };
+pub use bo_core::bus::BusRef;
 
 /// A timecode: a point in time, parsed from the lenient forms the whole
 /// tool speaks — `SS`, `MM:SS` or `HH:MM:SS` with an optional `.fff`
@@ -241,6 +244,44 @@ impl From<(usize, Duration)> for TrackPosition {
     }
 }
 
+/// A bus to route into: the master, or a group bus by its stable id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BusIndex {
+    /// The master bus — routing a track here sends it back out.
+    Master,
+    /// A group bus, by the id [`Bo::new_bus`] returned.
+    Group(u64),
+}
+
+impl BusIndex {
+    /// The master bus.
+    #[must_use]
+    pub const fn master() -> Self {
+        Self::Master
+    }
+
+    /// A group bus by id.
+    #[must_use]
+    pub const fn group(id: u64) -> Self {
+        Self::Group(id)
+    }
+}
+
+impl From<u64> for BusIndex {
+    fn from(id: u64) -> Self {
+        Self::Group(id)
+    }
+}
+
+impl From<BusIndex> for BusRef {
+    fn from(bus: BusIndex) -> Self {
+        match bus {
+            BusIndex::Master => BusRef::Master,
+            BusIndex::Group(id) => BusRef::Group(id),
+        }
+    }
+}
+
 /// A typed client on a [`Connection`]: the arrangement lives there, commands
 /// travel there, and the replies come back typed.
 ///
@@ -340,6 +381,32 @@ impl Bo {
     pub fn apply(&mut self) -> Result<Applied, Error> {
         match self.exec(Command::Apply)? {
             Outcome::Applied(applied) => Ok(applied),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// Create a group bus (named, when a name is given) and return its id.
+    pub fn new_bus(&mut self, name: Option<&str>) -> Result<u64, Error> {
+        match self.exec(Command::NewBus {
+            name: name.map(str::to_string),
+        })? {
+            Outcome::Bus { id } => Ok(id),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// Route a track's output into a bus — a group bus, or back to the
+    /// master. Structure: it lands at the next `apply`.
+    pub fn route(
+        &mut self,
+        track: TrackIndex,
+        to: BusIndex,
+    ) -> Result<Routed, Error> {
+        match self.exec(Command::Route {
+            track: track.0,
+            bus: to.into(),
+        })? {
+            Outcome::Routed(routed) => Ok(routed),
             other => Err(unexpected(&other)),
         }
     }

@@ -7,7 +7,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use bo::client::{Bo, Clip, Error, TimecodeRange, TrackIndex};
+use bo::client::{Bo, BusRef, Clip, Error, Landed, TimecodeRange, TrackIndex};
 use bo::connection::Connection;
 
 fn temp_dir() -> PathBuf {
@@ -215,6 +215,40 @@ fn transport_verbs_round_trip_through_the_daemon() {
     bo.stop().unwrap();
     let out = bo_cli(&socket, &["ls"]);
     assert!(out.contains("stopped, playhead at 00:00:00.000"), "{out}");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn buses_and_routing_round_trip_through_the_daemon() {
+    use bo::client::{BusIndex, TrackIndex};
+    let dir = temp_dir();
+    let socket = dir.join("d.sock");
+    let _daemon = spawn_daemon(&socket);
+
+    let mut bo = Bo::with_connection(Connection::at(&socket));
+    let id = bo.new_bus(Some("music")).expect("a fresh bus");
+    assert_eq!(id, 0);
+
+    bo.put(
+        Clip::of("a.wav").trim(TimecodeRange::from((Duration::ZERO, Duration::from_secs(10)))),
+        TrackIndex(0).at(Duration::ZERO),
+    )
+    .unwrap();
+
+    let routed = bo
+        .route(TrackIndex(0), BusIndex::group(id))
+        .expect("route joins the group");
+    assert_eq!(routed.bus, BusRef::Group(0));
+    assert_eq!(routed.landed, Landed::Pending, "structure waits for apply");
+
+    // The CLI sees the routing.
+    let out = bo_cli(&socket, &["ls"]);
+    assert!(out.contains("'music'") && out.contains("bus=#0"), "{out}");
+
+    bo.route(TrackIndex(0), BusIndex::master()).unwrap();
+    let out = bo_cli(&socket, &["ls"]);
+    assert!(out.contains("master"), "{out}");
 
     std::fs::remove_dir_all(&dir).ok();
 }

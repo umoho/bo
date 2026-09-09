@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::bus::BusRef;
 use crate::time;
 use crate::track::Fade;
 
@@ -111,6 +112,13 @@ pub enum Command {
         at: Duration,
         track: usize,
     },
+    /// Create a group bus (named, when a name is given) and return its id.
+    NewBus {
+        name: Option<String>,
+    },
+    /// Route a track's output into a bus — a group bus, or back to the
+    /// master. Structure: it lands at the next `apply`.
+    Route { track: usize, bus: BusRef },
     /// Start playback from the current playhead.
     Play,
     /// Hold position and silence output.
@@ -158,11 +166,26 @@ pub enum Applied {
     NotPlaying,
 }
 
+/// What a route did, echoed ([`Command::Route`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Routed {
+    /// The routed track.
+    pub track: usize,
+    /// Where its output now points.
+    pub bus: BusRef,
+    /// Structure lands at the next `apply` ([`Landed::Pending`]).
+    pub landed: Landed,
+}
+
 /// The result of a [`Command`], as data.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Outcome {
     /// A clip was inserted ([`Command::Insert`]).
     Inserted(Inserted),
+    /// A group bus was created ([`Command::NewBus`]).
+    Bus { id: u64 },
+    /// A track was routed ([`Command::Route`]).
+    Routed(Routed),
     /// Playback started ([`Command::Play`]).
     Played(Played),
     /// The transport paused ([`Command::Pause`]).
@@ -283,6 +306,12 @@ impl std::error::Error for Overlap {}
 pub enum Error {
     /// Text that failed to parse (a key, a control source).
     Parse(String),
+    /// A command addressed a track that does not exist.
+    NoTrack(usize),
+    /// A command addressed a group bus that does not exist.
+    NoBus(u64),
+    /// A command addressed a bus whose name is reserved.
+    BusName(String),
     /// An open-ended insert whose source could not be measured.
     Probe { uri: String, why: String },
     /// The placement collided with a resident clip.
@@ -298,6 +327,9 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Parse(msg) => f.write_str(msg),
+            Self::NoTrack(track) => write!(f, "no track {track}"),
+            Self::NoBus(id) => write!(f, "no bus {id}"),
+            Self::BusName(name) => write!(f, "'{name}' is reserved for the master bus"),
             Self::Probe { uri, why } => write!(f, "cannot measure {uri}: {why}"),
             Self::Overlap(overlap) => write!(f, "{overlap}"),
             Self::Backend(err) => write!(f, "{err}"),

@@ -19,8 +19,8 @@ pub mod rodio;
 pub mod session;
 pub mod timeline;
 
-use bo_core::bus::{Bus, Group};
-use bo_core::command::{Command, Error, Inserted, Outcome, Overlap, PlacedClip, Played};
+use bo_core::bus::{Bus, BusRef, Group};
+use bo_core::command::{Command, Error, Inserted, Outcome, Overlap, PlacedClip, Played, Routed};
 use bo_core::track::{Clip, Fade, Source, Track};
 
 /// Why a backend could not do what it was told: data, shared with the
@@ -660,6 +660,25 @@ pub fn exec<B: Backend>(player: &mut Player<B>, command: Command) -> Result<Outc
                 },
                 landed,
             }))
+        }
+        Command::NewBus { name } => {
+            let id = player.add_group(name);
+            Ok(Outcome::Bus { id })
+        }
+        Command::Route { track, bus } => {
+            if track >= player.tracks().len() {
+                return Err(Error::NoTrack(track));
+            }
+            if let BusRef::Group(id) = bus
+                && player.group(id).is_none()
+            {
+                return Err(Error::NoBus(id));
+            }
+            player.tracks_mut()[track].set_bus(bus);
+            // Routing is structure: no running graph can take it, so it
+            // lands at the next apply's rebuild.
+            let landed = player.changed(Change::Structure);
+            Ok(Outcome::Routed(Routed { track, bus, landed }))
         }
         Command::Play => {
             player.play().map_err(Error::Backend)?;

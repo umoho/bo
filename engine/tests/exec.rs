@@ -220,3 +220,65 @@ fn exec_drives_the_transport() {
     };
     assert_eq!(p.state(), bo_engine::State::Stopped);
 }
+
+#[test]
+fn exec_routes_tracks_into_buses() {
+    use bo_core::bus::BusRef;
+    let mut p = player();
+    exec(
+        &mut p,
+        insert(&src("a.wav"), Duration::ZERO, Duration::from_secs(10), Duration::ZERO, 0),
+    )
+    .unwrap();
+
+    // A route to a missing track or bus is refused, no trace.
+    match exec(
+        &mut p,
+        Command::Route { track: 9, bus: BusRef::Group(0) },
+    )
+    .unwrap_err()
+    {
+        Error::NoTrack(9) => {}
+        other => panic!("expected NoTrack, got {other:?}"),
+    }
+    match exec(
+        &mut p,
+        Command::Route { track: 0, bus: BusRef::Group(7) },
+    )
+    .unwrap_err()
+    {
+        Error::NoBus(7) => {}
+        other => panic!("expected NoBus, got {other:?}"),
+    }
+    assert_eq!(p.tracks()[0].bus(), BusRef::Master, "refusals leave no trace");
+
+    // NewBus creates and names; route joins; structure lands at apply.
+    let Outcome::Bus { id } = exec(&mut p, Command::NewBus { name: Some("music".into()) }).unwrap()
+    else {
+        panic!("expected a bus id");
+    };
+    assert_eq!(id, 0);
+    let Outcome::Routed(routed) = exec(
+        &mut p,
+        Command::Route { track: 0, bus: BusRef::Group(id) },
+    )
+    .unwrap()
+    else {
+        panic!("expected Routed");
+    };
+    assert_eq!(routed.landed, Landed::Pending);
+    assert_eq!(p.tracks()[0].bus(), BusRef::Group(0));
+    assert!(!p.groups()[0].muted());
+
+    // Back to the master.
+    let Outcome::Routed(routed) = exec(
+        &mut p,
+        Command::Route { track: 0, bus: BusRef::Master },
+    )
+    .unwrap()
+    else {
+        panic!("expected Routed");
+    };
+    assert_eq!(routed.bus, BusRef::Master);
+    assert_eq!(p.tracks()[0].bus(), BusRef::Master);
+}
