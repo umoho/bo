@@ -148,13 +148,16 @@ pub enum Command {
     Set { path: String, patcher: Value },
     /// Measure a source: its length and channel count.
     Probe { uri: String },
-    /// Mix the arrangement — or a range of it — to a wav file.
+    /// Mix the arrangement — or a range of it — to a wav file, optionally
+    /// measuring the mix or folding it to mono.
     Render {
         file: String,
         #[serde(with = "ms_opt")]
         from: Option<Duration>,
         #[serde(with = "ms_opt")]
         to: Option<Duration>,
+        measure: bool,
+        mono: bool,
     },
     /// Start playback from the current playhead.
     Play,
@@ -293,13 +296,37 @@ pub struct Probed {
     pub channels: u16,
 }
 
+/// Levels of a rendered span, when measured ([`Command::Render`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Stats {
+    /// The span actually measured, milliseconds.
+    pub span_ms: u64,
+    /// Sample peak over all channels, dBFS.
+    pub peak_db: f32,
+    /// True peak (4× oversampled), dBFS.
+    pub true_peak_db: f32,
+    /// RMS over all samples, dBFS.
+    pub rms_db: f32,
+    /// Integrated loudness, LUFS; none under 3 s or for all-silence.
+    pub integrated_lufs: Option<f32>,
+    /// Loudest 400 ms block, LUFS.
+    pub momentary_max_lufs: Option<f32>,
+    /// Loudest 3 s window, LUFS.
+    pub short_term_max_lufs: Option<f32>,
+    /// Loudness range, LU.
+    pub lra: Option<f32>,
+}
+
 /// What a render produced, echoed ([`Command::Render`]).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Rendered {
     /// Where the wav went.
     pub file: String,
     /// How long the rendered range is.
     pub duration_ms: u64,
+    /// Levels, when the render measured them.
+    #[serde(skip)]
+    pub stats: Option<Stats>,
 }
 
 /// The result of a [`Command`], as data.

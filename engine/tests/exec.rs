@@ -753,7 +753,7 @@ fn exec_probes_and_renders() {
     let file = out.to_string_lossy().into_owned();
     let Outcome::Rendered(rendered) = exec(
         &mut p,
-        Command::Render { file: file.clone(), from: None, to: None },
+        Command::Render { file: file.clone(), from: None, to: None, measure: false, mono: false },
     )
     .unwrap()
     else {
@@ -774,6 +774,8 @@ fn exec_probes_and_renders() {
             file: dir.path().join("bad.wav").to_string_lossy().into_owned(),
             from: None,
             to: None,
+            measure: false,
+            mono: false,
         },
     )
     .unwrap_err()

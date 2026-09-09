@@ -37,7 +37,7 @@ use crate::connection::Connection;
 
 // The command protocol, shared with the engine and the daemon.
 pub use bo_core::command::{
-    Applied, Command, Error, Inserted, Landed, Moved, Outcome, Overlap, PlacedClip, Played, Probed, Removed, Rendered, Reply, Routed, Set,
+    Applied, Command, Error, Inserted, Landed, Moved, Outcome, Overlap, PlacedClip, Played, Probed, Removed, Rendered, Reply, Routed, Set, Stats,
 };
 pub use bo_core::bus::BusRef;
 use bo_core::command::{ClipHere, OnTrack, RouteBus};
@@ -373,6 +373,19 @@ impl From<NewBus> for BusIndex {
     }
 }
 
+/// How a render runs: an optional trimmed range, measurement, mono fold.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct RenderConfig {
+    /// Render only this span of the arrangement (`None` = the whole thing).
+    pub trim: Option<TimecodeRange>,
+    /// Measure the mix in the same pass; the numbers describe the exact
+    /// sample stream the file carries.
+    pub measure: bool,
+    /// Fold the mix to mono, `(L+R)/2` — a broadcast or single-speaker
+    /// delivery.
+    pub mono: bool,
+}
+
 /// A typed client on a [`Connection`]: the arrangement lives there, commands
 /// travel there, and the replies come back typed.
 ///
@@ -503,10 +516,25 @@ impl Bo {
         }
     }
 
-    /// Mix the arrangement to a wav file at `file`.
-    pub fn render(&mut self, file: impl AsRef<std::path::Path>) -> Result<Rendered, Error> {
-        let file = file.as_ref().to_string_lossy().into_owned();
-        match self.exec(Command::Render { file, from: None, to: None })? {
+    /// Mix the arrangement to a wav file at `output`, per `settings` —
+    /// optionally only a trimmed range, measured, or folded to mono.
+    pub fn render(
+        &mut self,
+        output: impl AsRef<std::path::Path>,
+        settings: RenderConfig,
+    ) -> Result<Rendered, Error> {
+        let file = output.as_ref().to_string_lossy().into_owned();
+        let (from, to) = match settings.trim {
+            Some(trim) => (Some(trim.from.duration()), trim.to.map(Timecode::duration)),
+            None => (None, None),
+        };
+        match self.exec(Command::Render {
+            file,
+            from,
+            to,
+            measure: settings.measure,
+            mono: settings.mono,
+        })? {
             Outcome::Rendered(rendered) => Ok(rendered),
             other => Err(unexpected(&other)),
         }

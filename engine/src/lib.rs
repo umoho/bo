@@ -23,7 +23,7 @@ pub mod timeline;
 
 use bo_core::bus::{Bus, BusRef, Group, Placement};
 use bo_core::control::ControlSource;
-use bo_core::command::{ClipHere, Command, Error, Inserted, Moved, OnTrack, Outcome, Overlap, PlacedClip, Played, Probed, Removed, Rendered, RouteBus, Routed, Set};
+use bo_core::command::{ClipHere, Command, Error, Inserted, Moved, OnTrack, Outcome, Overlap, PlacedClip, Played, Probed, Removed, Rendered, RouteBus, Routed, Set, Stats};
 use bo_core::track::{Clip, Fade, Source, Track};
 
 /// Why a backend could not do what it was told: data, shared with the
@@ -837,21 +837,42 @@ pub fn exec<B: Backend>(player: &mut Player<B>, command: Command) -> Result<Outc
                 channels: probing.channels,
             }))
         }
-        Command::Render { file, from, to } => {
+        Command::Render { file, from, to, measure, mono } => {
             let path = std::path::PathBuf::from(&file);
             let from = from.unwrap_or_default();
-            let duration = rodio::render_to_file(
-                player.tracks(),
-                player.groups(),
-                &path,
-                from,
-                to,
-                player.volume(),
-            )
-            .map_err(Error::Render)?;
+            let tracks = player.tracks();
+            let groups = player.groups();
+            let master = player.volume();
+            let (duration, measured) = match (measure, mono) {
+                (false, false) => (
+                    rodio::render_to_file(tracks, groups, &path, from, to, master)
+                        .map_err(Error::Render)?,
+                    None,
+                ),
+                (false, true) => (
+                    rodio::render_to_file_mono(tracks, groups, &path, from, to, master)
+                        .map_err(Error::Render)?,
+                    None,
+                ),
+                (true, false) => {
+                    let (d, m) = rodio::render_and_measure(
+                        tracks, groups, Some(&path), from, to, master,
+                    )
+                    .map_err(Error::Render)?;
+                    (d, Some(stats_of(&m)))
+                }
+                (true, true) => {
+                    let (d, m) = rodio::render_and_measure_mono(
+                        tracks, groups, Some(&path), from, to, master,
+                    )
+                    .map_err(Error::Render)?;
+                    (d, Some(stats_of(&m)))
+                }
+            };
             Ok(Outcome::Rendered(Rendered {
                 file,
                 duration_ms: ms_of(duration),
+                stats: measured,
             }))
         }
         Command::Play => {
@@ -1357,6 +1378,20 @@ fn arrangement_tree(player: &Player<impl Backend>) -> Value {
         "track": tracks,
         "bus": buses,
     })
+}
+
+/// A measured span as wire data.
+fn stats_of(m: &crate::measure::Measurement) -> Stats {
+    Stats {
+        span_ms: ms_of(m.span),
+        peak_db: m.peak_db,
+        true_peak_db: m.true_peak_db,
+        rms_db: m.rms_db,
+        integrated_lufs: m.integrated_lufs,
+        momentary_max_lufs: m.momentary_max_lufs,
+        short_term_max_lufs: m.short_term_max_lufs,
+        lra: m.lra,
+    }
 }
 
 /// A duration as whole milliseconds.
