@@ -674,7 +674,7 @@ pub fn exec<B: Backend>(player: &mut Player<B>, command: Command) -> Result<Outc
             }
             let target = match bus {
                 RouteBus::Master => BusRef::Master,
-                RouteBus::Group(id) => {
+                RouteBus::Group { id } => {
                     if player.group(id).is_none() {
                         return Err(Error::NoBus(id));
                     }

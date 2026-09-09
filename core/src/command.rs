@@ -244,7 +244,7 @@ pub enum RouteBus {
     /// The master bus — route back out.
     Master,
     /// A group bus that already exists, by id.
-    Group(u64),
+    Group { id: u64 },
     /// A fresh group bus, named by `name` (the CLI's first-mention create).
     New { name: Option<String> },
 }
@@ -596,5 +596,24 @@ mod tests {
             reply,
             "typed errors survive the wire"
         );
+    }
+
+    #[test]
+    fn a_group_route_survives_the_wire() {
+        // An internally tagged enum cannot carry a newtype variant, so a
+        // route to an existing group bus is a struct variant: it must
+        // serialize (the wire cannot even express Group(u64)) and come back
+        // identical.
+        let cmd = Command::Route {
+            track: 2,
+            bus: RouteBus::Group { id: 7 },
+        };
+        let text = serde_json::to_string(&cmd).unwrap();
+        assert_eq!(
+            text,
+            r#"{"cmd":"route","track":2,"bus":{"bus":"group","id":7}}"#,
+            "a group route is a tagged struct variant"
+        );
+        assert_eq!(serde_json::from_str::<Command>(&text).unwrap(), cmd);
     }
 }

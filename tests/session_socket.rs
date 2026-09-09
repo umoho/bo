@@ -252,6 +252,38 @@ fn buses_and_routing_round_trip_through_the_daemon() {
 }
 
 #[test]
+fn a_second_track_joins_an_existing_group_bus_by_id() {
+    use bo::client::{BusIndex, NewBus, TrackIndex};
+    let dir = temp_dir();
+    let socket = dir.join("d.sock");
+    let _daemon = spawn_daemon(&socket);
+
+    let mut bo = Bo::with_connection(Connection::at(&socket));
+    bo.put(
+        Clip::of("a.wav").trim(TimecodeRange::from((Duration::ZERO, Duration::from_secs(10)))),
+        TrackIndex(0).at(Duration::ZERO),
+    )
+    .unwrap();
+    bo.put(
+        Clip::of("b.wav").trim(TimecodeRange::from((Duration::ZERO, Duration::from_secs(10)))),
+        TrackIndex(1).at(Duration::ZERO),
+    )
+    .unwrap();
+
+    // First mention creates the bus; routing into it by id must travel the
+    // wire as a tagged struct variant (Group(u64) could never serialize).
+    let created = bo.route(TrackIndex(0), NewBus::with_name("music")).unwrap();
+    assert_eq!(created.bus, BusRef::Group(0));
+    let joined = bo.route(TrackIndex(1), BusIndex::group(0)).unwrap();
+    assert_eq!(joined.bus, BusRef::Group(0));
+
+    let tree = bo.get("").unwrap();
+    assert_eq!(tree["bus"][0]["members"], 2, "both tracks share the bus");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn take_round_trips_through_the_daemon() {
     use bo::client::ClipOnTrack;
     let dir = temp_dir();

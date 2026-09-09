@@ -662,7 +662,7 @@ impl Bo {
     ) -> Result<Routed, Error> {
         let bus = match to.into() {
             BusIndex::Master => RouteBus::Master,
-            BusIndex::Group(id) => RouteBus::Group(id),
+            BusIndex::Group(id) => RouteBus::Group { id },
             BusIndex::New(bus) => RouteBus::New { name: bus.0 },
         };
         match self.exec(Command::Route {

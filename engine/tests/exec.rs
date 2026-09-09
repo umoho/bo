@@ -271,7 +271,10 @@ fn exec_routes_tracks_into_buses() {
     // A route to a missing track or bus is refused, no trace.
     match exec(
         &mut p,
-        Command::Route { track: 9, bus: RouteBus::Group(0) },
+        Command::Route {
+            track: 9,
+            bus: RouteBus::Group { id: 0 },
+        },
     )
     .unwrap_err()
     {
@@ -280,7 +283,10 @@ fn exec_routes_tracks_into_buses() {
     }
     match exec(
         &mut p,
-        Command::Route { track: 0, bus: RouteBus::Group(7) },
+        Command::Route {
+            track: 0,
+            bus: RouteBus::Group { id: 7 },
+        },
     )
     .unwrap_err()
     {
@@ -322,7 +328,10 @@ fn exec_routes_tracks_into_buses() {
     // Routing into the fresh group by id joins the same bus.
     let Outcome::Routed(_) = exec(
         &mut p,
-        Command::Route { track: 0, bus: RouteBus::Group(0) },
+        Command::Route {
+            track: 0,
+            bus: RouteBus::Group { id: 0 },
+        },
     )
     .unwrap()
     else {
