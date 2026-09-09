@@ -10,7 +10,7 @@
 
 use std::time::Duration;
 
-use crate::track::Track;
+use bo_core::track::Track;
 
 /// The resolved schedule: per-track plans and the end of the arrangement.
 #[derive(Debug, Clone, PartialEq)]
@@ -54,15 +54,15 @@ pub struct ClipPlan {
     pub gain: f32,
     /// Control sources on the clip's gain — carried into the chain when it
     /// is built, so live and render read the same curves.
-    pub gain_controls: Vec<crate::control::ControlSource>,
+    pub gain_controls: Vec<bo_core::control::ControlSource>,
     /// The clip's fade envelope.
-    pub fade: crate::track::Fade,
+    pub fade: bo_core::track::Fade,
     /// This clip's own placement, when it does not follow its track: a fixed
     /// position that overrides the track's pan for the whole clip.
     pub placement: Option<f32>,
     /// Control sources on the clip's pan — carried into the chain when it
     /// is built, so live and render read the same curves.
-    pub pan_controls: Vec<crate::control::ControlSource>,
+    pub pan_controls: Vec<bo_core::control::ControlSource>,
 }
 
 impl Timeline {
@@ -108,7 +108,7 @@ impl Timeline {
                     gain: clip.gain,
                     gain_controls: clip.gain_controls.clone(),
                     fade: clip.fade,
-                    placement: clip.placement.map(crate::bus::Placement::position),
+                    placement: clip.placement.map(bo_core::bus::Placement::position),
                     pan_controls: clip.pan_controls.clone(),
                 });
                 previous_end = Some(abs_end);
@@ -201,7 +201,7 @@ impl TrackPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::track::{Clip, Source};
+    use bo_core::track::{Clip, Source};
     use std::sync::Arc;
 
     fn secs(s: u64) -> Duration {
@@ -300,14 +300,14 @@ mod tests {
         // The curve a clip carries travels into the plan, so the chain both
         // live and render build from it drives the same pan.
         let mut t = track_with(vec![Clip::new(src("a.wav"), secs(10))]);
-        t.clip_mut(0).unwrap().pan_controls = vec![crate::control::ControlSource::Curve(
-            crate::control::Curve::new(vec![crate::control::Keyframe {
+        t.clip_mut(0).unwrap().pan_controls = vec![bo_core::control::ControlSource::Curve(
+            bo_core::control::Curve::new(vec![bo_core::control::Keyframe {
                 at: Duration::ZERO,
                 value: 1.0,
             }]),
         )];
-        t.clip_mut(0).unwrap().gain_controls = vec![crate::control::ControlSource::Curve(
-            crate::control::Curve::new(vec![crate::control::Keyframe {
+        t.clip_mut(0).unwrap().gain_controls = vec![bo_core::control::ControlSource::Curve(
+            bo_core::control::Curve::new(vec![bo_core::control::Keyframe {
                 at: Duration::from_secs(5),
                 value: -0.5,
             }]),

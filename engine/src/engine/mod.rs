@@ -13,8 +13,8 @@ pub mod measure;
 pub mod rodio;
 pub mod timeline;
 
-use crate::bus::{Bus, Group};
-use crate::track::{Clip, Track};
+use bo_core::bus::{Bus, Group};
+use bo_core::track::{Clip, Track};
 
 /// Why a backend could not do what it was told.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -426,7 +426,7 @@ impl<B: Backend> Player<B> {
     }
 
     /// Add a group bus and return its stable id — the handle
-    /// [`crate::bus::BusRef`]'s `Group` variant addresses it by. Names are
+    /// [`bo_core::bus::BusRef`]'s `Group` variant addresses it by. Names are
     /// labels, not identity, so nothing checks them here.
     pub fn add_group(&mut self, name: Option<String>) -> u64 {
         let id = self.next_group_id;
@@ -629,7 +629,7 @@ impl<B: Backend> Player<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::track::Clip;
+    use bo_core::track::Clip;
     use std::sync::Arc;
 
     fn secs(s: u64) -> Duration {
@@ -639,7 +639,7 @@ mod tests {
     fn track_with(uri: &str, len: u64) -> Track {
         let mut t = Track::named(uri);
         t.insert(Clip::new(
-            Arc::new(crate::track::Source { uri: uri.into() }),
+            Arc::new(bo_core::track::Source { uri: uri.into() }),
             secs(len),
         ))
         .unwrap();
@@ -890,7 +890,7 @@ mod tests {
         let mut p: Player<Silent> = Player::default();
         let mut bed = Track::named("bed");
         bed.insert(Clip::new(
-            Arc::new(crate::track::Source {
+            Arc::new(bo_core::track::Source {
                 uri: "bed.wav".into(),
             }),
             secs(30),
@@ -900,7 +900,7 @@ mod tests {
         let mut ding = Track::named("ding");
         ding.insert(
             Clip::new(
-                Arc::new(crate::track::Source {
+                Arc::new(bo_core::track::Source {
                     uri: "ding.wav".into(),
                 }),
                 secs(2),

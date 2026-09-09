@@ -112,6 +112,7 @@ name = "bo"
 version = "0.1.0"
 dependencies = [
  "bo-core",
+ "bo-engine",
  "clap",
  "hound",
  "rodio",
@@ -124,6 +125,14 @@ dependencies = [
 name = "bo-core"
 version = "0.1.0"
 dependencies = [
+ "serde_json",
+]
+
+[[package]]
+name = "bo-engine"
+version = "0.1.0"
+dependencies = [
+ "bo-core",
  "hound",
  "rodio",
  "serde_json",

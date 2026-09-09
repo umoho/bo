@@ -37,12 +37,12 @@ use rodio::math::nz;
 use rodio::source::from_factory;
 use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink, Player, Sample, Source};
 
-use crate::bus::{BusRef, Group};
+use bo_core::bus::{BusRef, Group};
 use crate::engine::measure::{Measurement, Meter};
 use crate::engine::timeline::{ClipPlan, Timeline};
 use crate::engine::{Backend, BackendError, Change};
-use crate::control::ControlSource;
-use crate::track::{Fade, Track};
+use bo_core::control::ControlSource;
+use bo_core::track::{Fade, Track};
 
 /// A backend that actually makes sound.
 pub struct Rodio {
@@ -154,7 +154,7 @@ struct Graph {
 /// members' voices feed, whose output carries the group's baked strip into
 /// the master bus.
 struct BusNode {
-    /// The group id [`crate::bus::BusRef::Group`] names it by.
+    /// The group id [`bo_core::bus::BusRef::Group`] names it by.
     id: u64,
     /// The mixer this group's voices feed.
     mixer: Mixer,
@@ -729,7 +729,7 @@ impl Graph {
         // is not queued yet and belongs before the tail needs a rebuild.
         if let Some(i) = existing {
             let voice = &self.voices[i];
-            let unqueued = |c: &crate::track::Clip| {
+            let unqueued = |c: &bo_core::track::Clip| {
                 !voice.clips.iter().any(|q| q.id == c.id) && c.at < from
             };
             if data.clips().iter().any(unqueued) {
@@ -1892,8 +1892,8 @@ pub fn probe_sources(tracks: &[Track]) -> Vec<(String, Result<Probing, String>)>
 mod tests {
     use super::*;
     use crate::engine::Player;
-    use crate::control::{Curve, Keyframe, Lfo, LfoShape, Sidechain};
-    use crate::track::{Clip, Source, Track};
+    use bo_core::control::{Curve, Keyframe, Lfo, LfoShape, Sidechain};
+    use bo_core::track::{Clip, Source, Track};
     use rodio::Source as _;
     use std::sync::Arc;
 
@@ -2937,7 +2937,7 @@ mod tests {
         let mut track = Track::named("a");
         track.insert(clip_at(uri, 0, 1)).unwrap();
         let mut fixed = clip_at(uri, 1, 1);
-        fixed.placement = Some(crate::bus::Placement::Stereo { position: -1.0 });
+        fixed.placement = Some(bo_core::bus::Placement::Stereo { position: -1.0 });
         track.insert(fixed).unwrap();
         track.set_pan(1.0); // everything right, except the fixed clip
 
@@ -3303,7 +3303,7 @@ mod tests {
         let id = track.insert(clip_at(tone.to_str().unwrap(), 0, 2)).unwrap();
         // Pinned hard left, so the mono source sits on the left channel.
         track.clip_mut(id).unwrap().placement =
-            Some(crate::bus::Placement::Stereo { position: -1.0 });
+            Some(bo_core::bus::Placement::Stereo { position: -1.0 });
         let mut tracks = [track];
         let (mut graph, mut output) = graph_on_a_mixer();
         graph.play(&tracks, &[], Duration::ZERO).unwrap();
@@ -3322,7 +3322,7 @@ mod tests {
         // Swing the clip to hard right while it is sounding: no rebuild, the
         // running panner must hear the store on its own cell.
         tracks[0].clip_mut(id).unwrap().placement =
-            Some(crate::bus::Placement::Stereo { position: 1.0 });
+            Some(bo_core::bus::Placement::Stereo { position: 1.0 });
         assert!(graph.land(&tracks, graph.position(), &Change::ClipPan(0, id)));
         let after = pull(&mut output, 2_205);
         assert!(channel_peak(&after, 0) < 1e-4, "the left has gone quiet");
@@ -3348,7 +3348,7 @@ mod tests {
             .insert(clip_at(tone.to_str().unwrap(), 1, 1))
             .unwrap();
         track.clip_mut(pinned).unwrap().placement =
-            Some(crate::bus::Placement::Stereo { position: 1.0 });
+            Some(bo_core::bus::Placement::Stereo { position: 1.0 });
         let mut tracks = [track];
         let (mut graph, mut output) = graph_on_a_mixer();
         graph.play(&tracks, &[], Duration::ZERO).unwrap();
@@ -3382,7 +3382,7 @@ mod tests {
         let id = track.insert(clip_at(uri, 0, 2)).unwrap();
         let clip = track.clip_mut(id).unwrap();
         clip.pan_controls = vec![ControlSource::Curve(curve)];
-        clip.placement = Some(crate::bus::Placement::Stereo { position: base });
+        clip.placement = Some(bo_core::bus::Placement::Stereo { position: base });
         vec![track]
     }
 
@@ -3500,7 +3500,7 @@ mod tests {
         let clip = track.clip_mut(id).unwrap();
         clip.gain_controls = vec![ControlSource::Curve(duck)];
         // Hard left so one channel carries the whole tone.
-        clip.placement = Some(crate::bus::Placement::Stereo { position: -1.0 });
+        clip.placement = Some(bo_core::bus::Placement::Stereo { position: -1.0 });
         let tracks = [track];
         let (mut graph, mut output) = graph_on_a_mixer();
         graph.play(&tracks, &[], Duration::ZERO).unwrap();
@@ -3534,7 +3534,7 @@ mod tests {
             let clip = track.clip_mut(id).unwrap();
             clip.gain = 0.8;
             clip.gain_controls = vec![ControlSource::Curve(c)];
-            clip.placement = Some(crate::bus::Placement::Stereo { position: -1.0 });
+            clip.placement = Some(bo_core::bus::Placement::Stereo { position: -1.0 });
             vec![track]
         };
         let tracks = build(curve(-0.3));
@@ -3596,12 +3596,12 @@ mod tests {
         let mut voice = Track::named("voice");
         let v = voice.insert(clip_at(voice_file.to_str().unwrap(), 0, 1)).unwrap();
         voice.clip_mut(v).unwrap().placement =
-            Some(crate::bus::Placement::Stereo { position: 1.0 });
+            Some(bo_core::bus::Placement::Stereo { position: 1.0 });
         voice.set_bus(BusRef::Group(0));
         let mut music = Track::named("music");
         let m = music.insert(clip_at(bed_file.to_str().unwrap(), 0, 2)).unwrap();
         let clip = music.clip_mut(m).unwrap();
-        clip.placement = Some(crate::bus::Placement::Stereo { position: -1.0 });
+        clip.placement = Some(bo_core::bus::Placement::Stereo { position: -1.0 });
         // Deep duck: a full-level voice drives the music's gain to silence.
         clip.gain_controls = vec![ControlSource::Sidechain(Sidechain::new(
             BusRef::Group(0),

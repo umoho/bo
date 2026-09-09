@@ -9,10 +9,11 @@ license = "BSD-3-Clause"
 repository = "https://github.com/umoho/bo"
 
 [workspace]
-members = ["core"]
+members = ["core", "engine"]
 
 [dependencies]
 bo-core = { path = "core" }
+bo-engine = { path = "engine" }
 clap = { version = "4", features = ["derive", "env", "wrap_help"] }
 serde_json = "1"
 shlex = "2.0.1"
