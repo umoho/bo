@@ -895,6 +895,11 @@ pub fn exec<B: Backend>(player: &mut Player<B>, command: Command) -> Result<Outc
             let applied = player.apply().map_err(Error::Backend)?;
             Ok(Outcome::Applied(applied))
         }
+        // Host-level: the daemon (which logs the history) intercepts these
+        // before the engine sees them; reaching here is a host bug.
+        Command::Snapshot | Command::Load { .. } => {
+            Err(Error::Host("snapshot commands are handled by the host".into()))
+        }
     }
 }
 /// Apply a state-zone patch: a leaf scalar, or a merge over a strip node.

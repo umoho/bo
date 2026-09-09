@@ -7,7 +7,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use bo::client::{Bo, BusIndex, BusRef, Clip, Error, Landed, TimecodeRange, TrackIndex};
+use bo::client::{Bo, BusIndex, BusRef, Clip, ClipOnTrack, Error, Landed, TimecodeRange, TrackIndex};
 use bo::connection::Connection;
 
 fn temp_dir() -> PathBuf {
@@ -328,6 +328,47 @@ fn set_patches_over_the_wire() {
     let track = bo.get("track.0").unwrap();
     assert_eq!(track["muted"], true);
     assert_eq!(track["name"], serde_json::Value::Null);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn save_and_load_round_trip_through_the_daemon() {
+    let dir = temp_dir();
+    let socket = dir.join("d.sock");
+    let _daemon = spawn_daemon(&socket);
+    let snap = dir.join("show.json");
+
+    let mut bo = Bo::with_connection(Connection::at(&socket));
+    bo.put(
+        Clip::of("a.wav").trim(TimecodeRange::from((Duration::ZERO, Duration::from_secs(10)))),
+        TrackIndex(0).at(Duration::ZERO),
+    )
+    .unwrap();
+    bo.set("track.0.volume", serde_json::json!(0.4)).unwrap();
+    let snapshot = bo.save(&snap).unwrap();
+    assert_eq!(snapshot.version, 1);
+    assert_eq!(snapshot.history.len(), 2);
+
+    // Trash the session, then load the snapshot back.
+    bo.take(ClipOnTrack::id(TrackIndex(0), 0)).unwrap();
+    bo.load(&snap).unwrap();
+    let tree = bo.get("").unwrap();
+    assert_eq!(tree["track"][0]["clips"].as_array().unwrap().len(), 1, "replayed");
+    assert!((tree["track"][0]["volume"].as_f64().unwrap() - 0.4).abs() < 1e-6);
+
+    // A snapshot of a different version is refused, leaving the session as
+    // it was.
+    let mut wrong = serde_json::from_str::<serde_json::Value>(
+        &std::fs::read_to_string(&snap).unwrap(),
+    )
+    .unwrap();
+    wrong["version"] = serde_json::json!(99);
+    let bad = dir.join("bad.json");
+    std::fs::write(&bad, wrong.to_string()).unwrap();
+    assert!(bo.load(&bad).is_err());
+    let tree = bo.get("").unwrap();
+    assert_eq!(tree["track"][0]["clips"].as_array().unwrap().len(), 1);
 
     std::fs::remove_dir_all(&dir).ok();
 }

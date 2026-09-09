@@ -37,7 +37,7 @@ use crate::connection::Connection;
 
 // The command protocol, shared with the engine and the daemon.
 pub use bo_core::command::{
-    Applied, Command, Error, Inserted, Landed, Moved, Outcome, Overlap, PlacedClip, Played, Removed, Rendered, Reply, Routed, Set, Stats,
+    Applied, Command, Error, Inserted, Landed, Moved, Outcome, Overlap, PlacedClip, Played, Removed, Rendered, Reply, Routed, Set, Snapshot, Stats, SNAPSHOT_VERSION,
 };
 pub use bo_core::bus::BusRef;
 use bo_core::command::{ClipHere, OnTrack, RouteBus};
@@ -528,6 +528,39 @@ impl Bo {
             mono: settings.mono,
         })? {
             Outcome::Rendered(rendered) => Ok(rendered),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// Save the session as a snapshot at `path`: the arrangement commands
+    /// that built it (logged by the daemon) plus the playhead.
+    pub fn save(&mut self, path: impl AsRef<std::path::Path>) -> Result<Snapshot, Error> {
+        let snapshot = match self.exec(Command::Snapshot)? {
+            Outcome::Snapshot(snapshot) => snapshot,
+            other => return Err(unexpected(&other)),
+        };
+        let file = std::fs::File::create(path.as_ref())
+            .map_err(|e| Error::Value(format!("cannot write {}: {e}", path.as_ref().display())))?;
+        serde_json::to_writer(file, &snapshot).map_err(|e| Error::Value(e.to_string()))?;
+        Ok(snapshot)
+    }
+
+    /// Replace the session from a snapshot at `path`, atomically: the
+    /// history is staged by the daemon, so a failing script leaves the
+    /// session untouched. Refuses versions this build does not read.
+    pub fn load(&mut self, path: impl AsRef<std::path::Path>) -> Result<(), Error> {
+        let text = std::fs::read_to_string(path.as_ref())
+            .map_err(|e| Error::Value(format!("cannot read {}: {e}", path.as_ref().display())))?;
+        let snapshot: Snapshot = serde_json::from_str(&text)
+            .map_err(|e| Error::Value(format!("bad snapshot {}: {e}", path.as_ref().display())))?;
+        if snapshot.version != SNAPSHOT_VERSION {
+            return Err(Error::Version(format!(
+                "snapshot version {} — this build reads {}",
+                snapshot.version, SNAPSHOT_VERSION
+            )));
+        }
+        match self.exec(Command::Load { snapshot })? {
+            Outcome::Loaded => Ok(()),
             other => Err(unexpected(&other)),
         }
     }

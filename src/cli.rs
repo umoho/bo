@@ -336,6 +336,9 @@ struct Arrangement {
     /// 600, `0` disables). Reported on `ls` so a quiet session cannot
     /// silently time out.
     idle_timeout: u64,
+    /// The arrangement-building commands the typed path ran, in order —
+    /// the daemon's snapshot history.
+    history: Vec<bo_core::command::Command>,
 }
 
 impl Default for Arrangement {
@@ -349,6 +352,7 @@ impl Arrangement {
         Self {
             player: Player::new(backend),
             idle_timeout: 600,
+            history: Vec::new(),
         }
     }
 }
@@ -2610,17 +2614,90 @@ fn handle_json(state: &Mutex<Arrangement>, line: &str, cwd: &str) -> (i32, Strin
             )
         }
     };
-    match &mut command {
-        bo_core::command::Command::Insert { uri, .. } => *uri = absolutize(uri, cwd),
-        bo_core::command::Command::Render { file, .. } => *file = absolutize(file, cwd),
-        _ => {}
-    }
     let mut a = state.lock().unwrap();
-    let reply = match bo::engine::exec(&mut a.player, command) {
-        Ok(outcome) => bo_core::command::Reply::Ok(outcome),
-        Err(e) => bo_core::command::Reply::Err(e),
+    use bo_core::command::Command as Cmd;
+    let reply = match &command {
+        // Host-level: the daemon holds the history and the transport.
+        Cmd::Snapshot => {
+            let snapshot = bo_core::command::Snapshot {
+                version: bo_core::command::SNAPSHOT_VERSION,
+                history: a.history.clone(),
+                playhead: a.player.playhead(),
+            };
+            bo_core::command::Reply::Ok(bo_core::command::Outcome::Snapshot(snapshot))
+        }
+        Cmd::Load { snapshot } => match load_snapshot(&mut a, snapshot) {
+            Ok(()) => bo_core::command::Reply::Ok(bo_core::command::Outcome::Loaded),
+            Err(e) => bo_core::command::Reply::Err(e),
+        },
+        _ => {
+            match &mut command {
+                Cmd::Insert { uri, .. } => *uri = absolutize(uri, cwd),
+                Cmd::Render { file, .. } => *file = absolutize(file, cwd),
+                _ => {}
+            }
+            let executed = command.clone();
+            match bo::engine::exec(&mut a.player, command) {
+                Ok(outcome) => {
+                    if is_mutator(&executed) {
+                        a.history.push(executed);
+                    }
+                    bo_core::command::Reply::Ok(outcome)
+                }
+                Err(e) => bo_core::command::Reply::Err(e),
+            }
+        }
     };
     (0, json_reply(&reply), false)
+}
+
+/// The arrangement commands a snapshot records: everything that edits the
+/// session. Transport, queries, renders and snapshots do not count.
+fn is_mutator(command: &bo_core::command::Command) -> bool {
+    use bo_core::command::Command as Cmd;
+    matches!(
+        command,
+        Cmd::Insert { .. }
+            | Cmd::Remove { .. }
+            | Cmd::Move { .. }
+            | Cmd::Route { .. }
+            | Cmd::Set { .. }
+    )
+}
+
+/// Replace the arrangement from a snapshot, atomically: the history runs on
+/// a silent staging session first, so a failing script leaves the live
+/// session untouched; only then do the staged tracks, groups, volume and
+/// playhead come across.
+fn load_snapshot(
+    a: &mut Arrangement,
+    snapshot: &bo_core::command::Snapshot,
+) -> Result<(), bo_core::command::Error> {
+    use bo_core::command::Error;
+    if snapshot.version != bo_core::command::SNAPSHOT_VERSION {
+        return Err(Error::Version(format!(
+            "snapshot version {} — this build reads {}",
+            snapshot.version,
+            bo_core::command::SNAPSHOT_VERSION
+        )));
+    }
+    let mut staged = Arrangement::default();
+    for command in &snapshot.history {
+        bo::engine::exec(&mut staged.player, command.clone()).map_err(|e| Error::Host(format!(
+            "load failed at {command:?}: {e}"
+        )))?;
+    }
+    // Commit: the audio backend must survive — swap only the arrangement.
+    a.player.reset();
+    a.player.set_volume(staged.player.volume());
+    let tracks: Vec<_> = staged.player.tracks().to_vec();
+    let groups: Vec<_> = staged.player.groups().to_vec();
+    a.player.tracks_mut().extend(tracks);
+    a.player.set_groups(groups);
+    a.player.set_playhead(snapshot.playhead);
+    a.player.changed(bo::engine::Change::Structure);
+    a.history = snapshot.history.clone();
+    Ok(())
 }
 
 /// Serialize a typed reply for the wire.

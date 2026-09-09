@@ -19,6 +19,10 @@ use crate::bus::BusRef;
 use crate::time;
 use crate::track::Fade;
 
+/// The snapshot format this build reads and writes. Load refuses anything
+/// else, so future formats can change shape without guessing.
+pub const SNAPSHOT_VERSION: u32 = 1;
+
 /// A duration as whole milliseconds, serde's exact unit on the wire.
 pub mod ms {
     use std::time::Duration;
@@ -143,6 +147,12 @@ pub enum Command {
     /// Read the arrangement — the whole tree (`""`), a subtree, or a leaf
     /// ([`Command`]'s state zone and structure, as JSON).
     Get { path: String },
+    /// The session's snapshot: the history of arrangement commands that
+    /// built it, and the playhead. Host-level (the daemon logs the history).
+    Snapshot,
+    /// Replace the arrangement from a snapshot, atomically: the history is
+    /// staged first, so a failing script leaves the session untouched.
+    Load { snapshot: Snapshot },
     /// Patch the arrangement's state zone: a leaf scalar, or a merge over a
     /// strip ([`Set`]). Structure is edited by the other verbs only.
     Set { path: String, patcher: Value },
@@ -312,6 +322,19 @@ pub struct Rendered {
     pub stats: Option<Stats>,
 }
 
+/// A session snapshot: the arrangement-building commands that made it, and
+/// the playhead it had stopped at.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Snapshot {
+    /// The format version ([`SNAPSHOT_VERSION`]).
+    pub version: u32,
+    /// The arrangement commands, in the order they ran.
+    pub history: Vec<Command>,
+    /// The playhead, milliseconds.
+    #[serde(with = "ms")]
+    pub playhead: Duration,
+}
+
 /// The result of a [`Command`], as data.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Outcome {
@@ -327,6 +350,10 @@ pub enum Outcome {
     Set(Set),
     /// A range was rendered ([`Command::Render`]).
     Rendered(Rendered),
+    /// A snapshot read ([`Command::Snapshot`]).
+    Snapshot(Snapshot),
+    /// An arrangement was loaded ([`Command::Load`]).
+    Loaded,
     /// A track was routed ([`Command::Route`]).
     Routed(Routed),
     /// Playback started ([`Command::Play`]).
@@ -461,6 +488,10 @@ pub enum Error {
     Value(String),
     /// A render was refused.
     Render(String),
+    /// A snapshot's version is not one this build reads.
+    Version(String),
+    /// A host-level command reached the engine (it is handled by the host).
+    Host(String),
     /// A bus-name rule was refused ('master' reserved, a duplicate name).
     Bus(String),
     /// An open-ended insert whose source could not be measured.
@@ -484,6 +515,8 @@ impl fmt::Display for Error {
             Self::Path(path) => write!(f, "no such path {path:?}"),
             Self::Value(msg) => f.write_str(msg),
             Self::Render(msg) => f.write_str(msg),
+            Self::Version(msg) => f.write_str(msg),
+            Self::Host(msg) => f.write_str(msg),
             Self::Bus(msg) => f.write_str(msg),
             Self::Probe { uri, why } => write!(f, "cannot measure {uri}: {why}"),
             Self::Overlap(overlap) => write!(f, "{overlap}"),
