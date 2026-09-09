@@ -282,3 +282,27 @@ fn take_round_trips_through_the_daemon() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn get_reads_the_arrangement_over_the_wire() {
+    let dir = temp_dir();
+    let socket = dir.join("d.sock");
+    let _daemon = spawn_daemon(&socket);
+
+    let mut bo = Bo::with_connection(Connection::at(&socket));
+    bo.put(
+        Clip::of("a.wav").trim(TimecodeRange::from((Duration::ZERO, Duration::from_secs(10)))),
+        TrackIndex(0).at(Duration::ZERO),
+    )
+    .unwrap();
+
+    let tree = bo.get("").unwrap();
+    assert_eq!(tree["track"].as_array().unwrap().len(), 1);
+    assert_eq!(tree["track"][0]["clips"][0]["to"], 10_000u64);
+
+    let track = bo.get("track.0").unwrap();
+    assert_eq!(track["volume"], serde_json::json!(1.0));
+    assert!(bo.get("track.9").is_err(), "a dead path is an error");
+
+    std::fs::remove_dir_all(&dir).ok();
+}

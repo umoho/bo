@@ -139,6 +139,9 @@ pub enum Command {
         clip: ClipHere,
         to: OnTrack,
     },
+    /// Read the arrangement — the whole tree (`""`), a subtree, or a leaf
+    /// ([`Command`]'s state zone and structure, as JSON).
+    Get { path: String },
     /// Start playback from the current playhead.
     Play,
     /// Hold position and silence output.
@@ -260,6 +263,8 @@ pub enum Outcome {
     Removed(Removed),
     /// A clip was moved ([`Command::Move`]).
     Moved(Moved),
+    /// The arrangement read ([`Command::Get`]).
+    Tree(serde_json::Value),
     /// A track was routed ([`Command::Route`]).
     Routed(Routed),
     /// Playback started ([`Command::Play`]).
@@ -388,6 +393,8 @@ pub enum Error {
     NoBus(u64),
     /// A take or move could not find the clip it addressed.
     NoClip(String),
+    /// A [`Command::Get`] path led nowhere.
+    Path(String),
     /// A bus-name rule was refused ('master' reserved, a duplicate name).
     Bus(String),
     /// An open-ended insert whose source could not be measured.
@@ -408,6 +415,7 @@ impl fmt::Display for Error {
             Self::NoTrack(track) => write!(f, "no track {track}"),
             Self::NoBus(id) => write!(f, "no bus {id}"),
             Self::NoClip(what) => write!(f, "no clip {what}"),
+            Self::Path(path) => write!(f, "no such path {path:?}"),
             Self::Bus(msg) => f.write_str(msg),
             Self::Probe { uri, why } => write!(f, "cannot measure {uri}: {why}"),
             Self::Overlap(overlap) => write!(f, "{overlap}"),

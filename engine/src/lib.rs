@@ -14,6 +14,8 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
+use serde_json::{json, Value};
+
 pub mod measure;
 pub mod rodio;
 pub mod session;
@@ -809,6 +811,14 @@ pub fn exec<B: Backend>(player: &mut Player<B>, command: Command) -> Result<Outc
                 landed,
             }))
         }
+        Command::Get { path } => {
+            let tree = arrangement_tree(player);
+            let node = match get_path(&tree, &path) {
+                Ok(node) => node.clone(),
+                Err(msg) => return Err(Error::Path(msg)),
+            };
+            Ok(Outcome::Tree(node))
+        }
         Command::Play => {
             player.play().map_err(Error::Backend)?;
             Ok(Outcome::Played(Played {
@@ -844,6 +854,93 @@ pub fn exec<B: Backend>(player: &mut Player<B>, command: Command) -> Result<Outc
         }
     }
 }
+/// The arrangement as a JSON tree — what `Get` reads.
+fn arrangement_tree(player: &Player<impl Backend>) -> Value {
+    let ms = |d: Duration| d.as_secs() * 1000 + u64::from(d.subsec_millis());
+    let tracks: Vec<Value> = player
+        .tracks()
+        .iter()
+        .map(|t| {
+            let clips: Vec<Value> = t
+                .clips()
+                .iter()
+                .map(|c| {
+                    json!({
+                        "id": c.id,
+                        "uri": c.source.uri,
+                        "from": ms(c.from),
+                        "to": ms(c.to),
+                        "at": ms(c.at),
+                        "gain": c.gain,
+                    })
+                })
+                .collect();
+            json!({
+                "name": t.name(),
+                "volume": t.volume(),
+                "pan": t.pan(),
+                "muted": t.muted(),
+                "clips": clips,
+            })
+        })
+        .collect();
+    let buses: Vec<Value> = player
+        .groups()
+        .iter()
+        .map(|g| {
+            let members = player
+                .tracks()
+                .iter()
+                .filter(|t| t.bus() == BusRef::Group(g.id()))
+                .count();
+            json!({
+                "name": g.name(),
+                "volume": g.gain(),
+                "muted": g.muted(),
+                "members": members,
+            })
+        })
+        .collect();
+    json!({
+        "master": { "volume": player.volume() },
+        "transport": {
+            "state": player.state().to_string(),
+            "playhead": ms(player.playhead()),
+            "duration": ms(player.duration()),
+        },
+        "track": tracks,
+        "bus": buses,
+    })
+}
+
+/// Descend a dotted path (`track.0.clips.1.gain`) through a tree value.
+fn get_path<'a>(value: &'a Value, path: &str) -> Result<&'a Value, String> {
+    if path.trim().is_empty() {
+        return Ok(value);
+    }
+    let mut node = value;
+    for segment in path.split('.') {
+        if segment.is_empty() {
+            return Err(format!("empty path segment in {path:?}"));
+        }
+        node = match node {
+            Value::Array(items) => {
+                let index: usize = segment.parse().map_err(|_| {
+                    format!("{path:?}: array index expected, got {segment:?}")
+                })?;
+                items
+                    .get(index)
+                    .ok_or_else(|| format!("{path:?}: no index {index}"))?
+            }
+            Value::Object(fields) => fields
+                .get(segment)
+                .ok_or_else(|| format!("{path:?}: no key {segment:?}"))?,
+            other => return Err(format!("{path:?}: {other} is not a container")),
+        };
+    }
+    Ok(node)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

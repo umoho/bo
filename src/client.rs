@@ -481,6 +481,17 @@ impl Bo {
         }
     }
 
+    /// Read the arrangement — the whole tree (`""`), a subtree, or a leaf,
+    /// as JSON.
+    pub fn get(&mut self, path: &str) -> Result<serde_json::Value, Error> {
+        match self.exec(Command::Get {
+            path: path.to_string(),
+        })? {
+            Outcome::Tree(value) => Ok(value),
+            other => Err(unexpected(&other)),
+        }
+    }
+
     /// Start playback from the current playhead.
     pub fn play(&mut self) -> Result<Played, Error> {
         match self.exec(Command::Play)? {

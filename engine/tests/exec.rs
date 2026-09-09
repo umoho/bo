@@ -3,6 +3,7 @@
 use std::path::Path;
 use std::time::Duration;
 
+use bo_core::bus::BusRef;
 use bo_core::command::{Applied, ClipHere, Command, Error, Inserted, Landed, OnTrack, Outcome, RouteBus};
 use bo_engine::{exec, Player, Silent};
 
@@ -260,7 +261,6 @@ fn exec_drives_the_transport() {
 
 #[test]
 fn exec_routes_tracks_into_buses() {
-    use bo_core::bus::BusRef;
     let mut p = player();
     exec(
         &mut p,
@@ -475,4 +475,38 @@ fn exec_move_rearranges_clips_atomically() {
     };
     assert_eq!(moved.clip.id, 1, "same-track moves keep the id");
     assert_eq!(moved.clip.at, Duration::from_secs(6));
+}
+
+#[test]
+fn exec_get_reads_the_arrangement_as_a_tree() {
+    let mut p = player();
+    exec(
+        &mut p,
+        insert(&src("a.wav"), Duration::ZERO, Duration::from_secs(10), Duration::ZERO, 0),
+    )
+    .unwrap();
+    exec(&mut p, Command::Route { track: 0, bus: RouteBus::New { name: Some("music".into()) } }).unwrap();
+
+    let Outcome::Tree(tree) = exec(&mut p, Command::Get { path: String::new() }).unwrap() else {
+        panic!("expected a tree")
+    };
+    assert_eq!(tree["track"][0]["clips"][0]["id"], 0);
+    assert_eq!(tree["track"][0]["clips"][0]["to"], 10_000u64);
+    assert_eq!(tree["bus"][0]["members"], 1);
+    assert_eq!(tree["transport"]["state"], "stopped");
+
+    // Subtree and leaf paths, then a dead end.
+    let Outcome::Tree(leaf) = exec(
+        &mut p,
+        Command::Get { path: "track.0.volume".into() },
+    )
+    .unwrap()
+    else {
+        panic!("expected a leaf")
+    };
+    assert_eq!(leaf, serde_json::json!(1.0));
+    match exec(&mut p, Command::Get { path: "track.9".into() }).unwrap_err() {
+        Error::Path(msg) => assert!(msg.contains("no index 9"), "{msg}"),
+        other => panic!("expected Path, got {other:?}"),
+    }
 }
